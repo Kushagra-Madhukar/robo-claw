@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "aria-core",
+    "aria-mesh",
+    "aria-policy",
+    "aria-skill-runtime",
+    "aria-ssmu",
+    "aria-intelligence",
+    "aria-gateway",
+    "aria-x",
+]
+resolver = "2"

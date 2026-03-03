@@ -1,0 +1,11 @@
+[package]
+name = "aria-intelligence"
+version = "0.1.0"
+edition = "2021"
+description = "ARIA-X semantic routing and dynamic tool cache"
+
+[dependencies]
+aria-core = { path = "../aria-core" }
+async-trait = "0.1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "macros", "time"] }

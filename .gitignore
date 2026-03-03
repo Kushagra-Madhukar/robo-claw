@@ -1,0 +1,24 @@
+# Rust / Cargo build outputs
+/target/
+**/target/
+target-local/
+aria-skill-runtime/test-plugins/**/target/
+
+# Logs
+*.log
+
+# Rust backups
+**/*.rs.bk
+*.bak
+
+# OS/editor junk
+.DS_Store
+*.swp
+*.swo
+
+# Local helper scripts
+run_patch.sh
+
+# Windows test/bench binaries
+/tests/*.exe
+/benches/*.exe

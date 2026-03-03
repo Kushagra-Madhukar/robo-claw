@@ -1,0 +1,23 @@
+# ARIA-X Orchestrator Configuration
+
+[llm]
+# Backend type: "mock", "ollama", "claude"
+backend = "mock"
+# Model name (for ollama/claude)
+model = "llama3.2"
+# Max tool rounds per request
+max_tool_rounds = 5
+
+[policy]
+# Path to the Cedar policy file
+policy_path = "../aria-policy/policies/default.cedar"
+
+[gateway]
+# Adapter type: "cli", "telegram"
+adapter = "cli"
+
+[mesh]
+# Zenoh mode: "peer" or "client"
+mode = "peer"
+# Zenoh endpoints (empty for auto-discovery)
+endpoints = []

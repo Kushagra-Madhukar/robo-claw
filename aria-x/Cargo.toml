@@ -1,0 +1,26 @@
+[package]
+name = "aria-x"
+version = "0.1.0"
+edition = "2021"
+description = "ARIA-X orchestrator binary — wires all crates into the final agent runtime"
+
+[[bin]]
+name = "aria-x"
+path = "src/main.rs"
+
+[dependencies]
+aria-core = { path = "../aria-core" }
+aria-policy = { path = "../aria-policy" }
+aria-skill-runtime = { path = "../aria-skill-runtime" }
+aria-ssmu = { path = "../aria-ssmu" }
+aria-intelligence = { path = "../aria-intelligence" }
+aria-gateway = { path = "../aria-gateway" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -1,0 +1,9 @@
+[package]
+name = "aria-policy"
+version = "0.1.0"
+edition = "2021"
+description = "ARIA-X Cedar-based zero-trust policy engine"
+
+[dependencies]
+aria-core = { path = "../aria-core" }
+cedar-policy = "4.9"

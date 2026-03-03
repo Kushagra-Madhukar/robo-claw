@@ -1,0 +1,17 @@
+[package]
+name = "aria-ssmu"
+version = "0.1.0"
+edition = "2021"
+description = "ARIA-X RAG engine: PageIndex tree + session memory"
+
+[features]
+default = []
+# Vector store remains available for future migration work but is intentionally
+# disabled by default. PageIndex is the primary retrieval path.
+vector-store = []
+
+[dependencies]
+aria-core = { path = "../aria-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }

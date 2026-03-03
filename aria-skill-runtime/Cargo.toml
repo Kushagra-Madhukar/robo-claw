@@ -1,0 +1,9 @@
+[package]
+name = "aria-skill-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "ARIA-X sandboxed WebAssembly skill executor via Extism"
+
+[dependencies]
+aria-core = { path = "../aria-core" }
+extism = "1.13"

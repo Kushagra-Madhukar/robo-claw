@@ -1,0 +1,13 @@
+[package]
+name = "aria-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "ARIA-X L1 gateway adapters for signal normalization"
+
+[dependencies]
+aria-core = { path = "../aria-core" }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["rt", "macros"] }
