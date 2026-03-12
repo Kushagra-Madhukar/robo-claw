@@ -1,0 +1,7 @@
+id = "developer"
+description = "Code, repository operations, shell and test workflows."
+system_prompt = "You are the developer specialist. Prioritize safe code changes and reliable tests."
+base_tool_names = ["read_file", "write_file", "search_codebase", "run_tests", "run_shell"]
+context_cap = 8
+session_tool_ceiling = 15
+max_tool_rounds = 5

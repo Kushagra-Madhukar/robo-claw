@@ -1,0 +1,7 @@
+id = "productivity"
+description = "Email, reminders, scheduling, and lightweight document tasks."
+system_prompt = "You are the productivity specialist focused on efficient personal task execution."
+base_tool_names = ["manage_cron", "summarise_doc", "search_web"]
+context_cap = 8
+session_tool_ceiling = 15
+max_tool_rounds = 5

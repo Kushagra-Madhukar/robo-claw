@@ -1,0 +1,69 @@
+## ARIA-X Example Configuration (full schema)
+
+[llm]
+backend = "openrouter"
+model = "arcee-ai/trinity-large-preview:free"
+max_tool_rounds = 5
+
+[policy]
+policy_path = "../aria-policy/policies/default.cedar"
+
+[gateway]
+adapter = "cli" # or "telegram"
+# For adapter=telegram (resolution order: config → env → file):
+# telegram_token = ""           # Inline token, or...
+# telegram_token_file = ""      # Path to file (e.g. /run/secrets/telegram_token)
+# telegram_port = 8080          # Webhook listen port (only if telegram_mode = webhook)
+# telegram_mode = "polling"     # polling = no webhook (default). webhook = needs public URL
+# Env: TELEGRAM_BOT_TOKEN. Also load from .env or ~/.aria/.env
+
+[mesh]
+mode = "peer"              # "peer" or "client"
+endpoints = []             # e.g. ["tcp/localhost:7447"]
+
+[agents_dir]
+path = "../agents"
+
+[router]
+confidence_threshold = 0.70
+tie_break_gap = 0.05
+
+[ssmu]
+sessions_dir = "../workspace/sessions"
+
+[scheduler]
+enabled = false
+tick_seconds = 1
+
+#[[scheduler.jobs]]
+#id = "daily-standup"
+#agent_id = "productivity"
+#prompt = "Generate my standup from yesterday's commits."
+#schedule = "every:3600s"
+
+[localization]
+# Fallback timezone for users not listed below. Must be an IANA timezone.
+default_timezone = "UTC"
+# Optional per-user timezone overrides (keyed by user_id/chat user id).
+# user_timezones = { "7890386204" = "Asia/Kolkata", "123456789" = "Europe/Zurich" }
+user_timezones = {}
+
+[node]
+id = "orchestrator-1"
+role = "orchestrator"      # "orchestrator" | "relay" | "companion" | "micro"
+tier = "orchestrator"
+
+[simulator]
+enabled = false
+backend = "none"           # "gazebo" | "mujoco" | "none"
+
+[telemetry]
+# enabled=true, log_level=debug for all logs. Or RUST_LOG=aria_x=debug
+enabled = false
+log_level = "info"
+enabled = false
+log_level = "info"
+
+[ui]
+enabled = false
+bind_addr = "127.0.0.1:8080"

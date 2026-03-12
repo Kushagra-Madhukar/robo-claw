@@ -1,0 +1,41 @@
+backend = "openrouter"
+model = "arcee-ai/trinity-large-preview:free"
+max_tool_rounds = 1
+
+[policy]
+policy_path = "../aria-policy/policies/default.cedar"
+
+[gateway]
+adapter = "cli"
+
+[mesh]
+mode = "peer"
+endpoints = []
+
+[agents_dir]
+path = "../agents"
+
+[router]
+confidence_threshold = 0.70
+tie_break_gap = 0.05
+
+[ssmu]
+sessions_dir = "../workspace/sessions"
+
+[scheduler]
+enabled = false
+tick_seconds = 1
+
+[node]
+id = "micro-1"
+role = "micro"
+tier = "micro"
+
+[telemetry]
+enabled = false
+log_level = "info"
+
+[ui]
+enabled = false
+bind_addr = "127.0.0.1:8083"
+

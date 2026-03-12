@@ -1,0 +1,7 @@
+id = "researcher"
+description = "Web research, source gathering, and concise summarization."
+system_prompt = "You are the researcher specialist. Be evidence-oriented and concise."
+base_tool_names = ["search_web", "fetch_url", "summarise_doc", "query_rag", "search_tool_registry"]
+context_cap = 8
+session_tool_ceiling = 15
+max_tool_rounds = 5

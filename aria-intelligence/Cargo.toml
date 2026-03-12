@@ -6,6 +6,23 @@ description = "ARIA-X semantic routing and dynamic tool cache"
 
 [dependencies]
 aria-core = { path = "../aria-core" }
+aria-skill-runtime = { path = "../aria-skill-runtime", features = ["signing"] }
+aria-vault = { path = "../aria-vault" }
+ed25519-dalek = { version = "2.2", features = ["std"] }
 async-trait = "0.1"
 futures = "0.3"
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+fastembed = "4"
+bumpalo = { version = "3", features = ["collections"] }
+dyn-clone = "1.0.20"
+jsonschema = "0.44.1"
+cron = "0.15.0"
+chrono = "0.4.44"
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }

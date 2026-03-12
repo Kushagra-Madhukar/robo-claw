@@ -3,24 +3,31 @@
 //! Traces a request through the full ARIA-X stack using mocks:
 //! Gateway → SemanticRouter → AgentOrchestrator → Cedar → Wasm → Response
 
+use aria_core::{AgentRequest, GatewayChannel, MessageContent};
 use aria_intelligence::{
-    AgentOrchestrator, CachedTool, LLMBackend, LLMResponse, OrchestratorError, SemanticRouter,
-    ToolCall, ToolExecutor,
+    backends::{self, ollama::OllamaBackend},
+    llm_route_fallback, AgentOrchestrator, CachedTool, DynamicToolCache, LLMBackend, LLMResponse,
+    LlmBackendPool, LocalHashEmbedder, OrchestratorError, RouteConfig, RouterDecision,
+    SemanticRouter, ToolCall, ToolExecutor, ToolManifestStore,
 };
 use aria_policy::CedarEvaluator;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // Mock LLM: simulates a developer agent
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct MockDeveloperLLM {
-    call_count: std::sync::atomic::AtomicUsize,
+    call_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MockDeveloperLLM {
     fn new() -> Self {
         Self {
-            call_count: std::sync::atomic::AtomicUsize::new(0),
+            call_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -117,7 +124,7 @@ async fn full_pipeline_mocked() {
     }];
 
     let final_answer = orchestrator
-        .run(user_query, &tools, 5)
+        .run(user_query, &tools, 5, None, None)
         .await
         .expect("orchestrator should succeed");
 
@@ -141,15 +148,20 @@ async fn full_pipeline_mocked() {
     );
 
     // ---- Step 7: Verify final output ----
+    let final_answer_str = match final_answer {
+        aria_intelligence::OrchestratorResult::Completed(t) => t,
+        _ => panic!("Expected completed text"),
+    };
+
     assert!(
-        final_answer.contains("file1.txt"),
+        final_answer_str.contains("file1.txt"),
         "output should contain file1.txt, got: {}",
-        final_answer
+        final_answer_str
     );
     assert!(
-        final_answer.contains("file2.rs"),
+        final_answer_str.contains("file2.rs"),
         "output should contain file2.rs, got: {}",
-        final_answer
+        final_answer_str
     );
 
     // Verify Cedar denies system paths
@@ -166,6 +178,7 @@ async fn full_pipeline_mocked() {
 /// Verify the orchestrator aborts on infinite tool loops.
 #[tokio::test]
 async fn pipeline_infinite_loop_prevention() {
+    #[derive(Clone)]
     struct AlwaysToolCallLLM;
 
     #[async_trait::async_trait]
@@ -184,7 +197,9 @@ async fn pipeline_infinite_loop_prevention() {
 
     let orchestrator = AgentOrchestrator::new(AlwaysToolCallLLM, MockWasmExecutor);
 
-    let result = orchestrator.run("infinite loop test", &[], 5).await;
+    let result = orchestrator
+        .run("infinite loop test", &[], 5, None, None)
+        .await;
 
     assert!(result.is_err(), "should fail with max rounds exceeded");
     match result {
@@ -210,7 +225,220 @@ fn gateway_normalization_integration() {
     let request =
         aria_gateway::TelegramNormalizer::normalize(telegram_json).expect("should normalize");
 
-    assert_eq!(request.content, "List contents of workspace");
+    assert_eq!(
+        request.content,
+        MessageContent::Text("List contents of workspace".into())
+    );
     assert_eq!(request.user_id, "42");
     assert_eq!(request.timestamp_us, 1700000000 * 1_000_000);
+}
+
+#[tokio::test]
+async fn router_fallback_integration_path() {
+    #[derive(Clone)]
+    struct RouteChoiceLLM;
+
+    #[async_trait::async_trait]
+    impl LLMBackend for RouteChoiceLLM {
+        async fn query(
+            &self,
+            _prompt: &str,
+            _tools: &[CachedTool],
+        ) -> Result<LLMResponse, OrchestratorError> {
+            Ok(LLMResponse::TextAnswer("analyst".into()))
+        }
+    }
+
+    let mut router = SemanticRouter::new();
+    router
+        .register_agent("developer", vec![0.8, 0.7, 0.1, 0.05])
+        .expect("register developer");
+    router
+        .register_agent("analyst", vec![0.75, 0.72, 0.1, 0.05])
+        .expect("register analyst");
+    let cfg = RouteConfig {
+        confidence_threshold: 0.95,
+        tie_break_gap: 0.10,
+    };
+    let decision = router
+        .route_with_config(&[0.79, 0.71, 0.1, 0.05], cfg)
+        .expect("route should succeed");
+    let candidates = match decision {
+        RouterDecision::NeedsLlmFallback { candidates } => candidates,
+        other => panic!("expected fallback decision, got {:?}", other),
+    };
+
+    let chosen = llm_route_fallback(&RouteChoiceLLM, "who should handle this?", &candidates)
+        .await
+        .expect("fallback llm should pick candidate");
+    assert_eq!(chosen, "analyst");
+}
+
+#[tokio::test]
+async fn backend_failover_integration_path() {
+    #[derive(Clone)]
+    struct PrimaryFailingLLM {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl LLMBackend for PrimaryFailingLLM {
+        async fn query(
+            &self,
+            _prompt: &str,
+            _tools: &[CachedTool],
+        ) -> Result<LLMResponse, OrchestratorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(OrchestratorError::LLMError("primary unavailable".into()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct FallbackAnswerLLM;
+    #[async_trait::async_trait]
+    impl LLMBackend for FallbackAnswerLLM {
+        async fn query(
+            &self,
+            _prompt: &str,
+            _tools: &[CachedTool],
+        ) -> Result<LLMResponse, OrchestratorError> {
+            Ok(LLMResponse::TextAnswer("fallback succeeded".into()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct PoolBackedLLM {
+        pool: Arc<LlmBackendPool>,
+    }
+    #[async_trait::async_trait]
+    impl LLMBackend for PoolBackedLLM {
+        async fn query(
+            &self,
+            prompt: &str,
+            tools: &[CachedTool],
+        ) -> Result<LLMResponse, OrchestratorError> {
+            self.pool.query_with_fallback(prompt, tools).await
+        }
+    }
+
+    let primary_calls = Arc::new(AtomicUsize::new(0));
+    let pool = LlmBackendPool::new(
+        vec!["primary".into(), "fallback".into()],
+        Duration::from_millis(50),
+    );
+    pool.register_backend(
+        "primary",
+        Box::new(PrimaryFailingLLM {
+            calls: primary_calls.clone(),
+        }),
+    );
+    pool.register_backend("fallback", Box::new(FallbackAnswerLLM));
+    let pool = Arc::new(pool);
+
+    let orchestrator = AgentOrchestrator::new(PoolBackedLLM { pool }, MockWasmExecutor);
+    let answer = orchestrator
+        .run("produce answer", &[], 2, None, None)
+        .await
+        .expect("fallback backend should succeed");
+
+    let answer_str = match answer {
+        aria_intelligence::OrchestratorResult::Completed(t) => t,
+        _ => panic!("Expected completed text"),
+    };
+    assert_eq!(answer_str, "fallback succeeded");
+    assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn dynamic_tool_hotswap_integration_path() {
+    #[derive(Clone)]
+    struct DynamicSwapLLM {
+        step: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMBackend for DynamicSwapLLM {
+        async fn query(
+            &self,
+            prompt: &str,
+            _tools: &[CachedTool],
+        ) -> Result<LLMResponse, OrchestratorError> {
+            match self.step.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(LLMResponse::ToolCalls(vec![ToolCall {
+                    name: "search_tool_registry".into(),
+                    arguments: r#"{"query":"sensor telemetry read"}"#.into(),
+                }])),
+                1 => {
+                    assert!(
+                        prompt.contains("loaded 'read_sensor'"),
+                        "hot-swap result should be reflected in prompt"
+                    );
+                    Ok(LLMResponse::ToolCalls(vec![ToolCall {
+                        name: "read_sensor".into(),
+                        arguments: r#"{"sensor":"imu"}"#.into(),
+                    }]))
+                }
+                _ => Ok(LLMResponse::TextAnswer("imu=nominal".into())),
+            }
+        }
+    }
+
+    struct SensorExecutor;
+    #[async_trait::async_trait]
+    impl ToolExecutor for SensorExecutor {
+        async fn execute(&self, call: &ToolCall) -> Result<String, OrchestratorError> {
+            match call.name.as_str() {
+                "read_sensor" => Ok("imu=nominal".into()),
+                other => Err(OrchestratorError::ToolError(format!(
+                    "unexpected tool execution: {}",
+                    other
+                ))),
+            }
+        }
+    }
+
+    let llm = DynamicSwapLLM {
+        step: Arc::new(AtomicUsize::new(0)),
+    };
+    let orchestrator = AgentOrchestrator::new(llm, SensorExecutor);
+    let embedder = LocalHashEmbedder::new(64);
+    let mut registry = ToolManifestStore::new();
+    registry.register(CachedTool {
+        name: "read_sensor".into(),
+        description: "Read telemetry from on-device sensors".into(),
+        parameters_schema: r#"{"sensor":"string"}"#.into(),
+    });
+    let mut cache = DynamicToolCache::new(8, 15);
+    cache
+        .insert(CachedTool {
+            name: "search_tool_registry".into(),
+            description: "Search and hot-swap tools by semantic query".into(),
+            parameters_schema: r#"{"query":"string"}"#.into(),
+        })
+        .expect("insert meta tool");
+
+    let req = AgentRequest {
+        request_id: uuid::Uuid::new_v4().into_bytes(),
+        session_id: uuid::Uuid::new_v4().into_bytes(),
+        channel: GatewayChannel::Cli,
+        user_id: "integration-user".into(),
+        content: MessageContent::Text("check imu health".into()),
+        timestamp_us: 1_700_000_000_000_000,
+    };
+
+    let answer = orchestrator
+        .run_for_request_with_dynamic_tools(
+            "sys", &req, "", "", &mut cache, &registry, &embedder, 5, None, None,
+        )
+        .await
+        .expect("dynamic hot-swap flow should succeed");
+
+    let answer_str = match answer {
+        aria_intelligence::OrchestratorResult::Completed(t) => t,
+        _ => panic!("Expected completed text"),
+    };
+    assert_eq!(answer_str, "imu=nominal");
+    assert!(
+        cache.get("read_sensor").is_some(),
+        "tool should be loaded in cache"
+    );
 }

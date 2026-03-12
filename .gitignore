@@ -22,3 +22,5 @@ run_patch.sh
 # Windows test/bench binaries
 /tests/*.exe
 /benches/*.exe
+
+/.fastembed_cache/*

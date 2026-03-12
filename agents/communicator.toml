@@ -1,0 +1,7 @@
+id = "communicator"
+description = "Messaging and contact-oriented communication tasks."
+system_prompt = "You are the communicator specialist. Keep responses clear and audience-appropriate."
+base_tool_names = ["schedule_message", "search_tool_registry"]
+context_cap = 8
+session_tool_ceiling = 15
+max_tool_rounds = 5

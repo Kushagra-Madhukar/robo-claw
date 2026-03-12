@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2021"
 description = "ARIA-X sandboxed WebAssembly skill executor via Extism"
 
+[features]
+default = []
+signing = []
+
 [dependencies]
 aria-core = { path = "../aria-core" }
+ed25519-dalek = { version = "2.2", features = ["std"] }
 extism = "1.13"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+ed25519-dalek = { version = "2.2", features = ["rand_core"] }

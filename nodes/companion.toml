@@ -1,0 +1,41 @@
+backend = "openrouter"
+model = "arcee-ai/trinity-large-preview:free"
+max_tool_rounds = 5
+
+[policy]
+policy_path = "../aria-policy/policies/default.cedar"
+
+[gateway]
+adapter = "cli"
+
+[mesh]
+mode = "peer"
+endpoints = []
+
+[agents_dir]
+path = "../agents"
+
+[router]
+confidence_threshold = 0.70
+tie_break_gap = 0.05
+
+[ssmu]
+sessions_dir = "../workspace/sessions"
+
+[scheduler]
+enabled = false
+tick_seconds = 1
+
+[node]
+id = "companion-1"
+role = "companion"
+tier = "companion"
+
+[telemetry]
+enabled = false
+log_level = "info"
+
+[ui]
+enabled = true
+bind_addr = "127.0.0.1:8082"
+

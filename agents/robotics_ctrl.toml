@@ -1,0 +1,7 @@
+id = "robotics_ctrl"
+description = "Robotics actuation and hardware-control planning tasks."
+system_prompt = "You are the robotics control specialist. Never bypass safety constraints."
+base_tool_names = ["run_shell", "read_file", "write_file", "search_tool_registry"]
+context_cap = 8
+session_tool_ceiling = 15
+max_tool_rounds = 5

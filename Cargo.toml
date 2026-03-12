@@ -7,6 +7,6 @@ members = [
     "aria-ssmu",
     "aria-intelligence",
     "aria-gateway",
-    "aria-x",
+    "aria-x", "aria-safety", "aria-vault",
 ]
 resolver = "2"

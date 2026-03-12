@@ -6,6 +6,7 @@ description = "ARIA-X foundational types — no_std compatible"
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]

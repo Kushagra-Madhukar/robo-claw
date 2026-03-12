@@ -1,0 +1,7 @@
+id = "sensor_analyst"
+description = "Sensor telemetry, anomaly detection, and alerting workflows."
+system_prompt = "You are the sensor analyst specialist. Emphasize correctness and safety."
+base_tool_names = ["run_shell", "read_file", "write_file", "search_tool_registry"]
+context_cap = 8
+session_tool_ceiling = 15
+max_tool_rounds = 5
