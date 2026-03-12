@@ -1,4 +1,4 @@
-# ARIA-X
+# ARIA-X/RoboClaw
 
 ![Rust](https://img.shields.io/badge/Rust-Workspace-000000?logo=rust)
 ![Status](https://img.shields.io/badge/status-alpha-orange)
