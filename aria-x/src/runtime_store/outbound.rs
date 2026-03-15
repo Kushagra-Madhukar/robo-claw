@@ -124,7 +124,11 @@ impl RuntimeStore {
         conn.execute(
             "INSERT INTO channel_health_snapshots (snapshot_id, payload_json, recorded_at_us)
              VALUES (?1, ?2, ?3)",
-            params![format!("chs-{}", uuid::Uuid::new_v4()), payload, recorded_at_us as i64],
+            params![
+                format!("chs-{}", uuid::Uuid::new_v4()),
+                payload,
+                recorded_at_us as i64
+            ],
         )
         .map_err(|e| format!("write channel health snapshot failed: {}", e))?;
         Ok(())
@@ -176,7 +180,11 @@ impl RuntimeStore {
         conn.execute(
             "INSERT INTO operational_alert_snapshots (snapshot_id, payload_json, recorded_at_us)
              VALUES (?1, ?2, ?3)",
-            params![format!("oas-{}", uuid::Uuid::new_v4()), payload, recorded_at_us as i64],
+            params![
+                format!("oas-{}", uuid::Uuid::new_v4()),
+                payload,
+                recorded_at_us as i64
+            ],
         )
         .map_err(|e| format!("write operational alert snapshot failed: {}", e))?;
         Ok(())
@@ -205,8 +213,8 @@ impl RuntimeStore {
             .map_err(|e| format!("query operational alert snapshots failed: {}", e))?;
         let mut out = Vec::new();
         for row in rows {
-            let (payload, recorded_at_us) = row
-                .map_err(|e| format!("read operational alert snapshot row failed: {}", e))?;
+            let (payload, recorded_at_us) =
+                row.map_err(|e| format!("read operational alert snapshot row failed: {}", e))?;
             let mut value = serde_json::from_str::<serde_json::Value>(&payload)
                 .map_err(|e| format!("parse operational alert snapshot payload failed: {}", e))?;
             if let Some(map) = value.as_object_mut() {

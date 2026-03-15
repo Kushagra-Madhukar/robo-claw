@@ -130,7 +130,7 @@ mod tests {
             &session_memory,
         )
         .expect("clear command handled");
-        assert!(cleared_reply.contains("Override cleared"));
+        assert!(cleared_reply.contains("Session history was not cleared"));
 
         let (cleared_agent_override, _) = session_memory
             .get_overrides(&session_uuid)
@@ -148,7 +148,20 @@ mod tests {
             &session_memory,
         )
         .expect("session command handled after clear");
-        assert!(cleared_session_reply.contains("agent_override=<default>"));
+        assert!(cleared_session_reply.contains("agent_override=default"));
+        assert!(
+            handle_cli_control_command(
+                &AgentRequest {
+                    content: MessageContent::Text("/session clear".into()),
+                    ..cleared_session_req.clone()
+                },
+                &config,
+                &agent_store,
+                &session_memory,
+            )
+            .expect("clear session handled")
+            .contains("Session history cleared")
+        );
     }
 
     #[test]
@@ -969,6 +982,9 @@ mod tests {
             backend: "mock".into(),
             model: "tool-model".into(),
             max_tool_rounds: 5,
+            first_token_timeout_ms: 20_000,
+            provider_circuit_breaker_cooldown_ms: 30_000,
+            provider_circuit_breaker_failure_threshold: 2,
             repair_fallback_model_allowlist: vec![],
             capability_overrides: vec![ModelCapabilityOverrideConfig {
                 provider_id: "test-provider".into(),
@@ -1282,6 +1298,32 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct InspectingPromptCaptureLLM {
+        answer: String,
+        payload: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMBackend for InspectingPromptCaptureLLM {
+        async fn query(
+            &self,
+            _prompt: &str,
+            _tools: &[CachedTool],
+        ) -> Result<LLMResponse, OrchestratorError> {
+            Ok(LLMResponse::TextAnswer(self.answer.clone()))
+        }
+
+        fn inspect_context_payload(
+            &self,
+            _context: &aria_core::ExecutionContextPack,
+            _tools: &[CachedTool],
+            _policy: &aria_core::ToolRuntimePolicy,
+        ) -> Option<serde_json::Value> {
+            Some(self.payload.clone())
+        }
+    }
+
+    #[derive(Clone)]
     struct PolicyCaptureLLM {
         observed_policy: Arc<Mutex<Option<aria_core::ToolRuntimePolicy>>>,
     }
@@ -1353,7 +1395,7 @@ mod tests {
                     name: "write_file".into(),
                     arguments: serde_json::json!({
                         "path": "selector-generated.txt",
-                        "content": "hello"
+                        "content": "hello",
                     })
                     .to_string(),
                 }]))
@@ -1383,7 +1425,7 @@ mod tests {
                     arguments: serde_json::json!({
                         "agent_id": "researcher",
                         "prompt": "review background findings",
-                        "max_runtime_seconds": 60
+                        "max_runtime_seconds": 60,
                     })
                     .to_string(),
                 }]))
@@ -1418,7 +1460,7 @@ mod tests {
                     name: "run_shell".into(),
                     arguments: serde_json::json!({
                         "command": format!("touch {}", self.target_path),
-                        "cwd": std::env::temp_dir().display().to_string()
+                        "cwd": std::env::temp_dir().display().to_string(),
                     })
                     .to_string(),
                 }]))
@@ -1449,7 +1491,7 @@ mod tests {
                     name: "read_mcp_resource".into(),
                     arguments: serde_json::json!({
                         "server_id": "github",
-                        "resource_uri": "repo://issues"
+                        "resource_uri": "repo://issues",
                     })
                     .to_string(),
                 }]))
@@ -1552,7 +1594,7 @@ mod tests {
             aria_policy::CedarEvaluator::from_policy_str("").expect("empty policy should parse"),
         );
         let session_memory = aria_ssmu::SessionMemory::new(100);
-        let page_index = Arc::new(build_dynamic_page_index(&agent_store));
+        let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let mut vector_store_inner = VectorStore::new();
         vector_store_inner.index_document(
             "workspace.files",
@@ -1601,7 +1643,7 @@ mod tests {
             &agent_store,
             &tool_registry,
             &session_memory,
-            &page_index,
+            &capability_index,
             &vector_store,
             &kw_index,
             &aria_safety::DfaFirewall::new(vec![]),
@@ -1673,6 +1715,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_request_persists_provider_request_payload_in_context_inspection() {
+        let embedder = LocalHashEmbedder::new(64);
+        let mut router = SemanticRouter::new();
+        router
+            .register_agent_text("developer", "rust project workspace code", &embedder)
+            .expect("register agent");
+        let router_index = router.build_index(RouteConfig {
+            confidence_threshold: 0.0,
+            tie_break_gap: 0.01,
+        });
+        let cedar = Arc::new(
+            aria_policy::CedarEvaluator::from_policy_str("").expect("empty policy should parse"),
+        );
+        let mut agent_store = AgentConfigStore::new();
+        agent_store.insert(AgentConfig {
+            id: "developer".into(),
+            description: "Rust coding agent".into(),
+            system_prompt: "You are a developer.".into(),
+            base_tool_names: vec![],
+            context_cap: 8,
+            session_tool_ceiling: 15,
+            max_tool_rounds: 5,
+            tool_allowlist: vec![],
+            skill_allowlist: vec![],
+            mcp_server_allowlist: vec![],
+            mcp_tool_allowlist: vec![],
+            mcp_prompt_allowlist: vec![],
+            mcp_resource_allowlist: vec![],
+            filesystem_scopes: vec![],
+            retrieval_scopes: vec![],
+            delegation_scope: None,
+            web_domain_allowlist: vec![],
+            web_domain_blocklist: vec![],
+            browser_profile_allowlist: vec![],
+            browser_action_scope: None,
+            browser_session_scope: None,
+            crawl_scope: None,
+            web_approval_policy: None,
+            web_transport_allowlist: vec![],
+            requires_elevation: false,
+            class: AgentClass::Generalist,
+            side_effect_level: SideEffectLevel::StatefulWrite,
+            trust_profile: None,
+            fallback_agent: None,
+        });
+        let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
+        let vector_store = Arc::new(VectorStore::new());
+        let keyword_index = Arc::new(KeywordIndex::new().expect("keyword index"));
+        let firewall = aria_safety::DfaFirewall::new(vec![]);
+        let vault = Arc::new(aria_vault::CredentialVault::new(
+            "/tmp/test_vault_provider_payload.json",
+            [0; 32],
+        ));
+        let session_memory = aria_ssmu::SessionMemory::new(100);
+        let (tx_cron, mut rx_cron) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move { while rx_cron.recv().await.is_some() {} });
+        let provider_registry = Arc::new(tokio::sync::Mutex::new(ProviderRegistry::new()));
+        let session_tool_caches =
+            SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
+        let hooks = HookRegistry::new();
+        let session_locks = dashmap::DashMap::new();
+        let embed_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let sessions_temp = tempfile::tempdir().expect("sessions tempdir");
+        let llm_pool = LlmBackendPool::new(vec!["primary".into()], Duration::from_millis(100));
+        llm_pool.register_backend(
+            "primary",
+            Box::new(InspectingPromptCaptureLLM {
+                answer: "done".into(),
+                payload: serde_json::json!({
+                    "model": "test-model",
+                    "messages": [{"role":"user","content":"hello"}]
+                }),
+            }),
+        );
+        let llm_pool = Arc::new(llm_pool);
+        let tool_registry = ToolManifestStore::new();
+
+        let req = AgentRequest {
+            request_id: *uuid::Uuid::new_v4().as_bytes(),
+            session_id: *uuid::Uuid::new_v4().as_bytes(),
+            channel: GatewayChannel::Cli,
+            user_id: "u1".into(),
+            content: MessageContent::Text("hello".into()),
+            tool_runtime_policy: None,
+            timestamp_us: 42,
+        };
+
+        let result = process_request(
+            &req,
+            &LearningConfig::default(),
+            &router_index,
+            &embedder,
+            &llm_pool,
+            &cedar,
+            &agent_store,
+            &tool_registry,
+            &session_memory,
+            &capability_index,
+            &vector_store,
+            &keyword_index,
+            &firewall,
+            &vault,
+            &tx_cron,
+            &provider_registry,
+            &session_tool_caches,
+            &hooks,
+            &session_locks,
+            &embed_semaphore,
+            5,
+            None,
+            Some(&Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            sessions_temp.path(),
+            vec!["/workspace/".into()],
+            vec![],
+            chrono_tz::UTC,
+        )
+        .await
+        .expect("process request");
+
+        assert_eq!(
+            result,
+            aria_intelligence::OrchestratorResult::Completed("done".to_string())
+        );
+
+        let session_id = uuid::Uuid::from_bytes(req.session_id).to_string();
+        let records = RuntimeStore::for_sessions_dir(sessions_temp.path())
+            .list_context_inspections(Some(&session_id), None)
+            .expect("list context inspections");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].provider_request_payload,
+            Some(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role":"user","content":"hello"}]
+            }))
+        );
+    }
+
+    #[tokio::test]
     async fn process_request_persists_explicit_request_policy_audit() {
         let embedder = LocalHashEmbedder::new(64);
         let mut router = SemanticRouter::new();
@@ -1732,7 +1913,7 @@ mod tests {
             aria_policy::CedarEvaluator::from_policy_str("").expect("empty policy should parse"),
         );
         let session_memory = aria_ssmu::SessionMemory::new(100);
-        let page_index = Arc::new(build_dynamic_page_index(&agent_store));
+        let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let kw_index = Arc::new(KeywordIndex::new().expect("keyword index"));
         let session_tool_caches = SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
@@ -1760,7 +1941,7 @@ mod tests {
             &agent_store,
             &tool_registry,
             &session_memory,
-            &page_index,
+            &capability_index,
             &vector_store,
             &kw_index,
             &aria_safety::DfaFirewall::new(vec![]),
@@ -1925,7 +2106,7 @@ mod tests {
         );
         let session_memory = aria_ssmu::SessionMemory::new(100);
         let sessions_temp = tempfile::tempdir().expect("sessions tempdir");
-        let page_index = Arc::new(build_dynamic_page_index(&agent_store));
+        let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let keyword_index = Arc::new(KeywordIndex::new().expect("keyword index"));
         let firewall = aria_safety::DfaFirewall::new(vec![]);
@@ -1969,7 +2150,7 @@ mod tests {
             &agent_store,
             &tool_registry,
             &session_memory,
-            &page_index,
+            &capability_index,
             &vector_store,
             &keyword_index,
             &firewall,
@@ -2121,7 +2302,7 @@ mod tests {
             aria_policy::CedarEvaluator::from_policy_str("").expect("empty policy should parse"),
         );
         let session_memory = aria_ssmu::SessionMemory::new(100);
-        let page_index = Arc::new(build_dynamic_page_index(&agent_store));
+        let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let keyword_index = Arc::new(KeywordIndex::new().expect("keyword index"));
         let firewall = aria_safety::DfaFirewall::new(vec![]);
@@ -2157,7 +2338,7 @@ mod tests {
             &agent_store,
             &tool_registry,
             &session_memory,
-            &page_index,
+            &capability_index,
             &vector_store,
             &keyword_index,
             &firewall,
@@ -2277,7 +2458,7 @@ mod tests {
                 .expect("policy"),
         );
         let session_memory = aria_ssmu::SessionMemory::new(100);
-        let page_index = Arc::new(build_dynamic_page_index(&agent_store));
+        let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let keyword_index = Arc::new(KeywordIndex::new().expect("keyword index"));
         let firewall = aria_safety::DfaFirewall::new(vec![]);
@@ -2323,7 +2504,7 @@ mod tests {
             &agent_store,
             &tool_registry,
             &session_memory,
-            &page_index,
+            &capability_index,
             &vector_store,
             &keyword_index,
             &firewall,
@@ -2430,7 +2611,7 @@ mod tests {
                 .expect("policy"),
         );
         let session_memory = aria_ssmu::SessionMemory::new(100);
-        let page_index = Arc::new(build_dynamic_page_index(&agent_store));
+        let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let keyword_index = Arc::new(KeywordIndex::new().expect("keyword index"));
         let firewall = aria_safety::DfaFirewall::new(vec![]);
@@ -2502,7 +2683,7 @@ mod tests {
             &agent_store,
             &tool_registry,
             &session_memory,
-            &page_index,
+            &capability_index,
             &vector_store,
             &keyword_index,
             &firewall,
@@ -2523,11 +2704,16 @@ mod tests {
         )
         .await;
 
-        let err = result.expect_err("process request should reject unauthorized MCP read");
+        let response =
+            result.expect("process request should complete with blocked MCP access result");
         assert!(
-            format!("{}", err).contains("retrieval scope"),
-            "unexpected MCP rejection: {}",
-            err
+            matches!(
+                response,
+                aria_intelligence::OrchestratorResult::Completed(ref text)
+                    if text.contains("MCP resource access stayed blocked")
+            ),
+            "unexpected MCP result: {:?}",
+            response
         );
     }
 
@@ -2591,7 +2777,7 @@ mod tests {
             aria_policy::CedarEvaluator::from_policy_str("").expect("empty policy should parse"),
         );
         let session_memory = aria_ssmu::SessionMemory::new(100);
-        let page_index = Arc::new(build_dynamic_page_index(&agent_store));
+        let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let keyword_index = Arc::new(KeywordIndex::new().expect("keyword index"));
         let firewall = aria_safety::DfaFirewall::new(vec![]);
@@ -2650,7 +2836,7 @@ mod tests {
             &agent_store,
             &tool_registry,
             &session_memory,
-            &page_index,
+            &capability_index,
             &vector_store,
             &keyword_index,
             &firewall,
@@ -2823,7 +3009,7 @@ mod tests {
             aria_policy::CedarEvaluator::from_policy_str("").expect("empty policy should parse"),
         );
         let session_memory = aria_ssmu::SessionMemory::new(100);
-        let page_index = Arc::new(build_dynamic_page_index(&agent_store));
+        let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let keyword_index = Arc::new(KeywordIndex::new().expect("keyword index"));
         let firewall = aria_safety::DfaFirewall::new(vec![]);
@@ -2866,7 +3052,7 @@ mod tests {
             &agent_store,
             &tool_registry,
             &session_memory,
-            &page_index,
+            &capability_index,
             &vector_store,
             &keyword_index,
             &firewall,
@@ -2969,7 +3155,7 @@ mod tests {
             aria_policy::CedarEvaluator::from_policy_str("").expect("empty policy should parse"),
         );
         let session_memory = aria_ssmu::SessionMemory::new(100);
-        let page_index = Arc::new(build_dynamic_page_index(&agent_store));
+        let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let keyword_index = Arc::new(KeywordIndex::new().expect("keyword index"));
         let firewall = aria_safety::DfaFirewall::new(vec![]);
@@ -3007,7 +3193,7 @@ mod tests {
                 &agent_store,
                 &ToolManifestStore::new(),
                 &session_memory,
-                &page_index,
+                &capability_index,
                 &vector_store,
                 &keyword_index,
                 &firewall,
@@ -3171,7 +3357,7 @@ mod tests {
             aria_policy::CedarEvaluator::from_policy_str("").expect("empty policy should parse"),
         );
         let session_memory = aria_ssmu::SessionMemory::new(100);
-        let page_index = Arc::new(build_dynamic_page_index(&agent_store));
+        let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let keyword_index = Arc::new(KeywordIndex::new().expect("keyword index"));
         let firewall = aria_safety::DfaFirewall::new(vec![]);
@@ -3205,7 +3391,7 @@ mod tests {
             &agent_store,
             &tool_registry,
             &session_memory,
-            &page_index,
+            &capability_index,
             &vector_store,
             &keyword_index,
             &firewall,
@@ -3269,8 +3455,10 @@ mod tests {
             modalities: vec![aria_core::ToolModality::Text],
             }],
         );
-        assert!(context.contains("Prompt Mode: Planning"));
-        assert!(context.contains("Prompt Mode: Media"));
+        assert!(context.contains("--- Planning Guidance ---"));
+        assert!(context.contains("--- Media Guidance ---"));
+        assert!(!context.contains("Prompt Mode: Planning"));
+        assert!(!context.contains("Prompt Mode: Media"));
     }
 
     #[test]
@@ -3291,7 +3479,7 @@ mod tests {
             None,
             &[],
         );
-        assert!(context.contains("Prompt Mode: Robotics"));
+        assert!(context.contains("--- Robotics Guidance ---"));
         assert!(context.contains("never emit direct actuator commands"));
     }
 
@@ -3365,7 +3553,7 @@ mod tests {
             aria_policy::CedarEvaluator::from_policy_str("").expect("empty policy should parse"),
         );
         let session_memory = aria_ssmu::SessionMemory::new(200);
-        let page_index = Arc::new(build_dynamic_page_index(&agent_store));
+        let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let kw_index = Arc::new(KeywordIndex::new().expect("keyword index"));
         let session_tool_caches = SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
@@ -3416,7 +3604,7 @@ mod tests {
             &agent_store,
             &tool_registry,
             &session_memory,
-            &page_index,
+            &capability_index,
             &vector_store,
             &kw_index,
             &aria_safety::DfaFirewall::new(vec![]),
@@ -3514,7 +3702,7 @@ mod tests {
             aria_policy::CedarEvaluator::from_policy_str("").expect("empty policy should parse"),
         );
         let session_memory = aria_ssmu::SessionMemory::new(200);
-        let page_index = Arc::new(build_dynamic_page_index(&agent_store));
+        let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let kw_index = Arc::new(KeywordIndex::new().expect("keyword index"));
         let session_tool_caches = SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
@@ -3565,7 +3753,7 @@ mod tests {
                 &agent_store,
                 &tool_registry,
                 &session_memory,
-                &page_index,
+                &capability_index,
                 &vector_store,
                 &kw_index,
                 &aria_safety::DfaFirewall::new(vec![]),
@@ -3724,6 +3912,245 @@ mod tests {
                 hour: 19,
                 minute: 30,
                 timezone: chrono_tz::UTC,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn schedule_message_tool_accepts_message_alias_for_task() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<aria_intelligence::CronCommand>(2);
+        let (job_tx, job_rx) =
+            tokio::sync::oneshot::channel::<aria_intelligence::ScheduledPromptJob>();
+        tokio::spawn(async move {
+            if let Some(aria_intelligence::CronCommand::List(reply)) = rx.recv().await {
+                let _ = reply.send(Vec::new());
+            }
+            if let Some(aria_intelligence::CronCommand::Add(job)) = rx.recv().await {
+                let _ = job_tx.send(job);
+            }
+        });
+
+        let exec = NativeToolExecutor {
+            tx_cron: tx,
+            invoking_agent_id: Some("planner".into()),
+            session_id: Some(*uuid::Uuid::new_v4().as_bytes()),
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Telegram),
+            session_memory: None,
+            cedar: None,
+            sessions_dir: None,
+            scheduling_intent: None,
+            user_timezone: chrono_tz::UTC,
+        };
+
+        let result = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "schedule_message".into(),
+                arguments: r#"{"message":"Meeting reminder","schedule":{"kind":"daily","hour":19,"minute":30,"timezone":"UTC"},"agent_id":"communicator"}"#.into(),
+            })
+            .await
+            .expect("tool should accept message alias");
+
+        assert!(result.contains("Scheduled reminder notification"));
+        let job = job_rx.await.expect("expected Add job command");
+        assert_eq!(job.prompt, "Meeting reminder");
+    }
+
+    #[tokio::test]
+    async fn schedule_message_empty_schedule_object_falls_back_to_classified_schedule() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<aria_intelligence::CronCommand>(2);
+        let (job_tx, job_rx) =
+            tokio::sync::oneshot::channel::<aria_intelligence::ScheduledPromptJob>();
+        tokio::spawn(async move {
+            if let Some(aria_intelligence::CronCommand::List(reply)) = rx.recv().await {
+                let _ = reply.send(Vec::new());
+            }
+            if let Some(aria_intelligence::CronCommand::Add(job)) = rx.recv().await {
+                let _ = job_tx.send(job);
+            }
+        });
+
+        let exec = NativeToolExecutor {
+            tx_cron: tx,
+            invoking_agent_id: Some("planner".into()),
+            session_id: Some(*uuid::Uuid::new_v4().as_bytes()),
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Telegram),
+            session_memory: None,
+            cedar: None,
+            sessions_dir: None,
+            scheduling_intent: Some(SchedulingIntent {
+                mode: SchedulingMode::Notify,
+                normalized_schedule: Some(ToolSchedule::Daily {
+                    hour: 14,
+                    minute: 20,
+                    timezone: Some("Asia/Kolkata".into()),
+                }),
+                deferred_task: Some("Take meds".into()),
+                rationale: "test intent",
+            }),
+            user_timezone: chrono_tz::Asia::Kolkata,
+        };
+
+        let result = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "schedule_message".into(),
+                arguments: r#"{"task":"Take meds","schedule":{},"agent_id":"planner"}"#.into(),
+            })
+            .await
+            .expect("tool should recover from empty schedule object");
+
+        assert!(result.contains("notify + deferred execution"));
+        let job = job_rx.await.expect("expected Add job command");
+        assert_eq!(job.prompt, "Take meds");
+        assert!(matches!(
+            job.schedule,
+            aria_intelligence::ScheduleSpec::DailyAt {
+                hour: 14,
+                minute: 20,
+                timezone: chrono_tz::Asia::Kolkata,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn schedule_message_accepts_legacy_delay_string() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<aria_intelligence::CronCommand>(2);
+        let (job_tx, job_rx) =
+            tokio::sync::oneshot::channel::<aria_intelligence::ScheduledPromptJob>();
+        tokio::spawn(async move {
+            if let Some(aria_intelligence::CronCommand::List(reply)) = rx.recv().await {
+                let _ = reply.send(Vec::new());
+            }
+            if let Some(aria_intelligence::CronCommand::Add(job)) = rx.recv().await {
+                let _ = job_tx.send(job);
+            }
+        });
+
+        let exec = NativeToolExecutor {
+            tx_cron: tx,
+            invoking_agent_id: Some("planner".into()),
+            session_id: Some(*uuid::Uuid::new_v4().as_bytes()),
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Cli),
+            session_memory: None,
+            cedar: None,
+            sessions_dir: None,
+            scheduling_intent: None,
+            user_timezone: chrono_tz::UTC,
+        };
+
+        let result = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "schedule_message".into(),
+                arguments: r#"{"task":"Run report","delay":"every:60s","agent_id":"planner"}"#.into(),
+            })
+            .await
+            .expect("legacy delay should be normalized");
+
+        assert!(result.contains("Scheduled reminder notification"));
+        let job = job_rx.await.expect("expected Add job command");
+        assert!(matches!(
+            job.schedule,
+            aria_intelligence::ScheduleSpec::EverySeconds(60)
+        ));
+    }
+
+    #[tokio::test]
+    async fn schedule_message_accepts_stringified_empty_schedule_and_falls_back_to_classifier() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<aria_intelligence::CronCommand>(2);
+        let (job_tx, job_rx) =
+            tokio::sync::oneshot::channel::<aria_intelligence::ScheduledPromptJob>();
+        tokio::spawn(async move {
+            if let Some(aria_intelligence::CronCommand::List(reply)) = rx.recv().await {
+                let _ = reply.send(Vec::new());
+            }
+            if let Some(aria_intelligence::CronCommand::Add(job)) = rx.recv().await {
+                let _ = job_tx.send(job);
+            }
+        });
+
+        let exec = NativeToolExecutor {
+            tx_cron: tx,
+            invoking_agent_id: Some("planner".into()),
+            session_id: Some(*uuid::Uuid::new_v4().as_bytes()),
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Telegram),
+            session_memory: None,
+            cedar: None,
+            sessions_dir: None,
+            scheduling_intent: Some(SchedulingIntent {
+                mode: SchedulingMode::Notify,
+                normalized_schedule: Some(ToolSchedule::At {
+                    at: "2026-03-13T11:32:00+00:00".into(),
+                }),
+                deferred_task: None,
+                rationale: "test intent",
+            }),
+            user_timezone: chrono_tz::UTC,
+        };
+
+        let result = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "schedule_message".into(),
+                arguments: r#"{"task":"Sleep reminder","schedule":"{}","mode":"notify","agent_id":"planner"}"#.into(),
+            })
+            .await
+            .expect("stringified empty schedule should use classifier fallback");
+
+        assert!(result.contains("Scheduled reminder notification"));
+        let job = job_rx.await.expect("expected Add job command");
+        assert!(matches!(job.schedule, aria_intelligence::ScheduleSpec::Once(_)));
+    }
+
+    #[tokio::test]
+    async fn schedule_message_accepts_json_string_schedule_without_kind() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<aria_intelligence::CronCommand>(2);
+        let (job_tx, job_rx) =
+            tokio::sync::oneshot::channel::<aria_intelligence::ScheduledPromptJob>();
+        tokio::spawn(async move {
+            if let Some(aria_intelligence::CronCommand::List(reply)) = rx.recv().await {
+                let _ = reply.send(Vec::new());
+            }
+            if let Some(aria_intelligence::CronCommand::Add(job)) = rx.recv().await {
+                let _ = job_tx.send(job);
+            }
+        });
+
+        let exec = NativeToolExecutor {
+            tx_cron: tx,
+            invoking_agent_id: Some("planner".into()),
+            session_id: Some(*uuid::Uuid::new_v4().as_bytes()),
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Cli),
+            session_memory: None,
+            cedar: None,
+            sessions_dir: None,
+            scheduling_intent: None,
+            user_timezone: chrono_tz::UTC,
+        };
+
+        let result = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "schedule_message".into(),
+                arguments: r#"{"task":"Take meds","schedule":"{\"hour\":14,\"minute\":20,\"timezone\":\"UTC\"}","agent_id":"planner"}"#.into(),
+            })
+            .await
+            .expect("JSON-stringified schedule object should be normalized");
+
+        assert!(result.contains("Scheduled reminder notification"));
+        let job = job_rx.await.expect("expected Add job command");
+        assert!(matches!(
+            job.schedule,
+            aria_intelligence::ScheduleSpec::DailyAt {
+                hour: 14,
+                minute: 20,
+                timezone: chrono_tz::UTC
             }
         ));
     }
@@ -4041,7 +4468,7 @@ mod tests {
             aria_policy::CedarEvaluator::from_policy_str("").expect("empty policy should parse"),
         );
         let session_memory = aria_ssmu::SessionMemory::new(100);
-        let page_index = Arc::new(build_dynamic_page_index(&agent_store));
+        let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let keyword_index = Arc::new(KeywordIndex::new().expect("keyword index"));
         let firewall = aria_safety::DfaFirewall::new(vec![]);
@@ -4085,7 +4512,7 @@ mod tests {
             &agent_store,
             &ToolManifestStore::new(),
             &session_memory,
-            &page_index,
+            &capability_index,
             &vector_store,
             &keyword_index,
             &firewall,
@@ -4442,7 +4869,7 @@ mod tests {
             .execute(&ToolCall { invocation_id: None,
                 name: "run_shell".into(),
                 arguments: r#"{"command":"echo hi"}"#.into(),
-            })
+})
             .await
             .expect_err("run_shell should be denied");
 
@@ -5049,7 +5476,7 @@ mod tests {
             .execute(&ToolCall { invocation_id: None,
                 name: "activate_skill".into(),
                 arguments: r#"{"skill_id":"github_review"}"#.into(),
-            })
+})
             .await
             .expect_err("activation should require binding");
         assert!(format!("{}", err).contains("not bound"));
@@ -5398,7 +5825,7 @@ mod tests {
             .execute(&ToolCall { invocation_id: None,
                 name: "install_skill".into(),
                 arguments: r#"{"manifest_toml":"skill_id = \"github_review\"\nname = \"GitHub Review\"\ndescription = \"Review PRs\"\nversion = \"1.0.0\"\ntool_names = [\"read_file\"]\n"}"#.into(),
-            })
+})
             .await
             .expect("install skill should succeed");
         assert!(result
@@ -6320,6 +6747,488 @@ enabled = true
     }
 
     #[tokio::test]
+    async fn policy_checked_executor_allows_mcp_alias_tool_when_bound() {
+        let cedar = Arc::new(
+            aria_policy::CedarEvaluator::from_policy_str(r#"permit(principal, action, resource);"#)
+                .expect("policy"),
+        );
+        let sessions = tempfile::tempdir().expect("sessions");
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        store
+            .upsert_mcp_server(
+                &McpServerProfile {
+                    server_id: "github".into(),
+                    display_name: "GitHub".into(),
+                    transport: "stub".into(),
+                    endpoint: "stub://github".into(),
+                    auth_ref: None,
+                    enabled: true,
+                },
+                1,
+            )
+            .expect("upsert server");
+        store
+            .upsert_mcp_imported_tool(
+                &McpImportedTool {
+                    import_id: "tool-1".into(),
+                    server_id: "github".into(),
+                    tool_name: "create_issue".into(),
+                    description: "Create issue".into(),
+                    parameters_schema: r#"{"type":"object","properties":{"title":{"type":"string"}},"required":["title"]}"#.into(),
+                },
+                2,
+            )
+            .expect("upsert imported tool");
+        store
+            .upsert_mcp_binding(&McpBindingRecord {
+                binding_id: "mcp-bind-1".into(),
+                agent_id: "developer".into(),
+                server_id: "github".into(),
+                primitive_kind: McpPrimitiveKind::Tool,
+                target_name: "create_issue".into(),
+                created_at_us: 3,
+            })
+            .expect("upsert binding");
+
+        let exec = PolicyCheckedExecutor::new(
+            NativeToolExecutor {
+                tx_cron: {
+                    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                    tx
+                },
+                invoking_agent_id: Some("developer".into()),
+                session_id: None,
+                user_id: Some("u1".into()),
+                channel: Some(GatewayChannel::Cli),
+                session_memory: None,
+                cedar: None,
+                sessions_dir: Some(sessions.path().to_path_buf()),
+                scheduling_intent: None,
+                user_timezone: chrono_tz::UTC,
+            },
+            cedar,
+            "developer".into(),
+            GatewayChannel::Cli,
+            vec!["./".into()],
+            vec![],
+            Some(AgentCapabilityProfile {
+                agent_id: "developer".into(),
+                class: AgentClass::Generalist,
+                tool_allowlist: vec!["invoke_mcp_tool".into()],
+                skill_allowlist: vec![],
+                mcp_server_allowlist: vec!["github".into()],
+                mcp_tool_allowlist: vec!["create_issue".into()],
+                mcp_prompt_allowlist: vec![],
+                mcp_resource_allowlist: vec![],
+                filesystem_scopes: vec![],
+                retrieval_scopes: vec![],
+                delegation_scope: None,
+                web_domain_allowlist: vec![],
+                web_domain_blocklist: vec![],
+                browser_profile_allowlist: vec![],
+                browser_action_scope: None,
+                browser_session_scope: None,
+                crawl_scope: None,
+                web_approval_policy: None,
+                web_transport_allowlist: vec![],
+                requires_elevation: false,
+                side_effect_level: SideEffectLevel::ReadOnly,
+                trust_profile: None,
+            }),
+            Some(sessions.path().to_path_buf()),
+            None,
+        );
+
+        let result = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: mcp_tool_alias_name("github", "create_issue"),
+                arguments: r#"{"title":"Bug"}"#.into(),
+            })
+            .await
+            .expect("mcp alias should normalize to invoke_mcp_tool");
+        assert!(result
+            .render_for_prompt()
+            .contains("Invoked MCP tool 'github::create_issue'"));
+    }
+
+    #[test]
+    fn synthesize_bound_mcp_prompt_assets_and_resource_entries_returns_bound_primitives() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        store
+            .upsert_mcp_server(
+                &McpServerProfile {
+                    server_id: "github".into(),
+                    display_name: "GitHub".into(),
+                    transport: "stub".into(),
+                    endpoint: "stub://github".into(),
+                    auth_ref: None,
+                    enabled: true,
+                },
+                1,
+            )
+            .expect("upsert server");
+        store
+            .upsert_mcp_imported_prompt(
+                &McpImportedPrompt {
+                    import_id: "prompt-1".into(),
+                    server_id: "github".into(),
+                    prompt_name: "review_pr".into(),
+                    description: "Review a PR".into(),
+                    arguments_schema: Some("{}".into()),
+                },
+                2,
+            )
+            .expect("upsert prompt");
+        store
+            .upsert_mcp_imported_resource(
+                &McpImportedResource {
+                    import_id: "resource-1".into(),
+                    server_id: "github".into(),
+                    resource_uri: "repo://issues".into(),
+                    description: "Issue feed".into(),
+                    mime_type: Some("application/json".into()),
+                },
+                3,
+            )
+            .expect("upsert resource");
+        store
+            .upsert_mcp_binding(&McpBindingRecord {
+                binding_id: "bind-prompt".into(),
+                agent_id: "developer".into(),
+                server_id: "github".into(),
+                primitive_kind: McpPrimitiveKind::Prompt,
+                target_name: "review_pr".into(),
+                created_at_us: 4,
+            })
+            .expect("bind prompt");
+        store
+            .upsert_mcp_binding(&McpBindingRecord {
+                binding_id: "bind-resource".into(),
+                agent_id: "developer".into(),
+                server_id: "github".into(),
+                primitive_kind: McpPrimitiveKind::Resource,
+                target_name: "repo://issues".into(),
+                created_at_us: 5,
+            })
+            .expect("bind resource");
+
+        let prompts = synthesize_bound_mcp_prompt_assets(&store, "developer").expect("prompts");
+        let resources =
+            synthesize_bound_mcp_resource_entries(&store, "developer").expect("resources");
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].public_name, "review_pr");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].public_name, "repo://issues");
+    }
+
+    #[tokio::test]
+    async fn external_compat_tool_executor_runs_registered_sidecar() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("compat-echo.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat >/dev/null\nprintf '{\"ok\":true,\"summary\":\"compat ok\",\"kind\":\"external_compat\",\"data\":{\"mode\":\"compat\"}}'\n",
+        )
+        .expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+
+        register_external_compat_tool(ExternalCompatToolRegistration {
+            tool_name: "compat_echo".into(),
+            command: vec!["sh".into(), script.to_string_lossy().to_string()],
+            description: "Echo compat tool".into(),
+            parameters_schema: "{}".into(),
+        })
+        .expect("register compat tool");
+
+        let exec = ExternalCompatToolExecutor;
+        let result = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "compat_echo".into(),
+                arguments: "{}".into(),
+            })
+            .await
+            .expect("compat tool should succeed");
+        assert_eq!(result.render_for_prompt(), "compat ok");
+        assert_eq!(result.as_provider_payload()["mode"], serde_json::json!("compat"));
+    }
+
+    #[tokio::test]
+    async fn native_registration_exposes_external_compat_tool_to_multiplex_executor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("compat-roundtrip.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncat >/dev/null\nprintf '{\"ok\":true,\"summary\":\"roundtrip ok\",\"kind\":\"external_compat\",\"data\":{\"source\":\"sidecar\"}}'\n",
+        )
+        .expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod");
+        }
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let register_exec = NativeToolExecutor {
+            tx_cron: tx.clone(),
+            invoking_agent_id: Some("developer".into()),
+            session_id: Some([9; 16]),
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Cli),
+            session_memory: Some(aria_ssmu::SessionMemory::new(4)),
+            cedar: Some(Arc::new(
+                aria_policy::CedarEvaluator::from_policy_str("")
+                    .expect("empty policy should parse"),
+            )),
+            sessions_dir: Some(temp.path().to_path_buf()),
+            scheduling_intent: None,
+            user_timezone: chrono_tz::UTC,
+        };
+        register_exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "register_external_compat_tool".into(),
+                arguments: serde_json::json!({
+                    "tool_name": "compat_roundtrip",
+                    "command": ["sh", script.to_string_lossy()],
+                    "description": "Roundtrip compat tool",
+                    "parameters_schema": "{}",
+                })
+                .to_string(),
+            })
+            .await
+            .expect("register compat tool through native executor");
+
+        let vault_path = temp.path().join("vault.json");
+        let vault = Arc::new(aria_vault::CredentialVault::new(&vault_path, [9u8; 32]));
+        let multiplex = MultiplexToolExecutor::new(
+            vault,
+            "developer".into(),
+            [9; 16],
+            "u1".into(),
+            GatewayChannel::Cli,
+            tx,
+            aria_ssmu::SessionMemory::new(4),
+            Arc::new(
+                aria_policy::CedarEvaluator::from_policy_str("")
+                    .expect("empty policy should parse"),
+            ),
+            temp.path().to_path_buf(),
+            None,
+            None,
+            chrono_tz::UTC,
+        );
+        let result = multiplex
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "compat_roundtrip".into(),
+                arguments: "{}".into(),
+            })
+            .await
+            .expect("compat tool should run through multiplex executor");
+        assert_eq!(result.render_for_prompt(), "roundtrip ok");
+        assert_eq!(
+            result.as_provider_payload()["source"],
+            serde_json::json!("sidecar")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_registration_exposes_remote_tool_to_multiplex_executor() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let app = axum::Router::new().route(
+            "/tool",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "ok": true,
+                    "summary": "remote ok",
+                    "kind": "remote_tool",
+                    "data": { "source": "remote" }
+                }))
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve remote tool");
+        });
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let register_exec = NativeToolExecutor {
+            tx_cron: tx.clone(),
+            invoking_agent_id: Some("developer".into()),
+            session_id: Some([8; 16]),
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Cli),
+            session_memory: Some(aria_ssmu::SessionMemory::new(4)),
+            cedar: Some(Arc::new(
+                aria_policy::CedarEvaluator::from_policy_str("")
+                    .expect("empty policy should parse"),
+            )),
+            sessions_dir: Some(temp.path().to_path_buf()),
+            scheduling_intent: None,
+            user_timezone: chrono_tz::UTC,
+        };
+        register_exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "register_remote_tool".into(),
+                arguments: serde_json::json!({
+                    "tool_name": "remote_roundtrip",
+                    "endpoint": format!("http://{}/tool", addr),
+                    "description": "Roundtrip remote tool",
+                    "parameters_schema": "{}",
+                })
+                .to_string(),
+            })
+            .await
+            .expect("register remote tool through native executor");
+
+        let vault_path = temp.path().join("vault.json");
+        let vault = Arc::new(aria_vault::CredentialVault::new(&vault_path, [8u8; 32]));
+        let multiplex = MultiplexToolExecutor::new(
+            vault,
+            "developer".into(),
+            [8; 16],
+            "u1".into(),
+            GatewayChannel::Cli,
+            tx,
+            aria_ssmu::SessionMemory::new(4),
+            Arc::new(
+                aria_policy::CedarEvaluator::from_policy_str("")
+                    .expect("empty policy should parse"),
+            ),
+            temp.path().to_path_buf(),
+            None,
+            None,
+            chrono_tz::UTC,
+        );
+        let result = multiplex
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "remote_roundtrip".into(),
+                arguments: "{}".into(),
+            })
+            .await
+            .expect("remote tool should run through multiplex executor");
+        assert_eq!(result.render_for_prompt(), "remote ok");
+        assert_eq!(
+            result.as_provider_payload()["source"],
+            serde_json::json!("remote")
+        );
+    }
+
+    #[test]
+    fn build_visible_tool_catalog_context_includes_provider_origin_kinds() {
+        register_external_compat_tool(ExternalCompatToolRegistration {
+            tool_name: "compat_visible".into(),
+            command: vec!["echo".into()],
+            description: "Compat visible tool".into(),
+            parameters_schema: "{}".into(),
+        })
+        .expect("register compat tool");
+
+        let tools = vec![
+            CachedTool {
+                name: "read_file".into(),
+                description: "Read a file".into(),
+                parameters_schema: "{}".into(),
+                embedding: Vec::new(),
+                requires_strict_schema: false,
+                streaming_safe: false,
+                parallel_safe: true,
+                modalities: vec![aria_core::ToolModality::Text],
+            },
+            CachedTool {
+                name: mcp_tool_alias_name("github", "create_issue"),
+                description: "Create a GitHub issue".into(),
+                parameters_schema: "{}".into(),
+                embedding: Vec::new(),
+                requires_strict_schema: false,
+                streaming_safe: false,
+                parallel_safe: true,
+                modalities: vec![aria_core::ToolModality::Text],
+            },
+            CachedTool {
+                name: "compat_visible".into(),
+                description: "Compat visible tool".into(),
+                parameters_schema: "{}".into(),
+                embedding: Vec::new(),
+                requires_strict_schema: false,
+                streaming_safe: false,
+                parallel_safe: false,
+                modalities: vec![aria_core::ToolModality::Text],
+            },
+        ];
+
+        let rendered = build_visible_tool_catalog_context(&tools);
+        assert!(rendered.contains("read_file [native / native]"));
+        assert!(rendered.contains("mcp__github__create_issue [mcp / mcp]"));
+        assert!(rendered.contains("compat_visible [externalcompat / externalcompat]"));
+    }
+
+    #[test]
+    fn build_tool_visibility_context_reports_hidden_tools_for_model_capabilities() {
+        let image_tool = CachedTool {
+            name: "vision_lookup".into(),
+            description: "Inspect image input".into(),
+            parameters_schema: "{}".into(),
+            embedding: Vec::new(),
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Image],
+        };
+        let text_tool = CachedTool {
+            name: "search_web".into(),
+            description: "Search the web".into(),
+            parameters_schema: "{}".into(),
+            embedding: Vec::new(),
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
+        };
+        let profile = aria_core::ModelCapabilityProfile {
+            model_ref: aria_core::ModelRef::new("openrouter", "text-only"),
+            adapter_family: aria_core::AdapterFamily::OpenAiCompatible,
+            tool_calling: aria_core::CapabilitySupport::Supported,
+            parallel_tool_calling: aria_core::CapabilitySupport::Supported,
+            streaming: aria_core::CapabilitySupport::Supported,
+            vision: aria_core::CapabilitySupport::Unsupported,
+            json_mode: aria_core::CapabilitySupport::Supported,
+            max_context_tokens: None,
+            tool_schema_mode: aria_core::ToolSchemaMode::StrictJsonSchema,
+            tool_result_mode: aria_core::ToolResultMode::NativeStructured,
+            supports_images: aria_core::CapabilitySupport::Unsupported,
+            supports_audio: aria_core::CapabilitySupport::Unsupported,
+            source: aria_core::CapabilitySourceKind::RuntimeProbe,
+            source_detail: Some("test".into()),
+            observed_at_us: 1,
+            expires_at_us: None,
+        };
+        let rendered = build_tool_visibility_context(&[image_tool, text_tool], Some(&profile))
+            .expect("visibility context");
+        assert!(rendered.contains("Visible:"));
+        assert!(rendered.contains("search_web: available"));
+        assert!(rendered.contains("Hidden:"));
+        assert!(rendered.contains("vision_lookup"));
+        assert!(rendered.contains("does not support image inputs"));
+    }
+
+    #[tokio::test]
     async fn policy_checked_executor_denies_render_mcp_prompt_without_allowlist() {
         let cedar = Arc::new(
             aria_policy::CedarEvaluator::from_policy_str(r#"permit(principal, action, resource);"#)
@@ -6832,7 +7741,7 @@ enabled = true
             .execute(&ToolCall { invocation_id: None,
                 name: "cancel_agent_run".into(),
                 arguments: r#"{"run_id":"run-cancel-1"}"#.into(),
-            })
+})
             .await
             .expect("cancel should succeed");
         assert!(result.render_for_prompt().contains("Cancelled child run"));
@@ -6898,7 +7807,7 @@ enabled = true
             .execute(&ToolCall { invocation_id: None,
                 name: "retry_agent_run".into(),
                 arguments: r#"{"run_id":"run-source-1"}"#.into(),
-            })
+})
             .await
             .expect("retry should succeed");
         let new_run_id = match result {
@@ -6995,7 +7904,7 @@ enabled = true
             .execute(&ToolCall { invocation_id: None,
                 name: "list_agent_runs".into(),
                 arguments: "{}".into(),
-            })
+})
             .await
             .expect("list_agent_runs");
         assert!(list.render_for_prompt().contains("Found 1 runs"));
@@ -7004,7 +7913,7 @@ enabled = true
             .execute(&ToolCall { invocation_id: None,
                 name: "get_agent_run".into(),
                 arguments: r#"{"run_id":"run-read-1"}"#.into(),
-            })
+})
             .await
             .expect("get_agent_run");
         assert!(detail.render_for_prompt().contains("Fetched run 'run-read-1'"));
@@ -7013,7 +7922,7 @@ enabled = true
             .execute(&ToolCall { invocation_id: None,
                 name: "get_agent_run_events".into(),
                 arguments: r#"{"run_id":"run-read-1"}"#.into(),
-            })
+})
             .await
             .expect("get_agent_run_events");
         assert!(events.render_for_prompt().contains("Found 1 events"));
@@ -7022,7 +7931,7 @@ enabled = true
             .execute(&ToolCall { invocation_id: None,
                 name: "get_agent_mailbox".into(),
                 arguments: r#"{"run_id":"run-read-1"}"#.into(),
-            })
+})
             .await
             .expect("get_agent_mailbox");
         assert!(mailbox.render_for_prompt().contains("Found 1 mailbox messages"));
@@ -7609,7 +8518,7 @@ enabled = true
             .execute(&ToolCall { invocation_id: None,
                 name: "browser_download".into(),
                 arguments: r#"{"url":"https://example.com/file.txt"}"#.into(),
-            })
+})
             .await
             .expect_err("telegram social download should be denied");
         assert!(format!("{}", err).contains("blocked for untrusted social agents"));
@@ -7630,7 +8539,7 @@ enabled = true
         let agent_store = AgentConfigStore::new();
         let tool_registry = ToolManifestStore::new();
         let session_memory = aria_ssmu::SessionMemory::new(8);
-        let page_index = Arc::new(PageIndexTree::new(8));
+        let capability_index = Arc::new(aria_ssmu::CapabilityIndex::new(8));
         let vector_store = Arc::new(VectorStore::new());
         let keyword_index = Arc::new(KeywordIndex::new().expect("keyword index"));
         let firewall = aria_safety::DfaFirewall::new(vec!["ignore previous instructions".into()]);
@@ -7673,7 +8582,7 @@ enabled = true
             &agent_store,
             &tool_registry,
             &session_memory,
-            &page_index,
+            &capability_index,
             &vector_store,
             &keyword_index,
             &firewall,
@@ -7771,7 +8680,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://blocked.example/docs"}"#.into(),
-            })
+})
             .await
             .expect_err("blocked domain should be denied");
 
@@ -7813,7 +8722,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://docs.rs/serde"}"#.into(),
-            })
+})
             .await
             .expect("allowlisted domain should be allowed");
 
@@ -7847,7 +8756,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"http://127.0.0.1/private"}"#.into(),
-            })
+})
             .await
             .expect_err("private network target should be blocked");
         assert!(format!("{}", err).contains("private or non-public IP address"));
@@ -7883,7 +8792,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"http://127.0.0.1/private"}"#.into(),
-            })
+})
             .await
             .expect("privileged trusted local agent should be allowed");
         assert_eq!(result, "ok");
@@ -7919,7 +8828,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://blocked.example/docs"}"#.into(),
-            })
+})
             .await
             .expect_err("cedar should deny blocked domain");
         assert!(format!("{}", err).contains("policy denied"));
@@ -7951,7 +8860,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://unknown.example/page"}"#.into(),
-            })
+})
             .await
             .expect_err("unknown domain should require approval");
 
@@ -8004,7 +8913,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://approved.example/docs"}"#.into(),
-            })
+})
             .await
             .expect("persisted allow decision should allow");
 
@@ -8058,7 +8967,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://denied.example/private"}"#.into(),
-            })
+})
             .await
             .expect_err("persisted deny decision should deny");
 
@@ -8121,7 +9030,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://once.example/docs"}"#.into(),
-            })
+})
             .await
             .expect("allow once should permit first request");
         assert_eq!(first, "ok");
@@ -8136,7 +9045,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://once.example/docs"}"#.into(),
-            })
+})
             .await
             .expect_err("after consumption the request should require approval again");
         assert!(format!("{}", err).contains(aria_intelligence::APPROVAL_REQUIRED_PREFIX));
@@ -8189,7 +9098,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://deny-once.example/private"}"#.into(),
-            })
+})
             .await
             .expect_err("deny once should deny first request");
         assert!(format!("{}", err).contains("denied by stored policy"));
@@ -8204,7 +9113,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://deny-once.example/private"}"#.into(),
-            })
+})
             .await
             .expect_err("after consumption the request should require approval again");
         assert!(format!("{}", err).contains(aria_intelligence::APPROVAL_REQUIRED_PREFIX));
@@ -8243,7 +9152,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://docs.rs/serde"}"#.into(),
-            })
+})
             .await
             .expect_err("firewall should block poisoned web content");
 
@@ -8371,7 +9280,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_profile_list".into(),
                 arguments: "{}".into(),
-            })
+})
             .await
             .expect("list browser profiles");
         let payload = listed.as_provider_payload();
@@ -8385,7 +9294,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_profile_use".into(),
                 arguments: r#"{"profile_id":"work-profile"}"#.into(),
-            })
+})
             .await
             .expect("bind browser profile");
         assert!(bound.contains("Bound browser profile"));
@@ -8429,7 +9338,7 @@ enabled = true
             invocation_id: None,
             name: "browser_profile_create".into(),
             arguments: r#"{"name":"Team Browser"}"#.into(),
-        })
+})
         .await
         .expect("create browser profile from name fallback");
         assert!(browser_profile_dir(sessions.path(), "team-browser").is_dir());
@@ -8488,7 +9397,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_session_start".into(),
                 arguments: r#"{"url":"https://example.com"}"#.into(),
-            })
+})
             .await
             .expect("start browser session");
         let started_payload = started.as_provider_payload();
@@ -8580,7 +9489,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_session_status".into(),
                 arguments: "{}".into(),
-            })
+})
             .await
             .expect("status browser session");
         assert!(status.contains("browser-session-active"));
@@ -8677,7 +9586,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_login_status".into(),
                 arguments: r#"{"domain":"github.com"}"#.into(),
-            })
+})
             .await
             .expect("browser login status");
         assert!(status.contains("Found 1 browser login state record(s)."));
@@ -8752,7 +9661,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_session_start".into(),
                 arguments: r#"{"url":"https://github.com"}"#.into(),
-            })
+})
             .await
             .expect("start browser session");
         let started_payload = started.as_provider_payload();
@@ -8767,7 +9676,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_session_list".into(),
                 arguments: "{}".into(),
-            })
+})
             .await
             .expect("list browser sessions");
         let listed_payload = listed.as_provider_payload();
@@ -8856,7 +9765,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_session_start".into(),
                 arguments: r#"{"url":"https://github.com"}"#.into(),
-            })
+})
             .await
             .expect_err("attached transport should not silently reuse managed launch");
         assert!(format!("{}", err).contains("attached browser transport"));
@@ -8931,7 +9840,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_session_start".into(),
                 arguments: r#"{"url":"https://github.com"}"#.into(),
-            })
+})
             .await
             .expect("start browser session");
         let payload = result.as_provider_payload();
@@ -9033,7 +9942,7 @@ printf '{"cookies":[{"name":"sid","value":"cookie-secret"}],"localStorage":{"tok
                 invocation_id: None,
                 name: "browser_session_persist_state".into(),
                 arguments: r#"{"browser_session_id":"browser-session-1"}"#.into(),
-            })
+})
             .await
             .expect("persist session state");
         let payload = result.as_provider_payload();
@@ -9166,7 +10075,7 @@ printf '{"cookies":[{"name":"sid","value":"cookie-secret"}],"localStorage":{"tok
             invocation_id: None,
             name: "browser_session_restore_state".into(),
             arguments: r#"{"browser_session_id":"browser-session-1"}"#.into(),
-        })
+})
         .await
         .expect("restore session state");
 
@@ -9259,7 +10168,7 @@ printf '{"cookies":[]}'"#,
                 invocation_id: None,
                 name: "browser_session_persist_state".into(),
                 arguments: r#"{"browser_session_id":"browser-session-1"}"#.into(),
-            })
+})
             .await
             .expect_err("persist state should fail without master key");
         assert!(format!("{}", err).contains("ARIA_MASTER_KEY must be set"));
@@ -11040,7 +11949,7 @@ printf '{"ok":true,"mode":"bridge"}'
                 invocation_id: None,
                 name: "browser_session_start".into(),
                 arguments: r#"{"url":"https://github.com"}"#.into(),
-            })
+})
             .await
             .expect("browser_session_start");
         let payload = result.as_provider_payload();
@@ -12110,7 +13019,7 @@ exit 0
                 invocation_id: None,
                 name: "list_watch_jobs".into(),
                 arguments: "{}".into(),
-            })
+})
             .await
             .expect("list_watch_jobs");
         let payload = result.as_provider_payload();
@@ -12240,14 +13149,14 @@ exit 0
             invocation_id: None,
             name: "browser_session_pause".into(),
             arguments: r#"{"browser_session_id":"browser-session-1"}"#.into(),
-        })
+})
         .await
         .expect("pause session");
         exec.execute(&ToolCall {
             invocation_id: None,
             name: "browser_session_resume".into(),
             arguments: r#"{"browser_session_id":"browser-session-1"}"#.into(),
-        })
+})
         .await
         .expect("resume session");
 
@@ -12318,7 +13227,7 @@ exit 0
                 invocation_id: None,
                 name: "browser_session_cleanup".into(),
                 arguments: "{}".into(),
-            })
+})
             .await
             .expect("browser_session_cleanup");
         assert!(result.contains("Cleaned up 1 stale browser session"));
@@ -12391,7 +13300,7 @@ exit 0
                 invocation_id: None,
                 name: "browser_profile_use".into(),
                 arguments: r#"{"profile_id":"work-profile"}"#.into(),
-            })
+})
             .await
             .expect_err("profile outside allowlist should be denied");
         assert!(format!("{}", err).contains("not permitted"));
@@ -12455,7 +13364,7 @@ exit 0
                 invocation_id: None,
                 name: "browser_profile_use".into(),
                 arguments: r#"{"profile_id":"attached-profile"}"#.into(),
-            })
+})
             .await
             .expect_err("attached profile should be denied");
         assert!(format!("{}", err).contains("transport"));
@@ -12509,7 +13418,7 @@ exit 0
             invocation_id: None,
             name: "browser_profile_use".into(),
             arguments: r#"{"profile_id":"extension-profile"}"#.into(),
-        })
+})
         .await
         .expect("extension profile should be allowed");
     }
@@ -12565,7 +13474,7 @@ exit 0
                 invocation_id: None,
                 name: "browser_profile_use".into(),
                 arguments: r#"{"profile_id":"work-profile"}"#.into(),
-            })
+})
             .await
             .expect_err("cedar should deny browser profile");
         assert!(format!("{}", err).contains("policy denied"));
@@ -12739,6 +13648,198 @@ exit 0
         };
         let err = validate_config(&cfg).expect_err("invalid stt backend should fail");
         assert!(err.contains("gateway.stt_backend"));
+    }
+
+    #[test]
+    fn validate_config_rejects_local_whisper_without_model() {
+        let mut cfg = base_test_config();
+        cfg.gateway.adapter = "telegram".into();
+        cfg.gateway.telegram_token = "token".into();
+        cfg.gateway.stt_mode = "local".into();
+        let mut runtime = load_runtime_env_config().expect("runtime env config");
+        runtime.whisper_cpp_model = None;
+        runtime.whisper_cpp_bin = "missing-whisper-cli".into();
+        runtime.ffmpeg_bin = "missing-ffmpeg".into();
+        let cfg = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+        let err = validate_config(&cfg).expect_err("missing whisper model should fail");
+        assert!(err.contains("WHISPER_CPP_MODEL") || err.contains("whisper_cpp_model"));
+    }
+
+    #[test]
+    fn validate_config_rejects_local_whisper_without_required_binaries() {
+        let mut cfg = base_test_config();
+        cfg.gateway.adapter = "telegram".into();
+        cfg.gateway.telegram_token = "token".into();
+        cfg.gateway.stt_mode = "local".into();
+        let model = tempfile::NamedTempFile::new().expect("temp model");
+        let mut runtime = load_runtime_env_config().expect("runtime env config");
+        runtime.whisper_cpp_model = Some(model.path().to_string_lossy().to_string());
+        runtime.whisper_cpp_bin = "missing-whisper-cli".into();
+        runtime.ffmpeg_bin = "missing-ffmpeg".into();
+        let cfg = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+        let err = validate_config(&cfg).expect_err("missing local whisper binaries should fail");
+        assert!(err.contains("whisper_cpp_bin") || err.contains("ffmpeg_bin"));
+    }
+
+    #[test]
+    fn validate_config_allows_auto_stt_without_local_whisper_runtime() {
+        let mut cfg = base_test_config();
+        cfg.gateway.adapter = "telegram".into();
+        cfg.gateway.telegram_token = "token".into();
+        cfg.gateway.stt_mode = "auto".into();
+        let mut runtime = load_runtime_env_config().expect("runtime env config");
+        runtime.whisper_cpp_model = None;
+        runtime.whisper_cpp_bin = "missing-whisper-cli".into();
+        runtime.ffmpeg_bin = "missing-ffmpeg".into();
+        let cfg = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+        validate_config(&cfg).expect("auto stt mode should not hard-fail without local runtime");
+    }
+
+    #[test]
+    fn upsert_env_file_entries_replaces_and_appends_values() {
+        let temp = tempfile::NamedTempFile::new().expect("temp env");
+        std::fs::write(temp.path(), "A=1\nB=2\n").expect("seed env");
+        upsert_env_file_entries(temp.path(), &[("B", "3"), ("C", "4")]).expect("upsert env");
+        let content = std::fs::read_to_string(temp.path()).expect("read env");
+        assert!(content.contains("A=1\n"));
+        assert!(content.contains("B=3\n"));
+        assert!(content.contains("C=4\n"));
+    }
+
+    #[test]
+    fn render_cli_help_lists_install_doctor_and_runtime_commands() {
+        let help = render_cli_help(None);
+        assert!(help.contains("aria-x install"));
+        assert!(help.contains("aria-x doctor"));
+        assert!(help.contains("aria-x run"));
+        assert!(help.contains("aria-x tui"));
+        assert!(help.contains("aria-x inspect context"));
+        assert!(help.contains("aria-x explain context"));
+        assert!(help.contains("--explain-context"));
+        assert!(help.contains("--explain-provider-payloads"));
+    }
+
+    #[test]
+    fn render_cli_help_supports_topic_help() {
+        let help = render_cli_help(Some("doctor"));
+        assert!(help.contains("aria-x doctor"));
+        assert!(help.contains("doctor stt"));
+        assert!(!help.contains("aria-x install"));
+    }
+
+    #[test]
+    fn render_cli_help_lists_completion_and_extended_doctor_topics() {
+        let help = render_cli_help(None);
+        assert!(help.contains("aria-x completion"));
+        let doctor_help = render_cli_help(Some("doctor"));
+        assert!(doctor_help.contains("doctor env"));
+        assert!(doctor_help.contains("doctor gateway"));
+        assert!(doctor_help.contains("doctor browser"));
+        let inspect_help = render_cli_help(Some("inspect"));
+        assert!(inspect_help.contains("provider-payloads"));
+        let explain_help = render_cli_help(Some("explain"));
+        assert!(explain_help.contains("provider-payloads"));
+    }
+
+    #[test]
+    fn install_binary_copies_executable_to_target_location() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("aria-x-source");
+        let target = temp.path().join("bin").join("aria-x");
+        std::fs::write(&source, "#!/bin/sh\necho aria-x\n").expect("write source");
+        install_binary(&source, &target, InstallMode::Copy).expect("install binary");
+        let installed = std::fs::read_to_string(&target).expect("read target");
+        assert!(installed.contains("echo aria-x"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111);
+        }
+    }
+
+    #[test]
+    fn render_doctor_summary_reports_runtime_and_stt_state() {
+        let cfg = base_test_config();
+        let runtime = load_runtime_env_config().expect("runtime env config");
+        let cfg = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+        let summary = render_doctor_summary(&cfg);
+        assert!(summary.contains("ARIA-X doctor"));
+        assert!(summary.contains("runtime_status:"));
+        assert!(summary.contains("configured_channels:"));
+        assert!(summary.contains("stt_effective_mode:"));
+    }
+
+    #[test]
+    fn render_env_gateway_and_browser_doctors_include_key_sections() {
+        let cfg = base_test_config();
+        let runtime = load_runtime_env_config().expect("runtime env config");
+        let cfg = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+        let env_text = render_env_doctor(&cfg);
+        let gateway_text = render_gateway_doctor(&cfg);
+        let browser_text = render_browser_doctor(&cfg);
+        assert!(env_text.contains("Environment doctor"));
+        assert!(env_text.contains("telegram_token_present:"));
+        assert!(gateway_text.contains("Gateway doctor"));
+        assert!(gateway_text.contains("configured_channels:"));
+        assert!(browser_text.contains("Browser doctor"));
+        assert!(browser_text.contains("automation_bin:"));
+    }
+
+    #[test]
+    fn render_shell_completion_supports_zsh_and_rejects_unknown_shell() {
+        let zsh = render_shell_completion("zsh").expect("zsh completion");
+        assert!(zsh.contains("#compdef aria-x"));
+        let err = render_shell_completion("powershell").expect_err("unknown shell should fail");
+        assert!(err.contains("Usage: aria-x completion"));
+    }
+
+    #[test]
+    fn seed_default_runtime_config_preserves_existing_file_without_overwrite() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target_dir = temp.path().join("config-home");
+        std::fs::create_dir_all(&target_dir).expect("create target dir");
+        let target = target_dir.join("config.toml");
+        std::fs::write(&target, "seed=existing\n").expect("write existing");
+        seed_default_runtime_config_at(&target, false).expect("seed without overwrite");
+        let content = std::fs::read_to_string(&target).expect("read target");
+        assert_eq!(content, "seed=existing\n");
+    }
+
+    #[test]
+    fn seed_default_runtime_config_overwrites_when_requested() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target_dir = temp.path().join("config-home");
+        std::fs::create_dir_all(&target_dir).expect("create target dir");
+        let target = target_dir.join("config.toml");
+        std::fs::write(&target, "seed=existing\n").expect("write existing");
+        let status = seed_default_runtime_config_at(&target, true).expect("seed overwrite");
+        assert!(status.contains("installed default config"));
+        let content = std::fs::read_to_string(&target).expect("read target");
+        assert!(content.contains("[llm]"));
     }
 
     #[test]
@@ -13025,8 +14126,8 @@ exit 0
             false,
         );
 
-        let mut page_index = PageIndexTree::new(8);
-        let _ = page_index.insert(PageNode {
+        let mut capability_index = aria_ssmu::CapabilityIndex::new(8);
+        let _ = capability_index.insert(PageNode {
             node_id: "workspace.root".into(),
             title: "Workspace".into(),
             summary: "Workspace page".into(),
@@ -13048,21 +14149,26 @@ exit 0
             .expect("index docs");
 
         let query_embedding = super::local_embed("news summary", 64);
-        let (rag_context, metrics) = build_split_rag_context(
+        let (rag_context, bundle, metrics) = build_split_rag_context(
             "news summary",
             &query_embedding,
+            &[],
             &vector_store,
-            &page_index,
+            &capability_index,
             &keyword_index,
             None,
             Some(aria_core::TrustProfile::UntrustedWeb),
         );
 
-        assert!(rag_context.contains("Session Context:"));
+        assert!(!rag_context.contains("Session Context:"));
         assert!(rag_context.contains("Workspace Context:"));
         assert!(rag_context.contains("External Context:"));
         assert!(!rag_context.contains("Social Context:"));
         assert!(!rag_context.contains("Twitter thread summary"));
+        assert!(bundle
+            .blocks
+            .iter()
+            .any(|block| block.source_kind == aria_core::RetrievalSourceKind::External));
         assert_eq!(metrics.workspace_hits, 1);
     }
 
@@ -13109,8 +14215,8 @@ exit 0
             false,
         );
 
-        let mut page_index = PageIndexTree::new(8);
-        let _ = page_index.insert(PageNode {
+        let mut capability_index = aria_ssmu::CapabilityIndex::new(8);
+        let _ = capability_index.insert(PageNode {
             node_id: "workspace.root".into(),
             title: "Workspace".into(),
             summary: "Workspace page".into(),
@@ -13156,11 +14262,12 @@ exit 0
             trust_profile: None,
         };
 
-        let (rag_context, metrics) = build_split_rag_context(
+        let (rag_context, bundle, metrics) = build_split_rag_context(
             "news summary",
             &query_embedding,
+            &[],
             &vector_store,
-            &page_index,
+            &capability_index,
             &keyword_index,
             Some(&profile),
             None,
@@ -13169,6 +14276,10 @@ exit 0
         assert!(!rag_context.contains("Session Context:"));
         assert!(rag_context.contains("Workspace Context:"));
         assert!(!rag_context.contains("External Context:"));
+        assert!(bundle
+            .blocks
+            .iter()
+            .all(|block| block.source_kind != aria_core::RetrievalSourceKind::External));
         assert_eq!(metrics.external_hits, 0);
     }
 
@@ -13348,7 +14459,7 @@ exit 0
             policy_hits: 1,
             external_hits: 0,
             social_hits: 0,
-            page_context_hits: 1,
+            document_context_hits: 1,
             history_tokens: 120,
             rag_tokens: 240,
             control_tokens: 60,
@@ -14858,7 +15969,7 @@ exit 0
                 policy_hits: 0,
                 external_hits: 0,
                 social_hits: 0,
-                page_context_hits: 1,
+                document_context_hits: 1,
                 history_tokens: 100,
                 rag_tokens: 200,
                 control_tokens: 50,
@@ -15211,7 +16322,8 @@ exit 0
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
         let tx_for_task = Arc::clone(&tx);
-        let handle = spawn_supervised_adapter("test", GatewayChannel::WebSocket, move || {
+        let shutdown = Arc::new(ShutdownCoordinator::new());
+        let handle = spawn_supervised_adapter("test", GatewayChannel::WebSocket, shutdown, move || {
             let attempts = Arc::clone(&attempts_for_task);
             let tx = Arc::clone(&tx_for_task);
             async move {
@@ -16645,7 +17757,7 @@ exit 0
             .await
             .expect("schedule should use classifier schedule");
 
-        assert!(result.contains("Scheduled reminder notification"));
+        assert!(result.contains("notify + deferred execution"));
         let job = job_rx.await.expect("expected Add job");
         assert_eq!(job.schedule_str, "at:2026-03-06T20:45:00+00:00");
     }
@@ -16696,17 +17808,21 @@ exit 0
     }
 
     #[tokio::test]
-    async fn schedule_message_notify_with_deferred_prompt_prefers_defer_execution() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<aria_intelligence::CronCommand>(2);
-        let (job_tx, job_rx) =
-            tokio::sync::oneshot::channel::<aria_intelligence::ScheduledPromptJob>();
+    async fn schedule_message_notify_with_deferred_prompt_normalizes_to_both() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<aria_intelligence::CronCommand>(3);
+        let (kinds_tx, kinds_rx) =
+            tokio::sync::oneshot::channel::<Vec<aria_intelligence::ScheduledJobKind>>();
         tokio::spawn(async move {
             if let Some(aria_intelligence::CronCommand::List(reply)) = rx.recv().await {
                 let _ = reply.send(Vec::new());
             }
-            if let Some(aria_intelligence::CronCommand::Add(job)) = rx.recv().await {
-                let _ = job_tx.send(job);
+            let mut kinds = Vec::new();
+            for _ in 0..2 {
+                if let Some(aria_intelligence::CronCommand::Add(job)) = rx.recv().await {
+                    kinds.push(job.kind);
+                }
             }
+            let _ = kinds_tx.send(kinds);
         });
         let exec = NativeToolExecutor {
             tx_cron: tx,
@@ -16727,15 +17843,12 @@ exit 0
                 arguments: r#"{"task":"Send contents of new_ok.js","schedule":{"kind":"every","seconds":120},"mode":"notify","deferred_prompt":"Read the contents of new_ok.js and send them to me.","agent_id":"omni"}"#.into(),
             })
             .await
-            .expect("schedule should coerce to defer");
+            .expect("schedule should normalize to both");
 
-        assert!(result.contains("deferred execution"));
-        let job = job_rx.await.expect("expected Add job");
-        assert_eq!(job.kind, aria_intelligence::ScheduledJobKind::Orchestrate);
-        assert_eq!(
-            job.prompt,
-            "Read the contents of new_ok.js and send them to me."
-        );
+        assert!(result.contains("notify + deferred execution"));
+        let kinds = kinds_rx.await.expect("expected Add jobs");
+        assert!(kinds.contains(&aria_intelligence::ScheduledJobKind::Notify));
+        assert!(kinds.contains(&aria_intelligence::ScheduledJobKind::Orchestrate));
     }
 
     #[tokio::test]
@@ -16817,6 +17930,45 @@ exit 0
         let job = job_rx.await.expect("add job not received");
         assert!(job.id.starts_with("cron-"));
         assert_eq!(job.kind, aria_intelligence::ScheduledJobKind::Orchestrate);
+    }
+
+    #[tokio::test]
+    async fn manage_cron_accepts_legacy_schedule_string() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<aria_intelligence::CronCommand>(1);
+        let (job_tx, job_rx) =
+            tokio::sync::oneshot::channel::<aria_intelligence::ScheduledPromptJob>();
+        tokio::spawn(async move {
+            if let Some(aria_intelligence::CronCommand::Add(job)) = rx.recv().await {
+                let _ = job_tx.send(job);
+            }
+        });
+        let exec = NativeToolExecutor {
+            tx_cron: tx,
+            invoking_agent_id: Some("planner".into()),
+            session_id: Some(*uuid::Uuid::new_v4().as_bytes()),
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Cli),
+            session_memory: None,
+            cedar: None,
+            sessions_dir: None,
+            scheduling_intent: None,
+            user_timezone: chrono_tz::UTC,
+        };
+        let result = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "manage_cron".into(),
+                arguments: r#"{"action":"add","prompt":"run report","schedule":"every:60s","agent_id":"developer"}"#.into(),
+            })
+            .await
+            .expect("manage_cron should accept normalized schedule string");
+        assert!(result.contains("Cron cron-"));
+
+        let job = job_rx.await.expect("add job not received");
+        assert!(matches!(
+            job.schedule,
+            aria_intelligence::ScheduleSpec::EverySeconds(60)
+        ));
     }
 
     #[tokio::test]
@@ -16969,7 +18121,7 @@ exit 0
             .execute(&ToolCall { invocation_id: None,
                 name: "manage_cron".into(),
                 arguments: r#"{"action":"list"}"#.into(),
-            })
+})
             .await
             .expect("list crons");
 
@@ -17069,6 +18221,260 @@ exit 0
             "startup smoke exceeded budget: {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn operator_cli_inspect_subcommand_returns_context_json() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let policy_path = config_dir.path().join("policy.cedar");
+        std::fs::write(&policy_path, r#"permit(principal, action, resource);"#)
+            .expect("write policy");
+
+        let mut config = base_test_config();
+        config.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        config.policy.policy_path = policy_path.to_string_lossy().to_string();
+        let resolved = ResolvedAppConfig {
+            path: config_dir.path().join("config.toml"),
+            file: config,
+            runtime: load_runtime_env_config().expect("runtime env config"),
+        };
+
+        let session_id = *uuid::Uuid::new_v4().as_bytes();
+        RuntimeStore::for_sessions_dir(sessions.path())
+            .append_context_inspection(&aria_core::ContextInspectionRecord {
+                context_id: "ctx-cli-1".into(),
+                request_id: *uuid::Uuid::new_v4().as_bytes(),
+                session_id,
+                agent_id: "omni".into(),
+                channel: aria_core::GatewayChannel::Cli,
+                provider_model: Some("gemini/gemini-3-flash-preview".into()),
+                prompt_mode: "execution".into(),
+                history_tokens: 1,
+                context_tokens: 2,
+                system_tokens: 3,
+                user_tokens: 1,
+                tool_count: 1,
+                active_tool_names: vec!["search_web".into()],
+                tool_runtime_policy: Some(aria_core::ToolRuntimePolicy::default()),
+                tool_selection: Some(aria_core::ToolSelectionDecision {
+                    tool_choice: aria_core::ToolChoicePolicy::Auto,
+                    tool_calling_mode: aria_core::ToolCallingMode::NativeTools,
+                    text_fallback_mode: false,
+                    relevance_threshold_millis: None,
+                    available_tool_names: vec!["search_web".into()],
+                    selected_tool_names: vec!["search_web".into()],
+                    candidate_scores: vec![aria_core::ToolSelectionScore {
+                        tool_name: "search_web".into(),
+                        score: 321,
+                        source: "registry".into(),
+                    }],
+                }),
+                provider_request_payload: Some(serde_json::json!({"model":"gemini-3-flash-preview"})),
+                selected_tool_catalog: Vec::new(),
+                hidden_tool_messages: Vec::new(),
+                emitted_artifacts: Vec::new(),
+                tool_provider_readiness: Vec::new(),
+                pack: aria_core::ExecutionContextPack {
+                    system_prompt: "sys".into(),
+                    history_messages: vec![],
+                    context_blocks: vec![],
+                    user_request: "hello".into(),
+                    channel: aria_core::GatewayChannel::Cli,
+                    execution_contract: None,
+                    retrieved_context: None,
+                },
+                rendered_prompt: "rendered".into(),
+                created_at_us: 1,
+            })
+            .expect("append context inspection");
+
+        let out = run_operator_cli_command(
+            &resolved,
+            &[
+                "aria-x".into(),
+                "inspect".into(),
+                "context".into(),
+                uuid::Uuid::from_bytes(session_id).to_string(),
+            ],
+        )
+        .expect("inspect command should route")
+        .expect("inspect output");
+        assert!(out.contains("\"ctx-cli-1\""));
+        assert!(out.contains("\"provider_request_payload\""));
+    }
+
+    #[test]
+    fn operator_cli_explain_subcommand_renders_provider_payload_summary() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let policy_path = config_dir.path().join("policy.cedar");
+        std::fs::write(&policy_path, r#"permit(principal, action, resource);"#)
+            .expect("write policy");
+
+        let mut config = base_test_config();
+        config.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        config.policy.policy_path = policy_path.to_string_lossy().to_string();
+        let resolved = ResolvedAppConfig {
+            path: config_dir.path().join("config.toml"),
+            file: config,
+            runtime: load_runtime_env_config().expect("runtime env config"),
+        };
+
+        let session_id = *uuid::Uuid::new_v4().as_bytes();
+        RuntimeStore::for_sessions_dir(sessions.path())
+            .append_context_inspection(&aria_core::ContextInspectionRecord {
+                context_id: "ctx-cli-2".into(),
+                request_id: *uuid::Uuid::new_v4().as_bytes(),
+                session_id,
+                agent_id: "omni".into(),
+                channel: aria_core::GatewayChannel::Cli,
+                provider_model: Some("openrouter/openai/gpt-4o-mini".into()),
+                prompt_mode: "execution".into(),
+                history_tokens: 1,
+                context_tokens: 1,
+                system_tokens: 1,
+                user_tokens: 1,
+                tool_count: 1,
+                active_tool_names: vec!["read_file".into()],
+                tool_runtime_policy: Some(aria_core::ToolRuntimePolicy::default()),
+                tool_selection: Some(aria_core::ToolSelectionDecision {
+                    tool_choice: aria_core::ToolChoicePolicy::Auto,
+                    tool_calling_mode: aria_core::ToolCallingMode::CompatTools,
+                    text_fallback_mode: false,
+                    relevance_threshold_millis: None,
+                    available_tool_names: vec!["read_file".into()],
+                    selected_tool_names: vec!["read_file".into()],
+                    candidate_scores: vec![],
+                }),
+                provider_request_payload: Some(serde_json::json!({
+                    "model":"openai/gpt-4o-mini",
+                    "messages":[{"role":"user","content":"hello"}]
+                })),
+                selected_tool_catalog: Vec::new(),
+                hidden_tool_messages: Vec::new(),
+                emitted_artifacts: Vec::new(),
+                tool_provider_readiness: Vec::new(),
+                pack: aria_core::ExecutionContextPack {
+                    system_prompt: "sys".into(),
+                    history_messages: vec![],
+                    context_blocks: vec![],
+                    user_request: "hello".into(),
+                    channel: aria_core::GatewayChannel::Cli,
+                    execution_contract: None,
+                    retrieved_context: None,
+                },
+                rendered_prompt: "rendered".into(),
+                created_at_us: 1,
+            })
+            .expect("append context inspection");
+
+        let out = run_operator_cli_command(
+            &resolved,
+            &[
+                "aria-x".into(),
+                "explain".into(),
+                "provider-payloads".into(),
+                uuid::Uuid::from_bytes(session_id).to_string(),
+            ],
+        )
+        .expect("explain command should route")
+        .expect("explain output");
+        assert!(out.contains("Context ctx-cli-2"));
+        assert!(out.contains("Selected tools: read_file"));
+        assert!(out.contains("\"model\": \"openai/gpt-4o-mini\""));
+    }
+
+    #[test]
+    fn operator_cli_provider_payload_singular_alias_routes_for_inspect_and_explain() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let policy_path = config_dir.path().join("policy.cedar");
+        std::fs::write(&policy_path, r#"permit(principal, action, resource);"#)
+            .expect("write policy");
+
+        let mut config = base_test_config();
+        config.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        config.policy.policy_path = policy_path.to_string_lossy().to_string();
+        let resolved = ResolvedAppConfig {
+            path: config_dir.path().join("config.toml"),
+            file: config,
+            runtime: load_runtime_env_config().expect("runtime env config"),
+        };
+
+        let session_id = *uuid::Uuid::new_v4().as_bytes();
+        RuntimeStore::for_sessions_dir(sessions.path())
+            .append_context_inspection(&aria_core::ContextInspectionRecord {
+                context_id: "ctx-cli-alias".into(),
+                request_id: *uuid::Uuid::new_v4().as_bytes(),
+                session_id,
+                agent_id: "omni".into(),
+                channel: aria_core::GatewayChannel::Cli,
+                provider_model: Some("openrouter/openai/gpt-4o-mini".into()),
+                prompt_mode: "execution".into(),
+                history_tokens: 1,
+                context_tokens: 1,
+                system_tokens: 1,
+                user_tokens: 1,
+                tool_count: 1,
+                active_tool_names: vec!["search_web".into()],
+                tool_runtime_policy: Some(aria_core::ToolRuntimePolicy::default()),
+                tool_selection: Some(aria_core::ToolSelectionDecision {
+                    tool_choice: aria_core::ToolChoicePolicy::Auto,
+                    tool_calling_mode: aria_core::ToolCallingMode::NativeTools,
+                    text_fallback_mode: false,
+                    relevance_threshold_millis: None,
+                    available_tool_names: vec!["search_web".into()],
+                    selected_tool_names: vec!["search_web".into()],
+                    candidate_scores: vec![],
+                }),
+                provider_request_payload: Some(serde_json::json!({
+                    "model":"openai/gpt-4o-mini",
+                    "messages":[{"role":"user","content":"hello"}]
+                })),
+                selected_tool_catalog: Vec::new(),
+                hidden_tool_messages: Vec::new(),
+                emitted_artifacts: Vec::new(),
+                tool_provider_readiness: Vec::new(),
+                pack: aria_core::ExecutionContextPack {
+                    system_prompt: "sys".into(),
+                    history_messages: vec![],
+                    context_blocks: vec![],
+                    user_request: "hello".into(),
+                    channel: aria_core::GatewayChannel::Cli,
+                    execution_contract: None,
+                    retrieved_context: None,
+                },
+                rendered_prompt: "rendered".into(),
+                created_at_us: 1,
+            })
+            .expect("append context inspection");
+
+        let inspect_out = run_operator_cli_command(
+            &resolved,
+            &[
+                "aria-x".into(),
+                "inspect".into(),
+                "provider-payload".into(),
+                uuid::Uuid::from_bytes(session_id).to_string(),
+            ],
+        )
+        .expect("inspect alias command should route")
+        .expect("inspect alias output");
+        assert!(inspect_out.contains("\"ctx-cli-alias\""));
+
+        let explain_out = run_operator_cli_command(
+            &resolved,
+            &[
+                "aria-x".into(),
+                "explain".into(),
+                "provider-payload".into(),
+                uuid::Uuid::from_bytes(session_id).to_string(),
+            ],
+        )
+        .expect("explain alias command should route")
+        .expect("explain alias output");
+        assert!(explain_out.contains("Context ctx-cli-alias"));
     }
 
     #[test]
@@ -17255,7 +18661,7 @@ exit 0
     #[test]
     fn runtime_exposes_base_tool_filters_unimplemented_research_tools() {
         assert!(runtime_exposes_base_tool("fetch_url"));
-        assert!(!runtime_exposes_base_tool("search_web"));
+        assert!(runtime_exposes_base_tool("search_web"));
         assert!(!runtime_exposes_base_tool("summarise_doc"));
         assert!(!runtime_exposes_base_tool("query_rag"));
     }
@@ -17266,7 +18672,7 @@ exit 0
             invocation_id: None,
             name: "read_file".into(),
             arguments: serde_json::json!({
-                "path": "./src/tools.rs"
+                "path": "./src/tools.rs",
             })
             .to_string(),
         };
@@ -17764,7 +19170,7 @@ exit 0
     }
 
     #[test]
-    fn effective_tool_runtime_policy_for_request_requires_tools_for_scheduling_intents() {
+    fn effective_tool_runtime_policy_for_request_requires_tools_for_reminder_intents() {
         let req = AgentRequest {
             request_id: [1; 16],
             session_id: [2; 16],
@@ -17786,6 +19192,87 @@ exit 0
         .expect("policy");
         assert_eq!(policy.tool_choice, aria_core::ToolChoicePolicy::Required);
         assert!(!policy.allow_parallel_tool_calls);
+    }
+
+    #[test]
+    fn effective_tool_runtime_policy_for_request_requires_tools_for_deferred_intents() {
+        let req = AgentRequest {
+            request_id: [3; 16],
+            session_id: [4; 16],
+            channel: GatewayChannel::Cli,
+            user_id: "u".into(),
+            content: MessageContent::Text("Do this in 2 minutes".into()),
+            tool_runtime_policy: None,
+            timestamp_us: 1,
+        };
+        let now = chrono::Utc::now().with_timezone(&chrono_tz::Asia::Kolkata);
+        let scheduling_intent =
+            classify_scheduling_intent("Do this in 2 minutes", now).expect("intent");
+
+        let policy = effective_tool_runtime_policy_for_request(
+            &req,
+            "Do this in 2 minutes",
+            Some(&scheduling_intent),
+        )
+        .expect("policy");
+        assert_eq!(policy.tool_choice, aria_core::ToolChoicePolicy::Required);
+        assert!(!policy.allow_parallel_tool_calls);
+    }
+
+    #[test]
+    fn resolve_execution_contract_requires_file_artifact_for_file_write_requests() {
+        let contract = resolve_execution_contract(
+            "Save this yourself inside a hello1.js file",
+            None,
+        );
+        assert_eq!(
+            contract.kind,
+            aria_core::ExecutionContractKind::ArtifactCreate
+        );
+        assert_eq!(
+            contract.required_artifact_kinds,
+            vec![aria_core::ExecutionArtifactKind::File]
+        );
+        assert!(
+            contract
+                .forbidden_completion_modes
+                .contains(&"plain_text_only".to_string())
+        );
+    }
+
+    #[test]
+    fn execution_contract_requires_tool_capable_model_for_artifact_contracts() {
+        let schedule_contract = resolve_execution_contract(
+            "Set a reminder in 2 minutes to stretch",
+            None,
+        );
+        let file_contract = resolve_execution_contract(
+            "Create a hello.js file with console.log('hi')",
+            None,
+        );
+        let answer_contract = aria_core::ExecutionContract {
+            kind: aria_core::ExecutionContractKind::AnswerOnly,
+            allowed_tool_classes: Vec::new(),
+            required_artifact_kinds: Vec::new(),
+            forbidden_completion_modes: Vec::new(),
+            fallback_mode: None,
+            approval_required: false,
+        };
+        assert!(execution_contract_requires_tool_capable_model(&schedule_contract));
+        assert!(execution_contract_requires_tool_capable_model(&file_contract));
+        assert!(!execution_contract_requires_tool_capable_model(&answer_contract));
+    }
+
+    #[test]
+    fn dynamic_search_tool_registry_schema_is_valid_json_schema() {
+        let schema = aria_intelligence::normalize_tool_schema(
+            r#"{"type":"object","properties":{"query":{"type":"string","description":"Description of the capability you need"}},"required":["query"],"additionalProperties":false}"#,
+        )
+        .expect("search_tool_registry schema should normalize");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&schema).expect("normalized schema should parse");
+        assert_eq!(parsed["type"], "object");
+        assert_eq!(parsed["required"], serde_json::json!(["query"]));
     }
 
     #[test]
@@ -17867,5 +19354,243 @@ exit 0
             .expect("list approvals");
         assert_eq!(approvals.len(), 1);
         assert_eq!(approvals[0].tool_name, "write_file");
+    }
+
+    #[test]
+    fn build_split_rag_context_includes_live_session_history_hits() {
+        let vector_store = VectorStore::new();
+        let capability_index = aria_ssmu::CapabilityIndex::new(8);
+        let keyword_index = KeywordIndex::new().expect("keyword index");
+        let history = vec![
+            aria_ssmu::Message {
+                role: "user".into(),
+                content: "My name is Martian".into(),
+                timestamp_us: 10,
+            },
+            aria_ssmu::Message {
+                role: "assistant".into(),
+                content: "Understood, Martian.".into(),
+                timestamp_us: 11,
+            },
+        ];
+
+        let (rag, bundle, metrics) = build_split_rag_context(
+            "What's my name?",
+            &local_embed("What's my name?", 64),
+            &history,
+            &vector_store,
+            &capability_index,
+            &keyword_index,
+            None,
+            None,
+        );
+
+        assert!(rag.contains("Session Context:"));
+        assert!(rag.contains("Martian"));
+        assert!(bundle
+            .blocks
+            .iter()
+            .any(|block| block.source_kind == aria_core::RetrievalSourceKind::SessionHistory
+                || block.source_kind == aria_core::RetrievalSourceKind::SessionMemory));
+        assert!(metrics.session_hits >= 1);
+    }
+
+    #[test]
+    fn build_split_rag_context_dedupes_parent_child_vector_hits() {
+        let mut vector_store = VectorStore::new();
+        vector_store.index_document_with_parent(
+            "micro-1",
+            "Rust capability micro chunk",
+            local_embed("Rust capability micro chunk", 64),
+            "parent-1",
+            "Rust capability parent chunk with broader context",
+            local_embed("Rust capability parent chunk with broader context", 64),
+            "workspace",
+            vec!["workspace".into()],
+        );
+        let capability_index = aria_ssmu::CapabilityIndex::new(8);
+        let keyword_index = KeywordIndex::new().expect("keyword index");
+        keyword_index
+            .add_documents_batch(&[
+                ("micro-1".into(), "Rust capability micro chunk".into()),
+                (
+                    "parent-1".into(),
+                    "Rust capability parent chunk with broader context".into(),
+                ),
+            ])
+            .expect("index docs");
+
+        let (_rag, bundle, metrics) = build_split_rag_context(
+            "rust capability context",
+            &local_embed("rust capability context", 64),
+            &[],
+            &vector_store,
+            &capability_index,
+            &keyword_index,
+            None,
+            None,
+        );
+
+        let workspace_blocks = bundle
+            .blocks
+            .iter()
+            .filter(|block| block.source_kind == aria_core::RetrievalSourceKind::Workspace)
+            .collect::<Vec<_>>();
+        assert_eq!(workspace_blocks.len(), 1);
+        assert_eq!(bundle.dropped_blocks.len(), 1);
+        assert_eq!(metrics.dropped_duplicate_hits, 1);
+    }
+
+    #[test]
+    fn execution_contract_validation_rejects_plain_text_for_schedule_contract() {
+        let contract = resolve_execution_contract("remind me in 2 minutes", None);
+        let artifacts = infer_execution_artifacts(&[], "I will remind you in 2 minutes.");
+        let err = validate_execution_contract(&contract, &artifacts)
+            .expect_err("plain text should not satisfy scheduling contract");
+        assert_eq!(err, aria_core::ContractFailureReason::MissingRequiredArtifact);
+    }
+
+    #[tokio::test]
+    async fn workspace_lock_manager_serializes_same_workspace_and_reports_waiters() {
+        let manager = WorkspaceLockManager::new(Duration::from_millis(100));
+        let first = manager
+            .acquire("workspace:/shared", "run-a")
+            .await
+            .expect("first lock");
+        let manager_clone = manager.clone();
+        let waiter = tokio::spawn(async move {
+            manager_clone.acquire("workspace:/shared", "run-b").await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].workspace_key, "workspace:/shared");
+        assert_eq!(snapshot[0].active_holders, 1);
+        assert_eq!(snapshot[0].waiting_runs, 1);
+        assert_eq!(snapshot[0].current_holder.as_deref(), Some("run-a"));
+
+        drop(first);
+        waiter
+            .await
+            .expect("waiter join")
+            .expect("second lock should acquire after release");
+    }
+
+    #[tokio::test]
+    async fn workspace_lock_manager_times_out_busy_workspace() {
+        let manager = WorkspaceLockManager::new(Duration::from_millis(15));
+        let _first = manager
+            .acquire("workspace:/shared", "run-a")
+            .await
+            .expect("first lock");
+
+        let err = manager
+            .acquire("workspace:/shared", "run-b")
+            .await
+            .expect_err("second lock should time out");
+        assert!(format!("{}", err).contains("workspace"));
+        assert!(format!("{}", err).contains("busy"));
+    }
+
+    #[tokio::test]
+    async fn workspace_lock_manager_allows_parallel_different_workspaces() {
+        let manager = WorkspaceLockManager::new(Duration::from_millis(50));
+        let first = manager
+            .acquire("workspace:/one", "run-a")
+            .await
+            .expect("first workspace lock");
+        let second = manager
+            .acquire("workspace:/two", "run-b")
+            .await
+            .expect("second workspace lock");
+
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert!(snapshot.iter().all(|entry| entry.active_holders == 1));
+
+        drop(first);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn inspect_provider_health_json_reports_open_circuit() {
+        #[derive(Clone)]
+        struct ProviderFailingLLM;
+
+        #[async_trait::async_trait]
+        impl LLMBackend for ProviderFailingLLM {
+            async fn query(
+                &self,
+                _prompt: &str,
+                _tools: &[CachedTool],
+            ) -> Result<LLMResponse, OrchestratorError> {
+                Err(OrchestratorError::BackendOverloaded(
+                    "timed out waiting for first token".into(),
+                ))
+            }
+
+            fn provider_health_identity(&self) -> aria_intelligence::ProviderHealthIdentity {
+                aria_intelligence::ProviderHealthIdentity {
+                    provider_family: "openai-compatible".into(),
+                    upstream_identity: "https://shared.example/v1".into(),
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct OtherProviderSuccessLLM;
+
+        #[async_trait::async_trait]
+        impl LLMBackend for OtherProviderSuccessLLM {
+            async fn query(
+                &self,
+                _prompt: &str,
+                _tools: &[CachedTool],
+            ) -> Result<LLMResponse, OrchestratorError> {
+                Ok(LLMResponse::TextAnswer("ok".into()))
+            }
+
+            fn provider_health_identity(&self) -> aria_intelligence::ProviderHealthIdentity {
+                aria_intelligence::ProviderHealthIdentity {
+                    provider_family: "gemini".into(),
+                    upstream_identity: "https://generativelanguage.googleapis.com/v1beta".into(),
+                }
+            }
+        }
+
+        let pool = Arc::new(
+            LlmBackendPool::new(
+                vec!["primary".into(), "fallback".into()],
+                Duration::from_millis(10),
+            )
+            .with_provider_circuit_breaker(Duration::from_millis(50), 1),
+        );
+        pool.register_backend("primary", Box::new(ProviderFailingLLM));
+        pool.register_backend("fallback", Box::new(OtherProviderSuccessLLM));
+        let _ = pool.query_with_fallback("hello", &[]).await.expect("fallback");
+
+        let json = inspect_provider_health_json(&pool).expect("provider health json");
+        let entries = json.as_array().expect("array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["provider_family"], "openai-compatible");
+        assert_eq!(entries[0]["circuit_open"], true);
+    }
+
+    #[tokio::test]
+    async fn inspect_workspace_locks_json_reports_active_lock() {
+        let workspace_key = format!("workspace:/inspect-{}", uuid::Uuid::new_v4());
+        let guard = workspace_lock_manager()
+            .acquire(workspace_key.clone(), "inspection-run")
+            .await
+            .expect("workspace lock");
+
+        let json = inspect_workspace_locks_json().expect("workspace locks json");
+        let entries = json.as_array().expect("array");
+        assert!(entries.iter().any(|entry| {
+            entry["workspace_key"] == workspace_key && entry["current_holder"] == "inspection-run"
+        }));
+
+        drop(guard);
     }
 }

@@ -343,12 +343,28 @@ impl ToolExecutionResult {
         }
         sanitize_untrusted_web_value(payload, 0)
     }
+
+    pub fn to_envelope(&self) -> aria_core::ToolResultEnvelope {
+        match self {
+            ToolExecutionResult::Text { text } => aria_core::ToolResultEnvelope::text(text.clone()),
+            ToolExecutionResult::Structured {
+                summary,
+                kind,
+                payload,
+            } => aria_core::ToolResultEnvelope::success(
+                summary.clone(),
+                kind.clone(),
+                payload.clone(),
+            ),
+        }
+    }
 }
 
 fn is_untrusted_web_tool(name: &str) -> bool {
     matches!(
         name,
-        "fetch_url"
+        "search_web"
+            | "fetch_url"
             | "web_fetch"
             | "web_extract"
             | "browser_open"

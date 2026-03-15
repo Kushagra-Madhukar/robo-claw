@@ -179,13 +179,17 @@ async fn send_telegram_envelope(
         )
     })?;
     let client = reqwest::Client::new();
+    let escaped_text = match &envelope.content {
+        MessageContent::Text(response_text) => escape_telegram_html(response_text),
+        _ => String::new(),
+    };
 
     let (method, body) = match &envelope.content {
-        MessageContent::Text(response_text) => (
+        MessageContent::Text(_) => (
             "sendMessage",
             serde_json::json!({
                 "chat_id": chat_id,
-                "text": response_text,
+                "text": escaped_text,
                 "parse_mode": "HTML"
             }),
         ),
@@ -242,7 +246,7 @@ async fn send_telegram_envelope(
             let status = resp.status();
             let fallback_url = format!("{}/sendMessage", base_url);
             let fallback_text = match &envelope.content {
-                MessageContent::Text(t) => t.clone(),
+                MessageContent::Text(_) => escaped_text.clone(),
                 _ => "Unable to send media response.".to_string(),
             };
             let fallback_body = serde_json::json!({
@@ -264,7 +268,7 @@ async fn send_telegram_envelope(
             );
             let fallback_url = format!("{}/sendMessage", base_url);
             let fallback_text = match &envelope.content {
-                MessageContent::Text(t) => t.clone(),
+                MessageContent::Text(_) => escaped_text.clone(),
                 _ => "Unable to send media response.".to_string(),
             };
             let fallback_body = serde_json::json!({
@@ -276,6 +280,12 @@ async fn send_telegram_envelope(
             Err(format!("telegram request error: {}", err))
         }
     }
+}
+
+fn escape_telegram_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn outbound_content_to_websocket_payload(content: &MessageContent) -> String {
@@ -516,5 +526,11 @@ mod tests {
         );
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn escape_telegram_html_sanitizes_angle_brackets() {
+        let rendered = escape_telegram_html("agent_override=<default> & ready");
+        assert_eq!(rendered, "agent_override=&lt;default&gt; &amp; ready");
     }
 }

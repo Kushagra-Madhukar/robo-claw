@@ -129,7 +129,7 @@ impl KeywordIndex {
 // ---------------------------------------------------------------------------
 
 /// A search result from hybrid vector + keyword search, merged via RRF.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HybridSearchResult {
     /// The document ID.
     pub id: String,
@@ -290,7 +290,7 @@ impl std::error::Error for VectorError {}
 
 /// A simple in-memory vector store matching exact similarity searches
 /// using cosine. Fulfills the "embedded" RAG component requirement dynamically
-/// decoupled from PageIndex Tree formats.
+/// decoupled from internal index tree formats.
 #[derive(Serialize, Deserialize)]
 pub struct VectorStore {
     docs: Vec<VectorDoc>,
@@ -315,6 +315,10 @@ impl VectorStore {
 
     pub fn is_empty(&self) -> bool {
         self.docs.is_empty()
+    }
+
+    pub fn docs(&self) -> &[VectorDoc] {
+        &self.docs
     }
 }
 

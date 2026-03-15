@@ -5,6 +5,14 @@
 #   ./run.sh dist/.../config.toml
 set -e
 cd "$(dirname "$0")"
+
+if [[ -f ".env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source ".env"
+  set +a
+fi
+
 ARGS=()
 for arg in "$@"; do
   if [[ "$arg" == "--no-build" ]]; then NO_BUILD=1; else ARGS+=("$arg"); fi

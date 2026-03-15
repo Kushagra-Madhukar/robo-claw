@@ -87,6 +87,12 @@ cp "$OUT_DIR/$BUNDLE_NAME/config.toml" "$OUT_DIR/$BUNDLE_NAME/config.production.
 cat > "$OUT_DIR/$BUNDLE_NAME/run.sh" << 'RUNEOF'
 #!/usr/bin/env bash
 cd "$(dirname "$0")"
+if [[ -f ".env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source ".env"
+  set +a
+fi
 exec ./aria-x config.toml
 RUNEOF
 chmod +x "$OUT_DIR/$BUNDLE_NAME/run.sh"

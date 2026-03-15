@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 # Check Telegram webhook status. Requires TELEGRAM_BOT_TOKEN or pass token as arg.
-set -e
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [[ -f "$PROJECT_ROOT/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$PROJECT_ROOT/.env"
+  set +a
+fi
+
 TOKEN="${1:-$TELEGRAM_BOT_TOKEN}"
-if [ -z "$TOKEN" ]; then
+if [[ -z "$TOKEN" ]]; then
   echo "Usage: $0 <bot_token>"
   echo "   or: TELEGRAM_BOT_TOKEN=xxx $0"
   exit 1

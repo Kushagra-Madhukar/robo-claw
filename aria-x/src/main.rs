@@ -65,7 +65,7 @@ use aria_learning::{
 use aria_mcp::{McpClient, McpRegistry, TransportSelector};
 use aria_ssmu::{
     vector::{KeywordIndex, VectorStore},
-    HybridMemoryEngine, PageIndexTree, PageNode, QueryPlannerConfig,
+    HybridMemoryEngine, PageNode, QueryPlannerConfig,
 };
 use aria_vault::CredentialVault;
 mod channel_health;
@@ -103,6 +103,7 @@ enum RagCorpus {
 }
 
 include!("config.rs");
+include!("workspace_lock.rs");
 include!("gateway_runtime.rs");
 include!("tools.rs");
 include!("browser.rs");

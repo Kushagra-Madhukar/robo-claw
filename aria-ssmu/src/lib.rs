@@ -1,12 +1,12 @@
 //! # aria-ssmu
 //!
-//! ARIA-X RAG engine implementing the PageIndex tree structure and
+//! ARIA-X RAG engine implementing internal index tree structures and
 //! thread-safe session memory.
 //!
-//! ## PageIndex
+//! ## Index Trees
 //!
 //! Inspired by [VectifyAI/PageIndex](https://github.com/VectifyAI/PageIndex),
-//! this module provides a **vectorless, reasoning-based** document index.
+//! this module provides **vectorless, reasoning-based** index trees.
 //! Documents are represented as hierarchical JSON trees (semantic
 //! table-of-contents) rather than vector embeddings. An LLM navigates
 //! the tree top-down via reasoning to find relevant sections.
@@ -26,13 +26,13 @@ use tracing::debug;
 
 pub mod persistence;
 pub mod vector;
-use vector::VectorStore;
+use vector::{HybridSearchResult, VectorStore};
 
 // ---------------------------------------------------------------------------
 // PageNode
 // ---------------------------------------------------------------------------
 
-/// A single node in the PageIndex tree.
+/// A single node in an internal index tree.
 ///
 /// Mirrors the VectifyAI PageIndex JSON schema:
 /// ```json
@@ -53,19 +53,19 @@ pub struct PageNode {
     pub title: String,
     /// LLM-generated summary of this section.
     pub summary: String,
-    /// Start page index (inclusive).
+    /// Start document span index (inclusive).
     pub start_index: u32,
-    /// End page index (exclusive).
+    /// End document span index (exclusive).
     pub end_index: u32,
     /// IDs of child nodes.
     pub children: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
-// PageIndexTree
+// IndexTree
 // ---------------------------------------------------------------------------
 
-/// Error type for PageIndexTree operations.
+/// Error type for internal index tree operations.
 #[derive(Debug)]
 pub enum TreeError {
     /// A node with this ID already exists.
@@ -93,7 +93,7 @@ impl std::error::Error for TreeError {}
 /// Maintains an in-memory tree of [`PageNode`]s capped at `capacity`.
 /// When the tree is full, the least-recently-accessed node is evicted
 /// and moved to the `evicted` buffer (simulating disk spill).
-pub struct PageIndexTree {
+pub struct IndexTree {
     /// Maximum number of nodes kept in memory.
     capacity: usize,
     /// Node storage keyed by node_id.
@@ -104,7 +104,55 @@ pub struct PageIndexTree {
     evicted: Vec<PageNode>,
 }
 
-impl PageIndexTree {
+pub struct CapabilityIndex {
+    tree: IndexTree,
+}
+
+impl CapabilityIndex {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            tree: IndexTree::new(capacity),
+        }
+    }
+
+    pub fn insert(&mut self, node: PageNode) -> Result<Option<PageNode>, TreeError> {
+        self.tree.insert(node)
+    }
+
+    pub fn retrieve_relevant(&self, query: &str, top_k: usize) -> Vec<PageNode> {
+        self.tree.retrieve_relevant(query, top_k)
+    }
+
+    pub fn as_tree(&self) -> &IndexTree {
+        &self.tree
+    }
+}
+
+pub struct DocumentIndex {
+    tree: IndexTree,
+}
+
+impl DocumentIndex {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            tree: IndexTree::new(capacity),
+        }
+    }
+
+    pub fn insert(&mut self, node: PageNode) -> Result<Option<PageNode>, TreeError> {
+        self.tree.insert(node)
+    }
+
+    pub fn retrieve_relevant(&self, query: &str, top_k: usize) -> Vec<PageNode> {
+        self.tree.retrieve_relevant(query, top_k)
+    }
+
+    pub fn as_tree(&self) -> &IndexTree {
+        &self.tree
+    }
+}
+
+impl IndexTree {
     /// Create a new tree with the given capacity.
     pub fn new(capacity: usize) -> Self {
         Self {
@@ -164,9 +212,9 @@ impl PageIndexTree {
     }
 
     /// Retrieve nodes relevant to a natural-language query using
-    /// vectorless lexical scoring over the PageIndex hierarchy.
+    /// vectorless lexical scoring over the index hierarchy.
     ///
-    /// This keeps PageIndex as the primary retrieval mechanism:
+    /// This keeps the document index as the primary structured retrieval mechanism:
     /// we score by token overlap against node titles and summaries.
     pub fn retrieve_relevant(&self, query: &str, top_k: usize) -> Vec<PageNode> {
         if top_k == 0 || query.trim().is_empty() {
@@ -284,7 +332,7 @@ fn overlap_score(haystack_terms: &[String], needle_terms: &[String]) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryPlan {
     VectorOnly,
-    VectorPlusPageIndex,
+    VectorPlusDocumentIndex,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,12 +352,13 @@ impl Default for QueryPlannerConfig {
 pub struct HybridRetrieval {
     pub plan: QueryPlan,
     pub vector_context: Vec<String>,
-    pub page_context: Vec<PageNode>,
+    pub hybrid_results: Vec<HybridSearchResult>,
+    pub document_context: Vec<PageNode>,
 }
 
 pub struct HybridMemoryEngine<'a> {
     vector: &'a VectorStore,
-    page_index: &'a PageIndexTree,
+    document_index: &'a IndexTree,
     keyword_index: Option<&'a vector::KeywordIndex>,
     planner: QueryPlannerConfig,
 }
@@ -317,12 +366,12 @@ pub struct HybridMemoryEngine<'a> {
 impl<'a> HybridMemoryEngine<'a> {
     pub fn new(
         vector: &'a VectorStore,
-        page_index: &'a PageIndexTree,
+        document_index: &'a IndexTree,
         planner: QueryPlannerConfig,
     ) -> Self {
         Self {
             vector,
-            page_index,
+            document_index,
             keyword_index: None,
             planner,
         }
@@ -343,7 +392,7 @@ impl<'a> HybridMemoryEngine<'a> {
             )
         });
         if has_structured_hint || terms.len() >= self.planner.structured_query_token_threshold {
-            QueryPlan::VectorPlusPageIndex
+            QueryPlan::VectorPlusDocumentIndex
         } else {
             QueryPlan::VectorOnly
         }
@@ -378,8 +427,8 @@ impl<'a> HybridMemoryEngine<'a> {
             "RAG: VectorStore search"
         );
 
-        let page_context = if plan == QueryPlan::VectorPlusPageIndex {
-            let pages = self.page_index.retrieve_relevant(query, page_top_k);
+        let document_context = if plan == QueryPlan::VectorPlusDocumentIndex {
+            let pages = self.document_index.retrieve_relevant(query, page_top_k);
             debug!(
                 page_hits = pages.len(),
                 page_titles = pages
@@ -387,18 +436,19 @@ impl<'a> HybridMemoryEngine<'a> {
                     .map(|n| n.title.as_str())
                     .collect::<Vec<_>>()
                     .join(", "),
-                "RAG: PageIndex retrieval"
+                "RAG: DocumentIndex retrieval"
             );
             pages
         } else {
-            debug!("RAG: PageIndex skipped (VectorOnly plan)");
+            debug!("RAG: DocumentIndex skipped (VectorOnly plan)");
             Vec::new()
         };
 
         HybridRetrieval {
             plan,
             vector_context,
-            page_context,
+            hybrid_results: Vec::new(),
+            document_context,
         }
     }
 
@@ -417,34 +467,43 @@ impl<'a> HybridMemoryEngine<'a> {
         let plan = self.plan_query(query);
         debug!(query = %query, plan = ?plan, "RAG: plan_query (hybrid)");
 
-        let vector_context = if self.keyword_index.is_some() {
-            // Full hybrid: cosine + BM25 → RRF
-            let results = self.vector.hybrid_search(
+        let hybrid_results = if self.keyword_index.is_some() {
+            self.vector.hybrid_search(
                 query_embedding,
                 self.keyword_index,
                 query,
                 vector_top_k,
                 min_rrf_score,
                 60.0,
-            );
-            results
-                .into_iter()
-                .map(|r| {
-                    format!(
-                        "- [RRF:{:.4} V:{:.3} K:{:.1}] {}: {}",
-                        r.rrf_score, r.vector_score, r.keyword_score, r.id, r.content
-                    )
-                })
-                .collect::<Vec<_>>()
+            )
         } else {
-            // Fallback: vector-only
             self.vector
                 .search(query_embedding, vector_top_k)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|(score, doc)| format!("- {:.3} {}: {}", score, doc.id, doc.content))
+                .map(|(score, doc)| HybridSearchResult {
+                    id: doc.id.clone(),
+                    content: doc.content.clone(),
+                    rrf_score: score,
+                    vector_score: score,
+                    keyword_score: 0.0,
+                    metadata: doc.metadata.clone(),
+                })
                 .collect::<Vec<_>>()
         };
+        let vector_context = hybrid_results
+            .iter()
+            .map(|r| {
+                if self.keyword_index.is_some() {
+                    format!(
+                        "- [RRF:{:.4} V:{:.3} K:{:.1}] {}: {}",
+                        r.rrf_score, r.vector_score, r.keyword_score, r.id, r.content
+                    )
+                } else {
+                    format!("- {:.3} {}: {}", r.vector_score, r.id, r.content)
+                }
+            })
+            .collect::<Vec<_>>();
 
         debug!(
             vector_hits = vector_context.len(),
@@ -456,9 +515,9 @@ impl<'a> HybridMemoryEngine<'a> {
             "RAG: hybrid search"
         );
 
-        let page_context = if plan == QueryPlan::VectorPlusPageIndex {
-            let pages = self.page_index.retrieve_relevant(query, page_top_k);
-            debug!(page_hits = pages.len(), "RAG: PageIndex retrieval");
+        let document_context = if plan == QueryPlan::VectorPlusDocumentIndex {
+            let pages = self.document_index.retrieve_relevant(query, page_top_k);
+            debug!(page_hits = pages.len(), "RAG: DocumentIndex retrieval");
             pages
         } else {
             Vec::new()
@@ -467,7 +526,8 @@ impl<'a> HybridMemoryEngine<'a> {
         HybridRetrieval {
             plan,
             vector_context,
-            page_context,
+            hybrid_results,
+            document_context,
         }
     }
 }
@@ -575,19 +635,20 @@ impl SessionMemory {
 
     /// Get all durable constraints for a session.
     pub fn get_durable_constraints(&self, session_id: &uuid::Uuid) -> Result<Vec<String>, String> {
+        self.refresh_session_from_sqlite_if_newer(*session_id)?;
         let store = self
             .store
             .read()
             .map_err(|e| format!("lock poisoned: {}", e))?;
-        if let Some(state) = store.get(session_id) {
-            Ok(state.durable_constraints.clone())
-        } else {
-            Ok(Vec::new())
-        }
+        Ok(store
+            .get(session_id)
+            .map(|state| state.durable_constraints.clone())
+            .unwrap_or_default())
     }
 
     /// Get the message history for a session, in chronological order.
     pub fn get_history(&self, session_id: &uuid::Uuid) -> Result<Vec<Message>, String> {
+        self.refresh_session_from_sqlite_if_newer(*session_id)?;
         let store = self
             .store
             .read()
@@ -645,6 +706,7 @@ impl SessionMemory {
         &self,
         session_id: &uuid::Uuid,
     ) -> Result<(Option<String>, Option<String>), String> {
+        self.refresh_session_from_sqlite_if_newer(*session_id)?;
         let store = self
             .store
             .read()
@@ -1021,6 +1083,33 @@ impl SessionMemory {
             .map_err(|e| format!("sqlite load failed for {}: {}", session_id, e))
     }
 
+    fn refresh_session_from_sqlite_if_newer(&self, session_id: uuid::Uuid) -> Result<(), String> {
+        let Some(path) = &self.sqlite_path else {
+            return Ok(());
+        };
+        let current_version = {
+            let store = self
+                .store
+                .read()
+                .map_err(|e| format!("lock poisoned: {}", e))?;
+            store.get(&session_id).map(|state| state.version)
+        };
+        let Some(latest) = self.load_one_from_sqlite(path, session_id)? else {
+            return Ok(());
+        };
+        if current_version.unwrap_or(0) >= latest.version {
+            if current_version.is_some() {
+                return Ok(());
+            }
+        }
+        let mut store = self
+            .store
+            .write()
+            .map_err(|e| format!("lock poisoned: {}", e))?;
+        store.insert(session_id, latest);
+        Ok(())
+    }
+
     fn apply_session_mutation<F>(
         &self,
         session_id: uuid::Uuid,
@@ -1044,11 +1133,15 @@ impl SessionMemory {
 
         for _ in 0..2 {
             let (mut next_state, expected_version) = {
-                let store = self
-                    .store
-                    .read()
-                    .map_err(|e| format!("lock poisoned: {}", e))?;
-                let base_state = store.get(&session_id).cloned().unwrap_or_default();
+                let base_state = {
+                    let store = self
+                        .store
+                        .read()
+                        .map_err(|e| format!("lock poisoned: {}", e))?;
+                    store.get(&session_id).cloned()
+                }
+                .or_else(|| self.load_one_from_sqlite(path, session_id).ok().flatten())
+                .unwrap_or_default();
                 let expected_version = base_state.version;
                 let mut next_state = base_state;
                 mutator(&mut next_state, self.window_size);
@@ -1217,12 +1310,12 @@ mod tests {
     }
 
     // =====================================================================
-    // PageIndexTree tests
+    // IndexTree tests
     // =====================================================================
 
     #[test]
     fn lru_eviction_at_capacity() {
-        let mut tree = PageIndexTree::new(32);
+        let mut tree = IndexTree::new(32);
 
         // Insert 33 nodes (cap is 32)
         for i in 0..33 {
@@ -1244,7 +1337,7 @@ mod tests {
 
     #[test]
     fn lru_touch_prevents_eviction() {
-        let mut tree = PageIndexTree::new(3);
+        let mut tree = IndexTree::new(3);
 
         tree.insert(make_node("a", "A", vec![])).unwrap();
         tree.insert(make_node("b", "B", vec![])).unwrap();
@@ -1264,7 +1357,7 @@ mod tests {
 
     #[test]
     fn duplicate_node_error() {
-        let mut tree = PageIndexTree::new(10);
+        let mut tree = IndexTree::new(10);
         tree.insert(make_node("x", "X", vec![])).unwrap();
         let result = tree.insert(make_node("x", "X again", vec![]));
         assert!(result.is_err());
@@ -1276,7 +1369,7 @@ mod tests {
 
     #[test]
     fn get_children_returns_child_nodes() {
-        let mut tree = PageIndexTree::new(10);
+        let mut tree = IndexTree::new(10);
 
         tree.insert(make_node("root", "Root", vec!["c1", "c2"]))
             .unwrap();
@@ -1293,14 +1386,14 @@ mod tests {
 
     #[test]
     fn get_children_of_missing_node() {
-        let tree = PageIndexTree::new(10);
+        let tree = IndexTree::new(10);
         let result = tree.get_children("nonexistent");
         assert!(result.is_err());
     }
 
     #[test]
     fn retrieve_relevant_prefers_matching_nodes() {
-        let mut tree = PageIndexTree::new(10);
+        let mut tree = IndexTree::new(10);
         tree.insert(PageNode {
             node_id: "finance".into(),
             title: "Financial Stability".into(),
@@ -1327,20 +1420,20 @@ mod tests {
 
     #[test]
     fn retrieve_relevant_empty_query_returns_none() {
-        let mut tree = PageIndexTree::new(10);
+        let mut tree = IndexTree::new(10);
         tree.insert(make_node("n1", "Any", vec![])).unwrap();
         assert!(tree.retrieve_relevant("   ", 5).is_empty());
     }
 
     #[test]
     fn json_round_trip() {
-        let mut tree = PageIndexTree::new(10);
+        let mut tree = IndexTree::new(10);
         tree.insert(make_node("root", "Root Section", vec!["ch1"]))
             .unwrap();
         tree.insert(make_node("ch1", "Chapter 1", vec![])).unwrap();
 
         let json = tree.to_json().unwrap();
-        let restored = PageIndexTree::from_json(&json, 10).unwrap();
+        let restored = IndexTree::from_json(&json, 10).unwrap();
 
         assert_eq!(restored.len(), 2);
         assert_eq!(restored.peek("root").unwrap().title, "Root Section");
@@ -1361,7 +1454,7 @@ mod tests {
 
     #[test]
     fn hybrid_query_planner_vector_only_for_short_queries() {
-        let page = PageIndexTree::new(4);
+        let page = IndexTree::new(4);
         let mut vec_store = VectorStore::new();
         vec_store.insert_with_metadata(
             "a".into(),
@@ -1378,13 +1471,13 @@ mod tests {
         let engine = HybridMemoryEngine::new(&vec_store, &page, QueryPlannerConfig::default());
         let out = engine.retrieve("status?", &[1.0, 0.0], 2, 2);
         assert_eq!(out.plan, QueryPlan::VectorOnly);
-        assert_eq!(out.page_context.len(), 0);
+        assert_eq!(out.document_context.len(), 0);
         assert_eq!(out.vector_context.len(), 1);
     }
 
     #[test]
     fn hybrid_query_planner_deep_dive_for_structured_queries() {
-        let mut page = PageIndexTree::new(4);
+        let mut page = IndexTree::new(4);
         page.insert(PageNode {
             node_id: "doc.section.1".into(),
             title: "Section 1".into(),
@@ -1403,9 +1496,9 @@ mod tests {
             2,
             2,
         );
-        assert_eq!(out.plan, QueryPlan::VectorPlusPageIndex);
+        assert_eq!(out.plan, QueryPlan::VectorPlusDocumentIndex);
         assert_eq!(out.vector_context.len(), 1);
-        assert_eq!(out.page_context.len(), 1);
+        assert_eq!(out.document_context.len(), 1);
     }
 
     // =====================================================================
@@ -1803,6 +1896,133 @@ mod tests {
                 .map(|msg| msg.content)
                 .collect::<Vec<_>>(),
             vec!["from-a".to_string(), "from-b".to_string()]
+        );
+
+        std::fs::remove_file(sqlite_path).ok();
+    }
+
+    #[test]
+    fn session_sqlite_migrates_legacy_schema_and_imports_jsonl_history() {
+        let test_dir =
+            std::env::temp_dir().join(format!("aria_ssmu_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let sqlite_path = test_dir.join("runtime_state.sqlite");
+        let session_id = uuid::Uuid::new_v4();
+
+        {
+            let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    current_agent TEXT,
+                    current_model TEXT,
+                    durable_constraints TEXT
+                );
+                CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    role TEXT,
+                    content TEXT,
+                    timestamp_us INTEGER
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, current_agent, current_model, durable_constraints)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    session_id.to_string(),
+                    "omni",
+                    Option::<String>::None,
+                    "[\"remember the user's preferences\"]"
+                ],
+            )
+            .unwrap();
+        }
+
+        let jsonl_path = test_dir.join(format!("{}.jsonl", session_id));
+        std::fs::write(
+            &jsonl_path,
+            [
+                serde_json::to_string(&Message {
+                    role: "user".into(),
+                    content: "My name is Martian".into(),
+                    timestamp_us: 10,
+                })
+                .unwrap(),
+                serde_json::to_string(&Message {
+                    role: "assistant".into(),
+                    content: "Understood, Martian.".into(),
+                    timestamp_us: 11,
+                })
+                .unwrap(),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let restored = SessionMemory::new_sqlite_backed(10, &sqlite_path);
+        let report = restored.load_from_sqlite(&sqlite_path).unwrap();
+        assert_eq!(report.loaded_sessions, 1);
+        let history = restored.get_history(&session_id).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "My name is Martian");
+        assert_eq!(history[1].content, "Understood, Martian.");
+        assert_eq!(
+            restored.get_overrides(&session_id).unwrap(),
+            (Some("omni".into()), None)
+        );
+        assert_eq!(
+            restored.get_durable_constraints(&session_id).unwrap(),
+            vec!["remember the user's preferences".to_string()]
+        );
+
+        let conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+        let version_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM pragma_table_info('sessions') WHERE name='version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version_exists, 1);
+        let event_count: i64 = conn
+            .query_row("SELECT COUNT(1) FROM session_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 1);
+
+        std::fs::remove_dir_all(&test_dir).ok();
+    }
+
+    #[test]
+    fn session_sqlite_backed_getters_read_through_from_sqlite_without_preload() {
+        let sqlite_path =
+            std::env::temp_dir().join(format!("aria_ssmu_test_{}.sqlite", uuid::Uuid::new_v4()));
+        let writer = SessionMemory::new_sqlite_backed(10, &sqlite_path);
+        let reader = SessionMemory::new_sqlite_backed(10, &sqlite_path);
+        let sid = uuid::Uuid::new_v4();
+
+        writer
+            .append(
+                sid,
+                Message {
+                    role: "user".into(),
+                    content: "hello read through".into(),
+                    timestamp_us: 1,
+                },
+            )
+            .unwrap();
+        writer
+            .update_overrides(sid, Some("omni".into()), Some("test-model".into()))
+            .unwrap();
+
+        let history = reader.get_history(&sid).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "hello read through");
+        assert_eq!(
+            reader.get_overrides(&sid).unwrap(),
+            (Some("omni".into()), Some("test-model".into()))
         );
 
         std::fs::remove_file(sqlite_path).ok();

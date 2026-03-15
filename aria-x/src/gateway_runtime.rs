@@ -225,6 +225,21 @@ impl LLMBackend for PoolBackedLLM {
                 .await
         }
     }
+
+    fn inspect_context_payload(
+        &self,
+        context: &aria_core::ExecutionContextPack,
+        tools: &[CachedTool],
+        policy: &aria_core::ToolRuntimePolicy,
+    ) -> Option<serde_json::Value> {
+        if let Some(backend) = &self.override_backend {
+            backend.inspect_context_payload(context, tools, policy)
+        } else {
+            self.pool
+                .primary_backend_clone()
+                .and_then(|backend| backend.inspect_context_payload(context, tools, policy))
+        }
+    }
 }
 
 async fn resolve_model_capability_profile(
@@ -331,6 +346,7 @@ struct WasmToolExecutor {
     agent_id: String,
     session_id: uuid::Uuid,
     capability_profile: Option<AgentCapabilityProfile>,
+    sessions_dir: PathBuf,
 }
 
 impl WasmToolExecutor {
@@ -339,6 +355,7 @@ impl WasmToolExecutor {
         agent_id: String,
         session_id: uuid::Uuid,
         capability_profile: Option<AgentCapabilityProfile>,
+        sessions_dir: PathBuf,
     ) -> Self {
         Self {
             vault,
@@ -346,6 +363,7 @@ impl WasmToolExecutor {
             agent_id,
             session_id,
             capability_profile,
+            sessions_dir,
         }
     }
 }
@@ -364,19 +382,54 @@ impl ToolExecutor for WasmToolExecutor {
         let mut secrets = std::collections::HashMap::new();
         let network_allowed = capability_allows_external_network(self.capability_profile.as_ref());
         let vault_allowed = capability_allows_vault_egress(self.capability_profile.as_ref());
+        let agent_id = self.agent_id.clone();
+        let sessions_dir = self.sessions_dir.clone();
+        let session_id = *self.session_id.as_bytes();
+        let scope_name = format!("wasm_tool:{}", call.name);
+        let broker = aria_intelligence::EgressCredentialBroker::new().with_audit_sink(
+            move |record| {
+                let outcome = match record.outcome {
+                    aria_intelligence::EgressSecretOutcome::Allowed => {
+                        aria_core::SecretUsageOutcome::Allowed
+                    }
+                    aria_intelligence::EgressSecretOutcome::Denied => {
+                        aria_core::SecretUsageOutcome::Denied
+                    }
+                };
+                let _ = RuntimeStore::for_sessions_dir(&sessions_dir).append_secret_usage_audit(
+                    &aria_core::SecretUsageAuditRecord {
+                        audit_id: uuid::Uuid::new_v4().to_string(),
+                        agent_id: agent_id.clone(),
+                        session_id: Some(session_id),
+                        tool_name: scope_name.clone(),
+                        key_name: record.key_name,
+                        target_domain: record.target_domain,
+                        outcome,
+                        detail: record.detail,
+                        created_at_us: chrono::Utc::now().timestamp_micros() as u64,
+                    },
+                );
+            },
+        );
 
         if vault_allowed {
             // In a real system, we'd map "call.name" or "agent_id" to a list of required keys.
-            if let Ok(key) =
-                self.vault
-                    .retrieve_for_egress(&self.agent_id, "api_key", "api.github.com")
-            {
+            if let Ok(key) = broker.resolve_vault_secret(
+                &self.vault,
+                &self.agent_id,
+                "api_key",
+                "api.github.com",
+                &format!("wasm_tool:{}", call.name),
+            ) {
                 secrets.insert("GITHUB_TOKEN".to_string(), key);
             }
-            if let Ok(key) =
-                self.vault
-                    .retrieve_for_egress(&self.agent_id, "api_key", "api.openai.com")
-            {
+            if let Ok(key) = broker.resolve_vault_secret(
+                &self.vault,
+                &self.agent_id,
+                "api_key",
+                "api.openai.com",
+                &format!("wasm_tool:{}", call.name),
+            ) {
                 secrets.insert("OPENAI_API_KEY".to_string(), key);
             }
         }
@@ -400,7 +453,7 @@ impl ToolExecutor for WasmToolExecutor {
         }
 
         let config = aria_skill_runtime::ExtismConfig {
-            max_memory_pages: Some(256),
+            max_memory_pages: Some(runtime_resource_budget().wasm_max_memory_pages),
             wasi_enabled: true, // often needed for HTTP egress
             secrets,
             workspace_dir: Some(std::path::PathBuf::from(&ws_dir)),
@@ -408,6 +461,26 @@ impl ToolExecutor for WasmToolExecutor {
         };
         let _ = std::fs::create_dir_all(&ws_dir);
         let backend = aria_skill_runtime::ExtismBackend::with_config(config);
+        let persistent_cache = std::sync::Arc::new(aria_skill_runtime::PersistentWasmAotCache::new(
+            self.sessions_dir.join("wasm_aot"),
+            if runtime_deployment_profile() == DeploymentProfile::Edge {
+                aria_skill_runtime::WasmExecutionMode::EdgeAotOnly
+            } else {
+                aria_skill_runtime::WasmExecutionMode::NodePreferAot
+            },
+            match runtime_deployment_profile() {
+                DeploymentProfile::Edge => "edge",
+                DeploymentProfile::Node => "node",
+                DeploymentProfile::Cluster => "cluster",
+            },
+            std::env::consts::ARCH,
+            runtime_deployment_profile() == DeploymentProfile::Edge,
+        ));
+        let backend = aria_skill_runtime::AotCachedExecutor::with_persistent_cache(
+            backend,
+            std::sync::Arc::new(aria_skill_runtime::WasmAotCache::new()),
+            persistent_cache,
+        );
 
         use aria_skill_runtime::WasmExecutor;
         let result = backend
@@ -456,7 +529,7 @@ struct WebSocketState {
     agent_store: Arc<AgentConfigStore>,
     tool_registry: Arc<ToolManifestStore>,
     session_memory: Arc<aria_ssmu::SessionMemory>,
-    page_index: Arc<PageIndexTree>,
+    capability_index: Arc<aria_ssmu::CapabilityIndex>,
     vector_store: Arc<VectorStore>,
     keyword_index: Arc<KeywordIndex>,
     firewall: Arc<aria_safety::DfaFirewall>,
@@ -482,7 +555,7 @@ struct TelegramState {
     agent_store: Arc<AgentConfigStore>,
     tool_registry: Arc<ToolManifestStore>,
     session_memory: Arc<aria_ssmu::SessionMemory>,
-    page_index: Arc<PageIndexTree>,
+    capability_index: Arc<aria_ssmu::CapabilityIndex>,
     vector_store: Arc<VectorStore>,
     keyword_index: Arc<KeywordIndex>,
     firewall: Arc<aria_safety::DfaFirewall>,
@@ -830,6 +903,8 @@ impl TelegramState {
                                     confidence = ?stt.confidence,
                                     "Audio media transcribed"
                                 );
+                            } else if let Some(hint) = self.stt_backend.availability_hint() {
+                                *transcript = Some(hint);
                             }
                         }
                     }
@@ -858,6 +933,8 @@ impl TelegramState {
                                     confidence = ?stt.confidence,
                                     "Video audio transcribed"
                                 );
+                            } else if let Some(hint) = self.stt_backend.availability_hint() {
+                                *transcript = Some(hint);
                             }
                         }
                     }
@@ -1574,7 +1651,7 @@ async fn process_one_telegram_update(state: &TelegramState, update_json: &str) {
                                         state_clone.agent_store.as_ref(),
                                         state_clone.tool_registry.as_ref(),
                                         state_clone.session_memory.as_ref(),
-                                        &state_clone.page_index,
+                                        &state_clone.capability_index,
                                         &state_clone.vector_store,
                                         &state_clone.keyword_index,
                                         &state_clone.firewall,
@@ -1703,7 +1780,7 @@ async fn process_one_telegram_update(state: &TelegramState, update_json: &str) {
                                     state_clone.agent_store.as_ref(),
                                     state_clone.tool_registry.as_ref(),
                                     state_clone.session_memory.as_ref(),
-                                    &state_clone.page_index,
+                                    &state_clone.capability_index,
                                     &state_clone.vector_store,
                                     &state_clone.keyword_index,
                                     &state_clone.firewall,
@@ -1876,7 +1953,7 @@ async fn process_one_telegram_update(state: &TelegramState, update_json: &str) {
         state.agent_store.as_ref(),
         state.tool_registry.as_ref(),
         state.session_memory.as_ref(),
-        &state.page_index,
+        &state.capability_index,
         &state.vector_store,
         &state.keyword_index,
         &state.firewall,
@@ -2032,6 +2109,17 @@ async fn handle_control_documents_inspect(
         &query.workspace_root,
     )
     .map(Json)
+}
+
+async fn handle_provider_health_inspect(
+    State(state): State<TelegramState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    inspect_provider_health_json(&state.llm_pool).map(Json)
+}
+
+async fn handle_workspace_locks_inspect() -> Result<Json<serde_json::Value>, (StatusCode, String)>
+{
+    inspect_workspace_locks_json().map(Json)
 }
 
 async fn handle_retrieval_traces_inspect(
@@ -2518,7 +2606,7 @@ async fn handle_websocket_upgrade(
                         state.agent_store.as_ref(),
                         state.tool_registry.as_ref(),
                         state.session_memory.as_ref(),
-                        &state.page_index,
+                        &state.capability_index,
                         &state.vector_store,
                         &state.keyword_index,
                         &state.firewall,
@@ -2571,7 +2659,7 @@ async fn handle_whatsapp_webhook(
         state.agent_store.as_ref(),
         state.tool_registry.as_ref(),
         state.session_memory.as_ref(),
-        &state.page_index,
+        &state.capability_index,
         &state.vector_store,
         &state.keyword_index,
         &state.firewall,
@@ -2652,7 +2740,7 @@ async fn run_telegram_polling(
     agent_store: AgentConfigStore,
     tool_registry: ToolManifestStore,
     session_memory: aria_ssmu::SessionMemory,
-    page_index: Arc<PageIndexTree>,
+    capability_index: Arc<aria_ssmu::CapabilityIndex>,
     vector_store: Arc<VectorStore>,
     keyword_index: Arc<KeywordIndex>,
     firewall: Arc<aria_safety::DfaFirewall>,
@@ -2680,7 +2768,7 @@ async fn run_telegram_polling(
         agent_store: Arc::new(agent_store),
         tool_registry: Arc::new(tool_registry),
         session_memory: Arc::new(session_memory),
-        page_index,
+        capability_index,
         vector_store,
         keyword_index,
         firewall,
@@ -2893,7 +2981,7 @@ async fn run_telegram_gateway(
     agent_store: AgentConfigStore,
     tool_registry: ToolManifestStore,
     session_memory: aria_ssmu::SessionMemory,
-    page_index: Arc<PageIndexTree>,
+    capability_index: Arc<aria_ssmu::CapabilityIndex>,
     vector_store: Arc<VectorStore>,
     keyword_index: Arc<KeywordIndex>,
     session_tool_caches: Arc<SessionToolCacheStore>,
@@ -2923,7 +3011,7 @@ async fn run_telegram_gateway(
             agent_store,
             tool_registry,
             session_memory,
-            page_index,
+            capability_index,
             vector_store,
             keyword_index,
             firewall,
@@ -2955,7 +3043,7 @@ async fn run_telegram_gateway(
         agent_store: Arc::new(agent_store),
         tool_registry: Arc::new(tool_registry),
         session_memory: Arc::new(session_memory),
-        page_index,
+        capability_index,
         vector_store,
         keyword_index,
         firewall,
@@ -2984,6 +3072,14 @@ async fn run_telegram_gateway(
         .route(
             "/inspect/control-docs",
             get(handle_control_documents_inspect),
+        )
+        .route(
+            "/inspect/provider-health",
+            get(handle_provider_health_inspect),
+        )
+        .route(
+            "/inspect/workspace-locks",
+            get(handle_workspace_locks_inspect),
         )
         .route(
             "/inspect/retrieval-traces",
@@ -3223,7 +3319,7 @@ async fn run_websocket_gateway(
     agent_store: AgentConfigStore,
     tool_registry: ToolManifestStore,
     session_memory: aria_ssmu::SessionMemory,
-    page_index: Arc<PageIndexTree>,
+    capability_index: Arc<aria_ssmu::CapabilityIndex>,
     vector_store: Arc<VectorStore>,
     keyword_index: Arc<KeywordIndex>,
     session_tool_caches: Arc<SessionToolCacheStore>,
@@ -3243,7 +3339,7 @@ async fn run_websocket_gateway(
         agent_store: Arc::new(agent_store),
         tool_registry: Arc::new(tool_registry),
         session_memory: Arc::new(session_memory),
-        page_index,
+        capability_index,
         vector_store,
         keyword_index,
         firewall,
@@ -3282,7 +3378,7 @@ async fn run_whatsapp_gateway(
     agent_store: AgentConfigStore,
     tool_registry: ToolManifestStore,
     session_memory: aria_ssmu::SessionMemory,
-    page_index: Arc<PageIndexTree>,
+    capability_index: Arc<aria_ssmu::CapabilityIndex>,
     vector_store: Arc<VectorStore>,
     keyword_index: Arc<KeywordIndex>,
     session_tool_caches: Arc<SessionToolCacheStore>,
@@ -3302,7 +3398,7 @@ async fn run_whatsapp_gateway(
         agent_store: Arc::new(agent_store),
         tool_registry: Arc::new(tool_registry),
         session_memory: Arc::new(session_memory),
-        page_index,
+        capability_index,
         vector_store,
         keyword_index,
         firewall,

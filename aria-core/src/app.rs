@@ -94,12 +94,212 @@ pub struct RetrievalTraceRecord {
     pub policy_hits: u32,
     pub external_hits: u32,
     pub social_hits: u32,
-    pub page_context_hits: u32,
+    pub document_context_hits: u32,
     pub history_tokens: u32,
     pub rag_tokens: u32,
     pub control_tokens: u32,
     pub tool_count: u32,
     pub control_document_conflicts: u32,
+    pub created_at_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextBlockKind {
+    Retrieval,
+    ControlDocument,
+    DurableConstraint,
+    SubAgentResult,
+    ToolInstructions,
+    PromptAsset,
+    ResourceContext,
+    CapabilityIndex,
+    DocumentIndex,
+    ContractRequirements,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextBlock {
+    pub kind: ContextBlockKind,
+    pub label: String,
+    pub content: String,
+    pub token_estimate: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptContextMessage {
+    pub role: String,
+    pub content: String,
+    pub timestamp_us: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionContextPack {
+    pub system_prompt: String,
+    pub history_messages: Vec<PromptContextMessage>,
+    pub context_blocks: Vec<ContextBlock>,
+    pub user_request: String,
+    pub channel: GatewayChannel,
+    #[serde(default)]
+    pub execution_contract: Option<ExecutionContract>,
+    #[serde(default)]
+    pub retrieved_context: Option<RetrievedContextBundle>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionContractKind {
+    AnswerOnly,
+    ToolAssisted,
+    ScheduleCreate,
+    BrowserRead,
+    BrowserAct,
+    McpInvoke,
+    SubAgentSpawn,
+    ArtifactCreate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionContract {
+    pub kind: ExecutionContractKind,
+    #[serde(default)]
+    pub allowed_tool_classes: Vec<String>,
+    #[serde(default)]
+    pub required_artifact_kinds: Vec<ExecutionArtifactKind>,
+    #[serde(default)]
+    pub forbidden_completion_modes: Vec<String>,
+    #[serde(default)]
+    pub fallback_mode: Option<String>,
+    #[serde(default)]
+    pub approval_required: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionArtifactKind {
+    Schedule,
+    Browser,
+    File,
+    Mcp,
+    SubAgent,
+    ToolSearch,
+    PlainAnswer,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionArtifact {
+    pub kind: ExecutionArtifactKind,
+    pub label: String,
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContractFailureReason {
+    MissingRequiredArtifact,
+    ForbiddenCompletionMode,
+    ProviderCapabilityMismatch,
+    ToolPolicyMismatch,
+    ApprovalRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetrievalSourceKind {
+    SessionHistory,
+    SessionMemory,
+    Workspace,
+    PolicyRuntime,
+    External,
+    Social,
+    ControlDocument,
+    SubAgentResult,
+    PromptAsset,
+    McpResource,
+    CapabilityIndex,
+    DocumentIndex,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievedContextBlock {
+    pub source_kind: RetrievalSourceKind,
+    pub source_id: String,
+    pub label: String,
+    pub content: String,
+    #[serde(default)]
+    pub trust_class: Option<String>,
+    #[serde(default)]
+    pub score: Option<f32>,
+    #[serde(default)]
+    pub rank: Option<u32>,
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+    #[serde(default)]
+    pub recency_us: Option<u64>,
+    pub token_estimate: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct RetrievedContextBundle {
+    #[serde(default)]
+    pub plan_summary: Option<String>,
+    #[serde(default)]
+    pub blocks: Vec<RetrievedContextBlock>,
+    #[serde(default)]
+    pub dropped_blocks: Vec<RetrievedContextBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityIndexEntry {
+    pub entry_id: String,
+    pub title: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentIndexEntry {
+    pub entry_id: String,
+    pub title: String,
+    pub summary: String,
+    #[serde(default)]
+    pub start_index: Option<u32>,
+    #[serde(default)]
+    pub end_index: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextInspectionRecord {
+    pub context_id: String,
+    pub request_id: Uuid,
+    pub session_id: Uuid,
+    pub agent_id: String,
+    pub channel: GatewayChannel,
+    pub provider_model: Option<String>,
+    pub prompt_mode: String,
+    pub history_tokens: u32,
+    pub context_tokens: u32,
+    pub system_tokens: u32,
+    pub user_tokens: u32,
+    pub tool_count: u32,
+    #[serde(default)]
+    pub active_tool_names: Vec<String>,
+    #[serde(default)]
+    pub tool_runtime_policy: Option<ToolRuntimePolicy>,
+    #[serde(default)]
+    pub tool_selection: Option<ToolSelectionDecision>,
+    #[serde(default)]
+    pub provider_request_payload: Option<serde_json::Value>,
+    #[serde(default)]
+    pub selected_tool_catalog: Vec<ToolCatalogEntry>,
+    #[serde(default)]
+    pub hidden_tool_messages: Vec<String>,
+    #[serde(default)]
+    pub emitted_artifacts: Vec<ExecutionArtifact>,
+    #[serde(default)]
+    pub tool_provider_readiness: Vec<crate::ToolProviderReadiness>,
+    pub pack: ExecutionContextPack,
+    pub rendered_prompt: String,
     pub created_at_us: u64,
 }
 
@@ -308,12 +508,7 @@ pub fn builtin_channel_plugin_manifest(channel: GatewayChannel) -> ChannelPlugin
             true,
             ChannelFallbackMode::TextFallback,
         ),
-        GatewayChannel::Cli => (
-            "builtin.cli",
-            "cli",
-            true,
-            ChannelFallbackMode::NativeOnly,
-        ),
+        GatewayChannel::Cli => ("builtin.cli", "cli", true, ChannelFallbackMode::NativeOnly),
         GatewayChannel::WebSocket => (
             "builtin.websocket",
             "websocket",
@@ -368,7 +563,8 @@ pub fn validate_channel_plugin_manifest(manifest: &ChannelPluginManifest) -> Res
     if manifest.transport.trim().is_empty() {
         return Err("channel plugin manifest requires transport".into());
     }
-    if manifest.approval_capable && matches!(manifest.fallback_mode, ChannelFallbackMode::Unsupported)
+    if manifest.approval_capable
+        && matches!(manifest.fallback_mode, ChannelFallbackMode::Unsupported)
     {
         return Err("approval-capable channel cannot declare unsupported fallback".into());
     }
@@ -499,6 +695,7 @@ pub enum ControlIntent {
         instructions: Option<String>,
     },
     InspectSession,
+    ClearSession,
     ListApprovals,
     ResolveApproval {
         decision: ApprovalResolutionDecision,
@@ -580,7 +777,10 @@ pub fn parse_control_intent(text: &str, channel: GatewayChannel) -> Option<Contr
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string),
         }),
-        "/session" => Some(ControlIntent::InspectSession),
+        "/session" => match parts.next() {
+            Some(arg) if matches!(arg, "clear" | "reset") => Some(ControlIntent::ClearSession),
+            _ => Some(ControlIntent::InspectSession),
+        },
         "/approvals" => Some(ControlIntent::ListApprovals),
         "/approve" => Some(ControlIntent::ResolveApproval {
             decision: ApprovalResolutionDecision::Approve,

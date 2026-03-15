@@ -21,6 +21,22 @@ pub struct ExecutedToolCall {
     pub result: ToolExecutionResult,
 }
 
+impl ToolCall {
+    pub fn invocation_envelope(&self) -> aria_core::ToolInvocationEnvelope {
+        aria_core::ToolInvocationEnvelope {
+            invocation_id: self.invocation_id.clone(),
+            tool_name: self.name.clone(),
+            arguments_json: self.arguments.clone(),
+        }
+    }
+}
+
+impl ExecutedToolCall {
+    pub fn result_envelope(&self) -> aria_core::ToolResultEnvelope {
+        self.result.to_envelope()
+    }
+}
+
 /// Response from the LLM backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LLMResponse {
@@ -66,15 +82,44 @@ pub fn filter_tools_for_model_capability_with_repair(
     allow_repair_fallback: bool,
 ) -> Vec<CachedTool> {
     match tool_calling_mode_for_model_with_repair(profile, allow_repair_fallback) {
-        ToolCallingMode::NativeTools
-        | ToolCallingMode::CompatTools
-        | ToolCallingMode::TextFallbackWithRepair => tools
+        ToolCallingMode::NativeTools | ToolCallingMode::CompatTools => tools
             .iter()
             .filter(|tool| tool_is_compatible_with_model(tool, profile))
             .cloned()
             .collect(),
+        ToolCallingMode::TextFallbackWithRepair => tools
+            .iter()
+            .filter(|tool| tool_is_text_repair_compatible(tool, profile))
+            .cloned()
+            .collect(),
         ToolCallingMode::TextFallbackNoTools => Vec::new(),
     }
+}
+
+fn tool_is_text_repair_compatible(
+    tool: &CachedTool,
+    profile: Option<&ModelCapabilityProfile>,
+) -> bool {
+    let Some(profile) = profile else {
+        return true;
+    };
+    if tool.modalities.contains(&aria_core::ToolModality::Image)
+        && !matches!(
+            profile.supports_images,
+            aria_core::CapabilitySupport::Supported
+        )
+    {
+        return false;
+    }
+    if tool.modalities.contains(&aria_core::ToolModality::Audio)
+        && !matches!(
+            profile.supports_audio,
+            aria_core::CapabilitySupport::Supported
+        )
+    {
+        return false;
+    }
+    true
 }
 
 pub fn tool_mode_limitation_message(profile: Option<&ModelCapabilityProfile>) -> Option<String> {
@@ -103,6 +148,8 @@ pub enum OrchestratorError {
     MaxRoundsExceeded { limit: usize },
     /// The backend is overloaded or timed out.
     BackendOverloaded(String),
+    /// A workspace-level coordinator rejected or timed out a conflicting run.
+    ResourceBusy(String),
     /// A security violation was intercepted by the firewall.
     SecurityViolation(String),
     /// The human operator triggered an abort via steering.
@@ -118,6 +165,7 @@ impl std::fmt::Display for OrchestratorError {
                 write!(f, "max rounds ({}) exceeded", limit)
             }
             OrchestratorError::BackendOverloaded(msg) => write!(f, "backend overloaded: {}", msg),
+            OrchestratorError::ResourceBusy(msg) => write!(f, "resource busy: {}", msg),
             OrchestratorError::SecurityViolation(msg) => {
                 write!(f, "security violation: {}", msg)
             }
@@ -143,12 +191,57 @@ pub(crate) fn approval_required_tool_name(message: &str) -> Option<&str> {
 /// Identifier for registered LLM backends.
 pub type LlmBackendId = String;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderHealthIdentity {
+    pub provider_family: String,
+    pub upstream_identity: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCircuitState {
+    pub provider_family: String,
+    pub upstream_identity: String,
+    pub circuit_open: bool,
+    pub consecutive_failures: usize,
+    pub impacted_backends: Vec<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderTransportConfig {
+    pub response_start_timeout: Duration,
+}
+
+impl Default for ProviderTransportConfig {
+    fn default() -> Self {
+        Self {
+            response_start_timeout: Duration::from_secs(20),
+        }
+    }
+}
+
+static PROVIDER_TRANSPORT_CONFIG: std::sync::OnceLock<ProviderTransportConfig> =
+    std::sync::OnceLock::new();
+
+pub fn install_provider_transport_config(config: ProviderTransportConfig) {
+    let _ = PROVIDER_TRANSPORT_CONFIG.set(config);
+}
+
+pub fn provider_transport_config() -> ProviderTransportConfig {
+    *PROVIDER_TRANSPORT_CONFIG.get_or_init(ProviderTransportConfig::default)
+}
+
 pub struct LlmBackendPool {
     backends: Mutex<HashMap<LlmBackendId, Box<dyn LLMBackend>>>,
     fallback_order: Vec<LlmBackendId>,
     cooldown_for: Duration,
     cooldown_until: Mutex<HashMap<LlmBackendId, Instant>>,
     consecutive_failures: Mutex<HashMap<LlmBackendId, usize>>,
+    provider_circuit_cooldown_for: Duration,
+    provider_circuit_failure_threshold: usize,
+    provider_cooldown_until: Mutex<HashMap<String, Instant>>,
+    provider_failures: Mutex<HashMap<String, usize>>,
+    provider_last_error: Mutex<HashMap<String, String>>,
 }
 
 impl LlmBackendPool {
@@ -159,7 +252,22 @@ impl LlmBackendPool {
             cooldown_for,
             cooldown_until: Mutex::new(HashMap::new()),
             consecutive_failures: Mutex::new(HashMap::new()),
+            provider_circuit_cooldown_for: cooldown_for,
+            provider_circuit_failure_threshold: 3,
+            provider_cooldown_until: Mutex::new(HashMap::new()),
+            provider_failures: Mutex::new(HashMap::new()),
+            provider_last_error: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_provider_circuit_breaker(
+        mut self,
+        cooldown_for: Duration,
+        failure_threshold: usize,
+    ) -> Self {
+        self.provider_circuit_cooldown_for = cooldown_for;
+        self.provider_circuit_failure_threshold = failure_threshold.max(1);
+        self
     }
 
     pub fn register_backend(&self, id: impl Into<LlmBackendId>, backend: Box<dyn LLMBackend>) {
@@ -171,12 +279,29 @@ impl LlmBackendPool {
         for backend_id in &self.fallback_order {
             let backend = {
                 let guard = self.backends.lock().expect("poisoned pool mutex");
-                guard.get(backend_id).map(dyn_clone::clone_box)
+                guard
+                    .get(backend_id)
+                    .map(|backend| dyn_clone::clone_box(&**backend))
             };
             if let Some(backend) = backend {
                 if let Some(profile) = backend.capability_profile() {
                     return Some(profile);
                 }
+            }
+        }
+        None
+    }
+
+    pub fn primary_backend_clone(&self) -> Option<Box<dyn LLMBackend>> {
+        for backend_id in &self.fallback_order {
+            let backend = {
+                let guard = self.backends.lock().expect("poisoned pool mutex");
+                guard
+                    .get(backend_id)
+                    .map(|backend| dyn_clone::clone_box(&**backend))
+            };
+            if backend.is_some() {
+                return backend;
             }
         }
         None
@@ -193,6 +318,165 @@ impl LlmBackendPool {
     fn mark_cooldown(&self, id: &str) {
         let mut guard = self.cooldown_until.lock().expect("poisoned cooldown mutex");
         guard.insert(id.to_string(), Instant::now() + self.cooldown_for);
+    }
+
+    fn provider_key_for_backend(&self, backend: &dyn LLMBackend) -> String {
+        let identity = backend.provider_health_identity();
+        format!(
+            "{}::{}",
+            identity.provider_family, identity.upstream_identity
+        )
+    }
+
+    fn is_provider_circuit_open(&self, provider_key: &str) -> bool {
+        let guard = self
+            .provider_cooldown_until
+            .lock()
+            .expect("poisoned provider cooldown mutex");
+        guard
+            .get(provider_key)
+            .map(|until| *until > Instant::now())
+            .unwrap_or(false)
+    }
+
+    fn record_provider_failure(
+        &self,
+        provider_key: &str,
+        error: &OrchestratorError,
+    ) -> Option<Instant> {
+        let failures = {
+            let mut guard = self
+                .provider_failures
+                .lock()
+                .expect("poisoned provider failures mutex");
+            *guard
+                .entry(provider_key.to_string())
+                .and_modify(|count| *count += 1)
+                .or_insert(1)
+        };
+        {
+            let mut guard = self
+                .provider_last_error
+                .lock()
+                .expect("poisoned provider last-error mutex");
+            guard.insert(provider_key.to_string(), error.to_string());
+        }
+        if failures >= self.provider_circuit_failure_threshold {
+            let until = Instant::now() + self.provider_circuit_cooldown_for;
+            let mut guard = self
+                .provider_cooldown_until
+                .lock()
+                .expect("poisoned provider cooldown mutex");
+            guard.insert(provider_key.to_string(), until);
+            Some(until)
+        } else {
+            None
+        }
+    }
+
+    fn reset_provider_failures(&self, provider_key: &str) {
+        {
+            let mut guard = self
+                .provider_failures
+                .lock()
+                .expect("poisoned provider failures mutex");
+            guard.insert(provider_key.to_string(), 0);
+        }
+        {
+            let mut guard = self
+                .provider_last_error
+                .lock()
+                .expect("poisoned provider last-error mutex");
+            guard.remove(provider_key);
+        }
+        {
+            let mut guard = self
+                .provider_cooldown_until
+                .lock()
+                .expect("poisoned provider cooldown mutex");
+            guard.remove(provider_key);
+        }
+    }
+
+    fn should_trip_provider_circuit(error: &OrchestratorError) -> bool {
+        match error {
+            OrchestratorError::BackendOverloaded(_) => true,
+            OrchestratorError::LLMError(message) => {
+                let message = message.to_ascii_lowercase();
+                [
+                    "timeout",
+                    "timed out",
+                    "connection reset",
+                    "connection refused",
+                    "dns",
+                    "temporarily unavailable",
+                    "transport",
+                    "connect error",
+                    "network",
+                    "first token",
+                    "overloaded",
+                ]
+                .iter()
+                .any(|needle| message.contains(needle))
+            }
+            OrchestratorError::ToolError(_)
+            | OrchestratorError::MaxRoundsExceeded { .. }
+            | OrchestratorError::SecurityViolation(_)
+            | OrchestratorError::UserAborted
+            | OrchestratorError::ResourceBusy(_) => false,
+        }
+    }
+
+    pub fn provider_circuit_state(&self) -> Vec<ProviderCircuitState> {
+        let backends = self.backends.lock().expect("poisoned pool mutex");
+        let provider_failures = self
+            .provider_failures
+            .lock()
+            .expect("poisoned provider failures mutex");
+        let provider_cooldowns = self
+            .provider_cooldown_until
+            .lock()
+            .expect("poisoned provider cooldown mutex");
+        let provider_last_error = self
+            .provider_last_error
+            .lock()
+            .expect("poisoned provider last-error mutex");
+        let mut by_provider: HashMap<String, ProviderCircuitState> = HashMap::new();
+        for backend_id in &self.fallback_order {
+            let Some(backend) = backends.get(backend_id) else {
+                continue;
+            };
+            let identity = backend.provider_health_identity();
+            let provider_key = self.provider_key_for_backend(&**backend);
+            let entry =
+                by_provider
+                    .entry(provider_key.clone())
+                    .or_insert_with(|| ProviderCircuitState {
+                        provider_family: identity.provider_family.clone(),
+                        upstream_identity: identity.upstream_identity.clone(),
+                        circuit_open: provider_cooldowns
+                            .get(&provider_key)
+                            .map(|until| *until > Instant::now())
+                            .unwrap_or(false),
+                        consecutive_failures: provider_failures
+                            .get(&provider_key)
+                            .copied()
+                            .unwrap_or(0),
+                        impacted_backends: Vec::new(),
+                        last_error: provider_last_error.get(&provider_key).cloned(),
+                    });
+            entry.impacted_backends.push(backend_id.clone());
+        }
+        let mut states = by_provider
+            .into_values()
+            .filter(|state| state.consecutive_failures > 0 || state.circuit_open)
+            .collect::<Vec<_>>();
+        states.sort_by(|a, b| {
+            a.provider_family
+                .cmp(&b.provider_family)
+                .then(a.upstream_identity.cmp(&b.upstream_identity))
+        });
+        states
     }
 
     fn increment_failure(&self, id: &str) -> usize {
@@ -232,14 +516,26 @@ impl LlmBackendPool {
             }
             let backend = {
                 let guard = self.backends.lock().expect("poisoned pool mutex");
-                guard.get(backend_id).map(dyn_clone::clone_box)
+                guard
+                    .get(backend_id)
+                    .map(|backend| dyn_clone::clone_box(&**backend))
             };
             let Some(backend) = backend else {
                 continue;
             };
+            let provider_key = self.provider_key_for_backend(backend.as_ref());
+            if self.is_provider_circuit_open(&provider_key) {
+                info!(
+                    backend_id = %backend_id,
+                    provider_key = %provider_key,
+                    "LLM: skipping backend because provider circuit is open"
+                );
+                continue;
+            }
             match backend.query(prompt, tools).await {
                 Ok(resp) => {
                     self.reset_failures(backend_id);
+                    self.reset_provider_failures(&provider_key);
                     match &resp {
                         LLMResponse::TextAnswer(t) => info!(
                             response_len = t.len(),
@@ -257,6 +553,17 @@ impl LlmBackendPool {
                 Err(err) => {
                     if self.increment_failure(backend_id) >= 3 {
                         self.mark_cooldown(backend_id);
+                    }
+                    if Self::should_trip_provider_circuit(&err) {
+                        if let Some(until) = self.record_provider_failure(&provider_key, &err) {
+                            info!(
+                                backend_id = %backend_id,
+                                provider_key = %provider_key,
+                                cooldown_ms = self.provider_circuit_cooldown_for.as_millis() as u64,
+                                "LLM: opened provider circuit after retryable failure"
+                            );
+                            let _ = until;
+                        }
                     }
                     last_err = Some(err);
                 }
@@ -280,19 +587,34 @@ impl LlmBackendPool {
             }
             let backend = {
                 let guard = self.backends.lock().expect("poisoned pool mutex");
-                guard.get(backend_id).map(dyn_clone::clone_box)
+                guard
+                    .get(backend_id)
+                    .map(|backend| dyn_clone::clone_box(&**backend))
             };
             let Some(backend) = backend else {
                 continue;
             };
+            let provider_key = self.provider_key_for_backend(backend.as_ref());
+            if self.is_provider_circuit_open(&provider_key) {
+                info!(
+                    backend_id = %backend_id,
+                    provider_key = %provider_key,
+                    "LLM: skipping backend because provider circuit is open"
+                );
+                continue;
+            }
             match backend.query_with_policy(prompt, tools, policy).await {
                 Ok(resp) => {
                     self.reset_failures(backend_id);
+                    self.reset_provider_failures(&provider_key);
                     return Ok(resp);
                 }
                 Err(err) => {
                     if self.increment_failure(backend_id) >= 3 {
                         self.mark_cooldown(backend_id);
+                    }
+                    if Self::should_trip_provider_circuit(&err) {
+                        let _ = self.record_provider_failure(&provider_key, &err);
                     }
                     last_err = Some(err);
                 }
@@ -316,22 +638,37 @@ impl LlmBackendPool {
             }
             let backend = {
                 let guard = self.backends.lock().expect("poisoned pool mutex");
-                guard.get(backend_id).map(dyn_clone::clone_box)
+                guard
+                    .get(backend_id)
+                    .map(|backend| dyn_clone::clone_box(&**backend))
             };
             let Some(backend) = backend else {
                 continue;
             };
+            let provider_key = self.provider_key_for_backend(backend.as_ref());
+            if self.is_provider_circuit_open(&provider_key) {
+                info!(
+                    backend_id = %backend_id,
+                    provider_key = %provider_key,
+                    "LLM: skipping backend because provider circuit is open"
+                );
+                continue;
+            }
             match backend
                 .query_stream_with_policy(prompt, tools, policy)
                 .await
             {
                 Ok(resp) => {
                     self.reset_failures(backend_id);
+                    self.reset_provider_failures(&provider_key);
                     return Ok(resp);
                 }
                 Err(err) => {
                     if self.increment_failure(backend_id) >= 3 {
                         self.mark_cooldown(backend_id);
+                    }
+                    if Self::should_trip_provider_circuit(&err) {
+                        let _ = self.record_provider_failure(&provider_key, &err);
                     }
                     last_err = Some(err);
                 }
@@ -356,22 +693,37 @@ impl LlmBackendPool {
             }
             let backend = {
                 let guard = self.backends.lock().expect("poisoned pool mutex");
-                guard.get(backend_id).map(dyn_clone::clone_box)
+                guard
+                    .get(backend_id)
+                    .map(|backend| dyn_clone::clone_box(&**backend))
             };
             let Some(backend) = backend else {
                 continue;
             };
+            let provider_key = self.provider_key_for_backend(backend.as_ref());
+            if self.is_provider_circuit_open(&provider_key) {
+                info!(
+                    backend_id = %backend_id,
+                    provider_key = %provider_key,
+                    "LLM: skipping backend because provider circuit is open"
+                );
+                continue;
+            }
             match backend
                 .query_with_tool_results_and_policy(prompt, tools, executed_tools, policy)
                 .await
             {
                 Ok(resp) => {
                     self.reset_failures(backend_id);
+                    self.reset_provider_failures(&provider_key);
                     return Ok(resp);
                 }
                 Err(err) => {
                     if self.increment_failure(backend_id) >= 3 {
                         self.mark_cooldown(backend_id);
+                    }
+                    if Self::should_trip_provider_circuit(&err) {
+                        let _ = self.record_provider_failure(&provider_key, &err);
                     }
                     last_err = Some(err);
                 }
@@ -396,22 +748,37 @@ impl LlmBackendPool {
             }
             let backend = {
                 let guard = self.backends.lock().expect("poisoned pool mutex");
-                guard.get(backend_id).map(dyn_clone::clone_box)
+                guard
+                    .get(backend_id)
+                    .map(|backend| dyn_clone::clone_box(&**backend))
             };
             let Some(backend) = backend else {
                 continue;
             };
+            let provider_key = self.provider_key_for_backend(backend.as_ref());
+            if self.is_provider_circuit_open(&provider_key) {
+                info!(
+                    backend_id = %backend_id,
+                    provider_key = %provider_key,
+                    "LLM: skipping backend because provider circuit is open"
+                );
+                continue;
+            }
             match backend
                 .query_stream_with_tool_results_and_policy(prompt, tools, executed_tools, policy)
                 .await
             {
                 Ok(resp) => {
                     self.reset_failures(backend_id);
+                    self.reset_provider_failures(&provider_key);
                     return Ok(resp);
                 }
                 Err(err) => {
                     if self.increment_failure(backend_id) >= 3 {
                         self.mark_cooldown(backend_id);
+                    }
+                    if Self::should_trip_provider_circuit(&err) {
+                        let _ = self.record_provider_failure(&provider_key, &err);
                     }
                     last_err = Some(err);
                 }

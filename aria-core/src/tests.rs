@@ -157,8 +157,7 @@ mod tests {
             }
         );
 
-        let mailbox = parse_control_intent("/mailbox run-1", GatewayChannel::Cli)
-            .expect("mailbox");
+        let mailbox = parse_control_intent("/mailbox run-1", GatewayChannel::Cli).expect("mailbox");
         assert_eq!(
             mailbox,
             ControlIntent::InspectMailbox {
@@ -169,8 +168,8 @@ mod tests {
         let stop = parse_control_intent("/stop", GatewayChannel::Telegram).expect("stop");
         assert_eq!(stop, ControlIntent::StopCurrent);
 
-        let pivot = parse_control_intent("/pivot focus on tests", GatewayChannel::Cli)
-            .expect("pivot");
+        let pivot =
+            parse_control_intent("/pivot focus on tests", GatewayChannel::Cli).expect("pivot");
         assert_eq!(
             pivot,
             ControlIntent::Pivot {
@@ -178,17 +177,19 @@ mod tests {
             }
         );
 
-        let install = parse_control_intent(
-            "/install_skill {\"bytes\":\"abc\"}",
-            GatewayChannel::Cli,
-        )
-        .expect("install");
+        let install =
+            parse_control_intent("/install_skill {\"bytes\":\"abc\"}", GatewayChannel::Cli)
+                .expect("install");
         assert_eq!(
             install,
             ControlIntent::InstallSkill {
                 signed_module_json: Some(String::from("{\"bytes\":\"abc\"}"))
             }
         );
+
+        let session_clear = parse_control_intent("/session clear", GatewayChannel::Telegram)
+            .expect("session clear");
+        assert_eq!(session_clear, ControlIntent::ClearSession);
     }
 
     #[test]
@@ -981,7 +982,10 @@ mod tests {
 
     #[test]
     fn scope_denial_kind_exposes_stable_codes() {
-        assert_eq!(ScopeDenialKind::ExecutionProfile.code(), "execution_profile");
+        assert_eq!(
+            ScopeDenialKind::ExecutionProfile.code(),
+            "execution_profile"
+        );
         assert_eq!(ScopeDenialKind::NetworkEgress.code(), "network_egress");
         assert_eq!(ScopeDenialKind::SecretEgress.code(), "secret_egress");
     }
@@ -1018,7 +1022,7 @@ mod tests {
             policy_hits: 1,
             external_hits: 0,
             social_hits: 0,
-            page_context_hits: 1,
+            document_context_hits: 1,
             history_tokens: 120,
             rag_tokens: 240,
             control_tokens: 60,
@@ -1049,5 +1053,133 @@ mod tests {
         let mut manifest = builtin_channel_plugin_manifest(GatewayChannel::Telegram);
         manifest.control_capabilities.supports_callbacks = false;
         assert!(validate_channel_plugin_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn canonical_tool_spec_round_trips_json() {
+        let spec = CanonicalToolSpec {
+            tool_id: "tool.search_web".into(),
+            name: "search_web".into(),
+            description_short: "Search the web".into(),
+            description_long: "Search the public web and return ranked results.".into(),
+            schema: CanonicalToolSchema {
+                parameters_json_schema:
+                    r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#
+                        .into(),
+                result_json_schema: Some(
+                    r#"{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}"#
+                        .into(),
+                ),
+            },
+            execution_kind: ToolExecutionKind::Native,
+            requires_approval: ToolApprovalClass::LowRisk,
+            side_effect_level: ToolSideEffectLevel::ReadOnly,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![ToolModality::Text],
+            provider_hints: ProviderCompatibilityHints {
+                provider_names: vec!["openai".into(), "gemini".into()],
+                requires_strict_schema: false,
+                prefers_reduced_schema: true,
+                supports_parallel_calls: true,
+            },
+        };
+        let json = serde_json::to_string(&spec).expect("serialize");
+        let decoded: CanonicalToolSpec = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, spec);
+    }
+
+    #[test]
+    fn tool_result_envelope_builds_provider_payload() {
+        let envelope = ToolResultEnvelope::success(
+            "Search completed",
+            "search_web",
+            serde_json::json!({
+                "results": [{"title":"Example","url":"https://example.com"}]
+            }),
+        );
+        let payload = envelope.as_provider_payload();
+        assert_eq!(payload["ok"], serde_json::json!(true));
+        assert_eq!(payload["summary"], serde_json::json!("Search completed"));
+        assert_eq!(payload["kind"], serde_json::json!("search_web"));
+        assert!(payload["data"]["results"].is_array());
+    }
+
+    #[test]
+    fn tool_catalog_entry_round_trips_json() {
+        let entry = ToolCatalogEntry {
+            tool_id: "tool.github.create_issue".into(),
+            public_name: "create_issue".into(),
+            description: "Create a GitHub issue".into(),
+            parameters_json_schema:
+                r#"{"type":"object","properties":{"title":{"type":"string"}},"required":["title"]}"#
+                    .into(),
+            execution_kind: ToolExecutionKind::McpImported,
+            provider_kind: ToolProviderKind::Mcp,
+            runner_class: ToolRunnerClass::Mcp,
+            origin: ToolOrigin {
+                provider_kind: ToolProviderKind::Mcp,
+                provider_id: "github".into(),
+                origin_id: Some("import:create_issue".into()),
+                display_name: Some("GitHub MCP".into()),
+            },
+            artifact_kind: Some("mcp".into()),
+            requires_approval: ToolApprovalClass::LowRisk,
+            side_effect_level: ToolSideEffectLevel::StateChanging,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![ToolModality::Text],
+            capability_requirements: vec!["mcp_tool_allowlist:create_issue".into()],
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let decoded: ToolCatalogEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn execution_context_pack_round_trips_contract_and_retrieval_bundle() {
+        let pack = ExecutionContextPack {
+            system_prompt: "system".into(),
+            history_messages: vec![PromptContextMessage {
+                role: "user".into(),
+                content: "hello".into(),
+                timestamp_us: 1,
+            }],
+            context_blocks: vec![ContextBlock {
+                kind: ContextBlockKind::ContractRequirements,
+                label: "contract".into(),
+                content: "must create schedule artifact".into(),
+                token_estimate: 4,
+            }],
+            user_request: "remind me".into(),
+            channel: GatewayChannel::Telegram,
+            execution_contract: Some(ExecutionContract {
+                kind: ExecutionContractKind::ScheduleCreate,
+                allowed_tool_classes: vec!["schedule".into()],
+                required_artifact_kinds: vec![ExecutionArtifactKind::Schedule],
+                forbidden_completion_modes: vec!["plain_text_only".into()],
+                fallback_mode: Some("compat_tools".into()),
+                approval_required: false,
+            }),
+            retrieved_context: Some(RetrievedContextBundle {
+                plan_summary: Some("session+control".into()),
+                blocks: vec![RetrievedContextBlock {
+                    source_kind: RetrievalSourceKind::SessionHistory,
+                    source_id: "session:1".into(),
+                    label: "recent_history".into(),
+                    content: "user: remind me later".into(),
+                    trust_class: Some("trusted".into()),
+                    score: Some(0.91),
+                    rank: Some(1),
+                    dedupe_key: Some("session:recent".into()),
+                    recency_us: Some(1),
+                    token_estimate: 5,
+                }],
+                dropped_blocks: vec![],
+            }),
+        };
+        let json = serde_json::to_string(&pack).expect("serialize");
+        let decoded: ExecutionContextPack = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, pack);
     }
 }

@@ -74,6 +74,8 @@ It is built as a modular workspace so the runtime can evolve without collapsing 
 
 ## Architecture
 
+For the maintained multi-diagram reference set, see [`docs/architecture/README.md`](docs/architecture/README.md).
+
 ### High-level system view
 
 ```mermaid
@@ -144,8 +146,8 @@ The current runtime path is:
 2. Firewall and ingress safety checks run.
 3. Session scoping and override resolution run.
 4. Capability-aware tool exposure is computed for the active model and agent.
-5. Retrieval builds prompt context from session state, control docs, and memory.
-6. The orchestrator runs the tool loop.
+5. Retrieval builds a structured context pack from session state, control docs, and memory.
+6. The orchestrator sends that context to the provider and runs the tool loop.
 7. Approval-gated actions pause safely and persist approval state.
 8. Responses, audits, queue state, metrics, and compaction state are persisted.
 9. Outbound channel rendering sends the normalized response back to the originating surface.
@@ -221,6 +223,7 @@ The current runtime path is:
 - queue / outbox / DLQ visibility
 - retrieval traces
 - scope denials and secret usage audits
+- STT doctor/setup commands
 
 ## Channels and Interaction Surfaces
 
@@ -255,6 +258,7 @@ The project now includes a real terminal UI with:
 - agent switcher
 - runtime status summaries
 - runtime log tail
+- persisted context inspection records for prompt review
 - keyboard and mouse navigation
 
 ## Getting Started
@@ -264,12 +268,30 @@ The project now includes a real terminal UI with:
 - Rust stable toolchain
 - Cargo
 - optional `.env` for local secrets
+- a provider API key; the default repo setup uses Gemini Flash via `GEMINI_API_KEY`
 
 ### 1. Build the workspace
 
 ```bash
 cargo build --workspace
 ```
+
+### 1.5. Configure the default provider
+
+```bash
+cp .env.example .env
+```
+
+Then set:
+
+```bash
+GEMINI_API_KEY=your_key_here
+```
+
+The checked-in runtime defaults use:
+
+- `backend = "gemini"`
+- `model = "gemini-3-flash-preview"`
 
 ### 2. Run tests
 
@@ -306,6 +328,13 @@ cargo run -p aria-x -- nodes/companion.toml
 cargo run -p aria-x -- nodes/micro.toml
 ```
 
+### 7. Verify speech-to-text setup
+
+```bash
+target/debug/aria-x doctor stt
+target/debug/aria-x setup stt --local
+```
+
 ## Configuration
 
 The main example config is:
@@ -325,6 +354,31 @@ Primary configuration areas:
 - `telemetry`: logging/observability
 - `ui`: local UI controls
 
+### Default provider
+
+The repository defaults are configured for Gemini:
+
+- `backend = "gemini"`
+- `model = "gemini-3-flash-preview"`
+
+If you want to switch providers later, change the `[llm]` block in [`aria-x/config.toml`](aria-x/config.toml) and provide the matching credential in `.env`.
+
+### Speech-to-text modes
+
+ARIA-X supports:
+
+- `auto`: prefer local STT when available, otherwise use configured cloud STT, otherwise stay off
+- `local`: require a valid local Whisper runtime
+- `cloud`: require a configured cloud STT endpoint
+- `off`: disable voice/video transcription
+
+For local Whisper, ARIA expects:
+
+- `WHISPER_CPP_MODEL`
+- `WHISPER_CPP_BIN`
+- `FFMPEG_BIN`
+- optional `WHISPER_CPP_LANGUAGE`
+
 ### Secret handling
 
 Use local env files for secrets:
@@ -333,7 +387,51 @@ Use local env files for secrets:
 cp .env.example .env
 ```
 
+For the default Gemini setup, populate:
+
+```bash
+GEMINI_API_KEY=your_key_here
+```
+
 Do not place live secrets in tracked config files. Generated runtime config files and local env files are intentionally ignored.
+
+### STT onboarding
+
+If you want local voice transcription:
+
+```bash
+target/debug/aria-x doctor
+target/debug/aria-x doctor stt
+target/debug/aria-x setup stt --local
+```
+
+`doctor stt` reports whether the local runtime is operational.
+
+`setup stt --local` bootstraps a Homebrew-based local STT setup when possible and writes detected local STT paths into your local `.env`.
+
+`doctor` reports the current runtime status, install-path status, configured channels, and STT readiness in one operator summary.
+
+Additional doctor scopes:
+
+- `doctor env`
+- `doctor gateway`
+- `doctor browser`
+
+`install` copies the current `aria-x` binary into `~/.local/bin/aria-x` by default so you can run it from anywhere once that directory is on your shell `PATH`.
+
+You can also seed the standard application config path during install:
+
+```bash
+target/debug/aria-x install --with-default-config
+```
+
+Shell completions are generated on demand:
+
+```bash
+target/debug/aria-x completion zsh
+target/debug/aria-x completion bash
+target/debug/aria-x completion fish
+```
 
 ### Typical local setup
 
@@ -382,6 +480,7 @@ ARIA-X is built around runtime-enforced boundaries, not prompt-only instructions
 
 Start here if you want the deeper architecture and planning trail:
 
+- [`docs/architecture/README.md`](docs/architecture/README.md)
 - [`docs/REPO_CONTEXT_MAP.md`](docs/REPO_CONTEXT_MAP.md)
 - [`docs/ARCHITECTURAL_CHANGES.md`](docs/ARCHITECTURAL_CHANGES.md)
 - [`docs/ARCHITECTURE_REMAINING_WORK.md`](docs/ARCHITECTURE_REMAINING_WORK.md)
@@ -441,8 +540,31 @@ cargo test --workspace
 # Run main runtime
 cargo run -p aria-x -- aria-x/config.toml
 
+# Installed-style run command
+target/debug/aria-x run aria-x/config.toml
+
 # Run TUI
 cargo run -p aria-x -- tui aria-x/config.toml
+
+# Runtime lifecycle
+target/debug/aria-x status
+target/debug/aria-x stop
+target/debug/aria-x doctor
+target/debug/aria-x doctor stt
+target/debug/aria-x doctor env
+target/debug/aria-x doctor gateway
+target/debug/aria-x doctor browser
+target/debug/aria-x --inspect-context <session_id> [agent_id]
+target/debug/aria-x --inspect-provider-payloads <session_id> [agent_id]
+target/debug/aria-x --explain-context <session_id> [agent_id]
+target/debug/aria-x --explain-provider-payloads <session_id> [agent_id]
+target/debug/aria-x inspect context [session_id] [agent_id]
+target/debug/aria-x inspect provider-payloads [session_id] [agent_id]
+target/debug/aria-x explain context [session_id] [agent_id]
+target/debug/aria-x explain provider-payloads [session_id] [agent_id]
+target/debug/aria-x install
+target/debug/aria-x install --with-default-config
+target/debug/aria-x completion zsh
 
 # Dev wrapper
 ./dev.sh aria-x/config.toml

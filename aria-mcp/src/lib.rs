@@ -1175,6 +1175,85 @@ impl McpRegistry {
         self.resources.get(server_id).cloned().unwrap_or_default()
     }
 
+    pub fn list_tool_catalog_entries(&self, server_id: &str) -> Vec<aria_core::ToolCatalogEntry> {
+        self.list_imported_tools(server_id)
+            .into_iter()
+            .map(|tool| aria_core::ToolCatalogEntry {
+                tool_id: format!("mcp.{}.{}", tool.server_id, tool.tool_name),
+                public_name: tool.tool_name.clone(),
+                description: tool.description.clone(),
+                parameters_json_schema: tool.parameters_schema.clone(),
+                execution_kind: aria_core::ToolExecutionKind::McpImported,
+                provider_kind: aria_core::ToolProviderKind::Mcp,
+                runner_class: aria_core::ToolRunnerClass::Mcp,
+                origin: aria_core::ToolOrigin {
+                    provider_kind: aria_core::ToolProviderKind::Mcp,
+                    provider_id: tool.server_id.clone(),
+                    origin_id: Some(tool.import_id.clone()),
+                    display_name: self
+                        .servers
+                        .get(&tool.server_id)
+                        .map(|server| server.display_name.clone()),
+                },
+                artifact_kind: Some("mcp".into()),
+                requires_approval: aria_core::ToolApprovalClass::None,
+                side_effect_level: aria_core::ToolSideEffectLevel::ReadOnly,
+                streaming_safe: false,
+                parallel_safe: true,
+                modalities: vec![aria_core::ToolModality::Text],
+                capability_requirements: vec![
+                    format!("mcp_server_allowlist:{}", tool.server_id),
+                    format!("mcp_tool_allowlist:{}", tool.tool_name),
+                ],
+            })
+            .collect()
+    }
+
+    pub fn list_prompt_assets(&self, server_id: &str) -> Vec<aria_core::PromptAssetEntry> {
+        self.list_imported_prompts(server_id)
+            .into_iter()
+            .map(|prompt| aria_core::PromptAssetEntry {
+                asset_id: format!("mcp.{}.{}", prompt.server_id, prompt.prompt_name),
+                public_name: prompt.prompt_name.clone(),
+                description: prompt.description.clone(),
+                origin: aria_core::ToolOrigin {
+                    provider_kind: aria_core::ToolProviderKind::Mcp,
+                    provider_id: prompt.server_id.clone(),
+                    origin_id: Some(prompt.import_id.clone()),
+                    display_name: self
+                        .servers
+                        .get(&prompt.server_id)
+                        .map(|server| server.display_name.clone()),
+                },
+                arguments_json_schema: prompt.arguments_schema.clone(),
+            })
+            .collect()
+    }
+
+    pub fn list_resource_context_entries(
+        &self,
+        server_id: &str,
+    ) -> Vec<aria_core::ResourceContextEntry> {
+        self.list_imported_resources(server_id)
+            .into_iter()
+            .map(|resource| aria_core::ResourceContextEntry {
+                resource_id: format!("mcp.{}.{}", resource.server_id, resource.resource_uri),
+                public_name: resource.resource_uri.clone(),
+                description: resource.description.clone(),
+                origin: aria_core::ToolOrigin {
+                    provider_kind: aria_core::ToolProviderKind::Mcp,
+                    provider_id: resource.server_id.clone(),
+                    origin_id: Some(resource.import_id.clone()),
+                    display_name: self
+                        .servers
+                        .get(&resource.server_id)
+                        .map(|server| server.display_name.clone()),
+                },
+                mime_type: resource.mime_type.clone(),
+            })
+            .collect()
+    }
+
     pub fn tool_allowed_for_agent(
         &self,
         profile: &AgentCapabilityProfile,
@@ -1812,5 +1891,57 @@ mod tests {
         );
         assert!(reserved_native_mcp_target("scheduler_core"));
         assert!(!reserved_native_mcp_target("linear"));
+    }
+
+    #[test]
+    fn registry_projects_mcp_imports_into_normalized_catalog_and_assets() {
+        let mut registry = McpRegistry::new();
+        registry.register_server(McpServerProfile {
+            server_id: "github".into(),
+            display_name: "GitHub".into(),
+            transport: "stub".into(),
+            endpoint: "stub://github".into(),
+            auth_ref: None,
+            enabled: true,
+        });
+        registry
+            .import_tool(McpImportedTool {
+                import_id: "tool-1".into(),
+                server_id: "github".into(),
+                tool_name: "create_issue".into(),
+                description: "Create issue".into(),
+                parameters_schema: "{}".into(),
+            })
+            .expect("import tool");
+        registry
+            .import_prompt(McpImportedPrompt {
+                import_id: "prompt-1".into(),
+                server_id: "github".into(),
+                prompt_name: "review_pr".into(),
+                description: "Review PR".into(),
+                arguments_schema: Some("{}".into()),
+            })
+            .expect("import prompt");
+        registry
+            .import_resource(McpImportedResource {
+                import_id: "resource-1".into(),
+                server_id: "github".into(),
+                resource_uri: "repo://issues".into(),
+                description: "Issue feed".into(),
+                mime_type: Some("application/json".into()),
+            })
+            .expect("import resource");
+
+        let tools = registry.list_tool_catalog_entries("github");
+        let prompts = registry.list_prompt_assets("github");
+        let resources = registry.list_resource_context_entries("github");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].provider_kind, aria_core::ToolProviderKind::Mcp);
+        assert_eq!(tools[0].runner_class, aria_core::ToolRunnerClass::Mcp);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].public_name, "review_pr");
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].public_name, "repo://issues");
     }
 }

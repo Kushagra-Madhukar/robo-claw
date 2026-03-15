@@ -47,6 +47,8 @@ pub struct Config {
     pub cluster: ClusterConfig,
     #[serde(default)]
     pub rollout: RolloutConfig,
+    #[serde(default)]
+    pub resource_budget: ResourceBudgetConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +73,10 @@ struct RawRuntimeEnvConfig {
     whisper_cpp_model: Option<String>,
     #[serde(default = "default_whisper_cpp_bin")]
     whisper_cpp_bin: String,
+    #[serde(default = "default_ffmpeg_bin")]
+    ffmpeg_bin: String,
+    #[serde(default)]
+    whisper_cpp_language: Option<String>,
     #[serde(default)]
     allow_private_web_targets: Option<String>,
     #[serde(default)]
@@ -155,6 +161,8 @@ pub struct RuntimeEnvConfig {
     pub ollama_host: String,
     pub whisper_cpp_model: Option<String>,
     pub whisper_cpp_bin: String,
+    pub ffmpeg_bin: String,
+    pub whisper_cpp_language: Option<String>,
     pub allow_private_web_targets: bool,
     pub browser_chromium_bin: Option<String>,
     pub browser_chrome_bin: Option<String>,
@@ -212,10 +220,28 @@ pub struct LlmConfig {
     pub backend: String,
     pub model: String,
     pub max_tool_rounds: usize,
+    #[serde(default = "default_first_token_timeout_ms")]
+    pub first_token_timeout_ms: u64,
+    #[serde(default = "default_provider_circuit_cooldown_ms")]
+    pub provider_circuit_breaker_cooldown_ms: u64,
+    #[serde(default = "default_provider_circuit_failure_threshold")]
+    pub provider_circuit_breaker_failure_threshold: usize,
     #[serde(default)]
     pub capability_overrides: Vec<ModelCapabilityOverrideConfig>,
     #[serde(default)]
     pub repair_fallback_model_allowlist: Vec<String>,
+}
+
+fn default_first_token_timeout_ms() -> u64 {
+    20_000
+}
+
+fn default_provider_circuit_cooldown_ms() -> u64 {
+    30_000
+}
+
+fn default_provider_circuit_failure_threshold() -> usize {
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +326,69 @@ pub struct ClusterConfig {
     pub scheduler_shards: u16,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceBudgetConfig {
+    #[serde(default = "default_budget_parallel_requests")]
+    pub max_parallel_requests: usize,
+    #[serde(default = "default_budget_wasm_max_memory_pages")]
+    pub wasm_max_memory_pages: u32,
+    #[serde(default = "default_budget_tool_round_cap")]
+    pub max_tool_rounds: usize,
+    #[serde(default = "default_budget_retrieval_chars")]
+    pub retrieval_context_char_budget: usize,
+    #[serde(default = "default_budget_browser_automation")]
+    pub browser_automation_enabled: bool,
+    #[serde(default = "default_budget_learning_enabled")]
+    pub learning_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeResourceBudget {
+    pub max_parallel_requests: usize,
+    pub wasm_max_memory_pages: u32,
+    pub max_tool_rounds: usize,
+    pub retrieval_context_char_budget: usize,
+    pub browser_automation_enabled: bool,
+    pub learning_enabled: bool,
+}
+
+fn default_budget_parallel_requests() -> usize {
+    8
+}
+
+fn default_budget_wasm_max_memory_pages() -> u32 {
+    256
+}
+
+fn default_budget_tool_round_cap() -> usize {
+    8
+}
+
+fn default_budget_retrieval_chars() -> usize {
+    16_000
+}
+
+fn default_budget_browser_automation() -> bool {
+    true
+}
+
+fn default_budget_learning_enabled() -> bool {
+    true
+}
+
+impl Default for ResourceBudgetConfig {
+    fn default() -> Self {
+        Self {
+            max_parallel_requests: default_budget_parallel_requests(),
+            wasm_max_memory_pages: default_budget_wasm_max_memory_pages(),
+            max_tool_rounds: default_budget_tool_round_cap(),
+            retrieval_context_char_budget: default_budget_retrieval_chars(),
+            browser_automation_enabled: default_budget_browser_automation(),
+            learning_enabled: default_budget_learning_enabled(),
+        }
+    }
+}
+
 fn default_deployment_profile() -> DeploymentProfile {
     DeploymentProfile::Node
 }
@@ -342,6 +431,30 @@ impl ClusterConfig {
         self.runtime_store_backend == RuntimeStoreBackend::Postgres
             && self.postgres_url.as_ref().is_some_and(|url| !url.trim().is_empty())
     }
+}
+
+fn resolve_runtime_resource_budget(config: &Config, runtime: &RuntimeEnvConfig) -> RuntimeResourceBudget {
+    let mut budget = RuntimeResourceBudget {
+        max_parallel_requests: config
+            .resource_budget
+            .max_parallel_requests
+            .max(1)
+            .min(runtime.global_request_concurrency_limit.max(1)),
+        wasm_max_memory_pages: config.resource_budget.wasm_max_memory_pages.max(32),
+        max_tool_rounds: config.resource_budget.max_tool_rounds.max(1).min(config.llm.max_tool_rounds.max(1)),
+        retrieval_context_char_budget: config.resource_budget.retrieval_context_char_budget.max(1024),
+        browser_automation_enabled: config.resource_budget.browser_automation_enabled,
+        learning_enabled: config.resource_budget.learning_enabled,
+    };
+    if config.cluster.profile == DeploymentProfile::Edge {
+        budget.max_parallel_requests = budget.max_parallel_requests.min(2);
+        budget.wasm_max_memory_pages = budget.wasm_max_memory_pages.min(96);
+        budget.max_tool_rounds = budget.max_tool_rounds.min(4);
+        budget.retrieval_context_char_budget = budget.retrieval_context_char_budget.min(6000);
+        budget.browser_automation_enabled = false;
+        budget.learning_enabled = false;
+    }
+    budget
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -388,6 +501,10 @@ fn default_ollama_host() -> String {
 
 fn default_whisper_cpp_bin() -> String {
     "whisper-cli".to_string()
+}
+
+fn default_ffmpeg_bin() -> String {
+    "ffmpeg".to_string()
 }
 
 fn default_browser_artifact_max_count() -> usize {
@@ -536,6 +653,10 @@ pub struct GatewayConfig {
     /// Supported: "local_whisper", "cloud_http".
     #[serde(default = "default_stt_backend")]
     pub stt_backend: String,
+    /// Speech-to-text runtime mode.
+    /// Supported: "auto", "local", "cloud", "off".
+    #[serde(default = "default_stt_mode")]
+    pub stt_mode: String,
     /// If true, fallback to cloud STT when the primary backend fails.
     #[serde(default)]
     pub stt_cloud_fallback: bool,
@@ -567,6 +688,8 @@ pub struct GatewayConfig {
     pub whatsapp_auth_token: Option<String>,
     #[serde(default)]
     pub fanout: Vec<ChannelFanoutRule>,
+    #[serde(default = "default_workspace_lock_wait_timeout_ms")]
+    pub workspace_lock_wait_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -593,6 +716,10 @@ fn default_stt_backend() -> String {
     "local_whisper".to_string()
 }
 
+fn default_stt_mode() -> String {
+    "auto".to_string()
+}
+
 fn default_stt_cloud_api_key_env() -> String {
     "OPENAI_API_KEY".to_string()
 }
@@ -613,6 +740,10 @@ fn default_whatsapp_port() -> u16 {
     8091
 }
 
+fn default_workspace_lock_wait_timeout_ms() -> u64 {
+    5_000
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -625,6 +756,7 @@ impl Default for GatewayConfig {
             telegram_mode: default_telegram_mode(),
             bind_address: default_bind_address(),
             stt_backend: default_stt_backend(),
+            stt_mode: default_stt_mode(),
             stt_cloud_fallback: false,
             stt_cloud_endpoint: None,
             stt_cloud_api_key_env: default_stt_cloud_api_key_env(),
@@ -635,6 +767,7 @@ impl Default for GatewayConfig {
             whatsapp_outbound_url: None,
             whatsapp_auth_token: None,
             fanout: Vec::new(),
+            workspace_lock_wait_timeout_ms: default_workspace_lock_wait_timeout_ms(),
         }
     }
 }
@@ -727,6 +860,8 @@ fn load_runtime_env_config() -> Result<RuntimeEnvConfig, figment::Error> {
             ollama_host: default_ollama_host(),
             whisper_cpp_model: None,
             whisper_cpp_bin: default_whisper_cpp_bin(),
+            ffmpeg_bin: default_ffmpeg_bin(),
+            whisper_cpp_language: None,
             allow_private_web_targets: None,
             browser_chromium_bin: None,
             browser_chrome_bin: None,
@@ -780,6 +915,8 @@ fn load_runtime_env_config() -> Result<RuntimeEnvConfig, figment::Error> {
         ollama_host: non_empty_env("OLLAMA_HOST").unwrap_or(raw.ollama_host),
         whisper_cpp_model: non_empty_env("WHISPER_CPP_MODEL").or(raw.whisper_cpp_model),
         whisper_cpp_bin: non_empty_env("WHISPER_CPP_BIN").unwrap_or(raw.whisper_cpp_bin),
+        ffmpeg_bin: non_empty_env("FFMPEG_BIN").unwrap_or(raw.ffmpeg_bin),
+        whisper_cpp_language: non_empty_env("WHISPER_CPP_LANGUAGE").or(raw.whisper_cpp_language),
         allow_private_web_targets: env_flag_override("ARIA_ALLOW_PRIVATE_WEB_TARGETS")
             .or_else(|| raw.allow_private_web_targets.as_deref().and_then(parse_flag_value))
             .unwrap_or(false),
@@ -1255,10 +1392,17 @@ fn load_config(path: &str) -> Result<ResolvedAppConfig, Box<dyn std::error::Erro
             .to_string_lossy()
             .into_owned();
     }
+    let mut runtime = load_runtime_env_config()?;
+    let budget = resolve_runtime_resource_budget(&config, &runtime);
+    config.llm.max_tool_rounds = config.llm.max_tool_rounds.min(budget.max_tool_rounds).max(1);
+    runtime.global_request_concurrency_limit = runtime
+        .global_request_concurrency_limit
+        .min(budget.max_parallel_requests)
+        .max(1);
     Ok(ResolvedAppConfig {
         path: resolved,
         file: config,
-        runtime: load_runtime_env_config()?,
+        runtime,
     })
 }
 
@@ -1300,12 +1444,16 @@ struct AppRuntimeState {
     in_flight_compactions: std::sync::Mutex<HashSet<String>>,
     web_domain_rate_limiters:
         moka::sync::Cache<String, Arc<governor::DefaultDirectRateLimiter>>,
+    workspace_locks: Arc<WorkspaceLockManager>,
+    resource_budget: RuntimeResourceBudget,
+    deployment_profile: DeploymentProfile,
 }
 
 static APP_RUNTIME_STATE: OnceLock<Arc<AppRuntimeState>> = OnceLock::new();
 
 fn install_app_runtime(config: Arc<ResolvedAppConfig>) {
     let runtime = config.runtime.clone();
+    let resource_budget = resolve_runtime_resource_budget(&config.file, &runtime);
     let instance_id = uuid::Uuid::new_v4().to_string();
     let _ = APP_RUNTIME_STATE.set(Arc::new(AppRuntimeState {
         locked_config: true,
@@ -1320,12 +1468,17 @@ fn install_app_runtime(config: Arc<ResolvedAppConfig>) {
             .time_to_live(Duration::from_secs(runtime.idempotency_cache_ttl_secs.max(1)))
             .build(),
         global_request_permits: Arc::new(tokio::sync::Semaphore::new(
-            runtime.global_request_concurrency_limit.max(1),
+            resource_budget.max_parallel_requests.max(1),
         )),
         in_flight_compactions: std::sync::Mutex::new(HashSet::new()),
         web_domain_rate_limiters: moka::sync::Cache::builder()
             .max_capacity(runtime.web_domain_state_max_entries.max(1))
             .build(),
+        workspace_locks: Arc::new(WorkspaceLockManager::new(Duration::from_millis(
+            config.gateway.workspace_lock_wait_timeout_ms.max(1),
+        ))),
+        resource_budget,
+        deployment_profile: config.cluster.profile,
     }));
 }
 
@@ -1341,6 +1494,8 @@ fn fallback_runtime_state() -> Arc<AppRuntimeState> {
         ollama_host: default_ollama_host(),
         whisper_cpp_model: None,
         whisper_cpp_bin: default_whisper_cpp_bin(),
+        ffmpeg_bin: default_ffmpeg_bin(),
+        whisper_cpp_language: None,
         allow_private_web_targets: false,
         browser_chromium_bin: None,
         browser_chrome_bin: None,
@@ -1387,6 +1542,14 @@ fn fallback_runtime_state() -> Arc<AppRuntimeState> {
         session_tool_cache_max_entries: default_session_tool_cache_max_entries(),
         global_request_concurrency_limit: default_global_request_concurrency_limit(),
     });
+    let resource_budget = RuntimeResourceBudget {
+        max_parallel_requests: runtime.global_request_concurrency_limit.max(1),
+        wasm_max_memory_pages: default_budget_wasm_max_memory_pages(),
+        max_tool_rounds: default_budget_tool_round_cap(),
+        retrieval_context_char_budget: default_budget_retrieval_chars(),
+        browser_automation_enabled: default_budget_browser_automation(),
+        learning_enabled: default_budget_learning_enabled(),
+    };
     Arc::new(AppRuntimeState {
         locked_config: false,
         active_config_path: runtime
@@ -1404,12 +1567,17 @@ fn fallback_runtime_state() -> Arc<AppRuntimeState> {
             .time_to_live(Duration::from_secs(runtime.idempotency_cache_ttl_secs.max(1)))
             .build(),
         global_request_permits: Arc::new(tokio::sync::Semaphore::new(
-            runtime.global_request_concurrency_limit.max(1),
+            resource_budget.max_parallel_requests.max(1),
         )),
         in_flight_compactions: std::sync::Mutex::new(HashSet::new()),
         web_domain_rate_limiters: moka::sync::Cache::builder()
             .max_capacity(runtime.web_domain_state_max_entries.max(1))
             .build(),
+        workspace_locks: Arc::new(WorkspaceLockManager::new(Duration::from_millis(
+            default_workspace_lock_wait_timeout_ms(),
+        ))),
+        resource_budget,
+        deployment_profile: DeploymentProfile::Node,
     })
 }
 
@@ -1423,6 +1591,10 @@ fn runtime_instance_id() -> String {
 
 fn runtime_feature_flags() -> FeatureFlagsConfig {
     app_runtime().features.clone()
+}
+
+fn workspace_lock_manager() -> Arc<WorkspaceLockManager> {
+    Arc::clone(&app_runtime().workspace_locks)
 }
 
 fn runtime_env() -> RuntimeEnvConfig {
@@ -1439,6 +1611,14 @@ fn runtime_env() -> RuntimeEnvConfig {
     } else {
         load_runtime_env_config().unwrap_or_else(|_| fallback_runtime_state().runtime.clone())
     }
+}
+
+fn runtime_resource_budget() -> RuntimeResourceBudget {
+    app_runtime().resource_budget.clone()
+}
+
+fn runtime_deployment_profile() -> DeploymentProfile {
+    app_runtime().deployment_profile
 }
 
 #[cfg(test)]
@@ -1474,6 +1654,12 @@ fn runtime_env_with_test_overrides(base: &RuntimeEnvConfig) -> RuntimeEnvConfig 
     }
     if let Some(value) = non_empty_env("WHISPER_CPP_BIN") {
         runtime.whisper_cpp_bin = value;
+    }
+    if let Some(value) = non_empty_env("FFMPEG_BIN") {
+        runtime.ffmpeg_bin = value;
+    }
+    if let Some(value) = non_empty_env("WHISPER_CPP_LANGUAGE") {
+        runtime.whisper_cpp_language = Some(value);
     }
     if let Some(value) = env_flag_override("ARIA_ALLOW_PRIVATE_WEB_TARGETS") {
         runtime.allow_private_web_targets = value;
@@ -1567,7 +1753,41 @@ fn validate_config(config: &ResolvedAppConfig) -> Result<(), String> {
                 config.gateway.stt_backend
             ));
         }
-        if stt_backend == "cloud_http"
+        let stt_mode = config.gateway.stt_mode.trim().to_lowercase();
+        if stt_mode != "auto" && stt_mode != "local" && stt_mode != "cloud" && stt_mode != "off" {
+            return Err(format!(
+                "gateway.stt_mode '{}' is invalid; expected 'auto', 'local', 'cloud', or 'off'",
+                config.gateway.stt_mode
+            ));
+        }
+        if stt_mode == "local" {
+            let stt_status = crate::stt::inspect_stt_status(config);
+            let Some(model_path) = stt_status.whisper_model_path.as_deref() else {
+                return Err(
+                    "gateway.stt_mode=local requires WHISPER_CPP_MODEL or runtime.whisper_cpp_model"
+                        .into(),
+                );
+            };
+            if !stt_status.whisper_model_exists {
+                return Err(format!(
+                    "gateway.stt_mode=local requires whisper model file to exist: {}",
+                    model_path
+                ));
+            }
+            if !stt_status.whisper_bin_available {
+                return Err(format!(
+                    "gateway.stt_mode=local requires executable whisper_cpp_bin '{}'",
+                    config.runtime.whisper_cpp_bin
+                ));
+            }
+            if !stt_status.ffmpeg_available {
+                return Err(format!(
+                    "gateway.stt_mode=local requires executable ffmpeg_bin '{}'",
+                    config.runtime.ffmpeg_bin
+                ));
+            }
+        }
+        if stt_mode == "cloud"
             && config
                 .gateway
                 .stt_cloud_endpoint
@@ -1737,6 +1957,80 @@ mod config_tests {
         assert!(cfg.cluster.is_cluster());
         assert!(cfg.cluster.runtime_uses_postgres());
         assert_eq!(cfg.cluster.scheduler_shards, 4);
+    }
+
+    #[test]
+    fn edge_profile_clamps_runtime_resource_budget_and_disables_heavy_features() {
+        let cfg = parse_test_config(
+            r#"
+            [cluster]
+            profile = "edge"
+
+            [resource_budget]
+            max_parallel_requests = 6
+            wasm_max_memory_pages = 256
+            max_tool_rounds = 7
+            retrieval_context_char_budget = 12000
+            browser_automation_enabled = true
+            learning_enabled = true
+            "#,
+        );
+        let runtime = RuntimeEnvConfig {
+            config_path: None,
+            rust_log: None,
+            telegram_bot_token: None,
+            openrouter_api_key: None,
+            openai_api_key: None,
+            anthropic_api_key: None,
+            gemini_api_key: None,
+            ollama_host: default_ollama_host(),
+            whisper_cpp_model: None,
+            whisper_cpp_bin: default_whisper_cpp_bin(),
+            ffmpeg_bin: default_ffmpeg_bin(),
+            whisper_cpp_language: None,
+            allow_private_web_targets: false,
+            browser_chromium_bin: None,
+            browser_chrome_bin: None,
+            browser_edge_bin: None,
+            browser_safari_bin: None,
+            browser_automation_bin: None,
+            browser_automation_sha256_allowlist: Vec::new(),
+            browser_automation_os_containment: false,
+            artifact_scan_bin: None,
+            browser_artifact_max_count: default_browser_artifact_max_count(),
+            browser_artifact_max_bytes: default_browser_artifact_max_bytes(),
+            browser_session_state_max_count: default_browser_session_state_max_count(),
+            browser_session_state_max_bytes: default_browser_session_state_max_bytes(),
+            crawl_job_max_count: default_crawl_job_max_count(),
+            watch_job_max_count: default_watch_job_max_count(),
+            website_memory_max_count: default_website_memory_max_count(),
+            web_domain_min_interval_ms: default_web_domain_min_interval_ms(),
+            web_fetch_retry_attempts: default_web_fetch_retry_attempts(),
+            web_fetch_retry_base_delay_ms: default_web_fetch_retry_base_delay_ms(),
+            web_fetch_retry_max_delay_ms: default_web_fetch_retry_max_delay_ms(),
+            watch_max_jobs_per_agent: default_watch_max_jobs_per_agent(),
+            watch_max_jobs_per_domain: default_watch_max_jobs_per_domain(),
+            download_max_bytes: default_download_max_bytes(),
+            snapshot_max_bytes: default_snapshot_max_bytes(),
+            extract_max_bytes: default_extract_max_bytes(),
+            screenshot_max_bytes: default_screenshot_max_bytes(),
+            allowed_download_mime_prefixes: Vec::new(),
+            blocked_download_extensions: Vec::new(),
+            master_key: None,
+            idempotency_cache_max_entries: default_idempotency_cache_max_entries(),
+            idempotency_cache_ttl_secs: default_idempotency_cache_ttl_secs(),
+            dedupe_key_retention_secs: default_dedupe_key_retention_secs(),
+            web_domain_state_max_entries: default_web_domain_state_max_entries(),
+            session_tool_cache_max_entries: default_session_tool_cache_max_entries(),
+            global_request_concurrency_limit: 6,
+        };
+        let budget = resolve_runtime_resource_budget(&cfg, &runtime);
+        assert_eq!(budget.max_parallel_requests, 2);
+        assert_eq!(budget.wasm_max_memory_pages, 96);
+        assert_eq!(budget.max_tool_rounds, 4);
+        assert_eq!(budget.retrieval_context_char_budget, 6000);
+        assert!(!budget.browser_automation_enabled);
+        assert!(!budget.learning_enabled);
     }
 
     #[test]
