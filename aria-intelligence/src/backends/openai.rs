@@ -617,6 +617,7 @@ mod tests {
         assert_eq!(body["parallel_tool_calls"], json!(false));
     }
 
+
     #[test]
     fn openai_inspect_context_payload_includes_messages_and_tools() {
         let backend = backend();
@@ -627,6 +628,43 @@ mod tests {
         assert_eq!(payload["model"], json!("gpt-4o-mini"));
         assert!(payload["messages"].is_array());
         assert_eq!(payload["tools"][0]["function"]["name"], json!("write_file"));
+    }
+
+    #[tokio::test]
+    async fn openai_probe_marks_gpt_models_as_tool_and_vision_capable() {
+        let provider = OpenAiProvider {
+            api_key: SecretRef::Literal(String::from("test-key")),
+            base_url: String::from("https://api.openai.com/v1"),
+        };
+
+        let observed_at_us = 1_234_567;
+        let probe = provider
+            .probe_model_capabilities("gpt-4o-mini", observed_at_us)
+            .await
+            .expect("probe should succeed");
+
+        assert_eq!(probe.tool_calling, CapabilitySupport::Supported);
+        assert_eq!(probe.supports_images, CapabilitySupport::Supported);
+        assert_eq!(probe.model_ref.provider_id, "openai");
+        assert_eq!(probe.model_ref.model_id, "gpt-4o-mini");
+        assert_eq!(probe.expires_at_us, Some(observed_at_us + 86_400_000_000));
+    }
+
+    #[tokio::test]
+    async fn openai_probe_marks_unknown_models_as_degraded_and_unknown_vision() {
+        let provider = OpenAiProvider {
+            api_key: SecretRef::Literal(String::from("test-key")),
+            base_url: String::from("https://api.openai.com/v1"),
+        };
+
+        let probe = provider
+            .probe_model_capabilities("legacy-text-model", 999)
+            .await
+            .expect("probe should succeed");
+
+        assert_eq!(probe.tool_calling, CapabilitySupport::Degraded);
+        assert_eq!(probe.supports_images, CapabilitySupport::Unknown);
+        assert_eq!(probe.native_tool_probe, Some(CapabilitySupport::Degraded));
     }
 }
 
