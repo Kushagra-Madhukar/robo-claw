@@ -3,6 +3,13 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+if [[ -f ".env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source ".env"
+  set +a
+fi
+
 RUN_ID="$(date +"%Y%m%d-%H%M%S")"
 LOG_DIR="${ARIA_LOG_DIR:-./logs/dev}"
 mkdir -p "$LOG_DIR"

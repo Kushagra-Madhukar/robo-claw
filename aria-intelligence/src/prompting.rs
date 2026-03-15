@@ -1,5 +1,8 @@
 use super::*;
-use aria_core::AdapterFamily;
+use aria_core::{
+    AdapterFamily, CapabilitySupport, ContextBlock, ContextBlockKind, ExecutionContextPack,
+    PromptContextMessage, ToolCallingMode,
+};
 
 // ---------------------------------------------------------------------------
 // Item 3: Bump-Pointer Arena Prompt Assembly (P3)
@@ -53,6 +56,10 @@ pub enum PromptMode {
 pub struct PromptManager;
 
 impl PromptManager {
+    fn estimate_token_count(text: &str) -> usize {
+        text.split_whitespace().count()
+    }
+
     fn render_user_text<'a>(arena: &'a PromptArena, request: &AgentRequest) -> &'a str {
         match &request.content {
             MessageContent::Text(s) => arena.alloc(s),
@@ -93,6 +100,104 @@ impl PromptManager {
         }
     }
 
+    pub fn build_execution_context_pack(
+        arena: &PromptArena,
+        agent_system_prompt: &str,
+        request: &AgentRequest,
+        history_messages: &[PromptContextMessage],
+        context_blocks: Vec<ContextBlock>,
+        tools: &[CachedTool],
+        capability_profile: Option<&ModelCapabilityProfile>,
+        tool_calling_mode: Option<ToolCallingMode>,
+    ) -> ExecutionContextPack {
+        let user_text = Self::render_user_text(arena, request).to_string();
+        let now_utc = chrono::Utc::now();
+        let now_local = chrono::Local::now();
+        let provider_variant = Self::provider_execution_guidance(capability_profile);
+        let tool_section =
+            Self::textual_tool_instruction_block(tools, capability_profile, tool_calling_mode);
+        let meta_instructions = format!(
+            "--- System Directives ---\n\
+            1. You are a precise, concise AI agent. Follow the defined system prompt strictly.\n\
+            2. If native tool calling is unavailable, use only the documented fallback tool format.\n\
+            3. Do not over-explain. Provide direct answers.\n\
+            4. Current UTC time: {}.\n\
+            5. Current local time: {}.\n\
+            6. For reminders/scheduling, always pass a structured 'schedule' object. Use kind='at' with RFC3339 timestamps for one-shot events, kind='every' for fixed intervals, kind='daily' for daily wall-clock time, kind='weekly' for weekly or biweekly wall-clock time, and kind='cron' for advanced cron expressions.\n\
+            7. For schedule_message/set_reminder, use mode='notify' for static reminders, mode='defer' to execute work at trigger time, and mode='both' if both are needed.\n\
+            8. If user asks to perform work \"in X\" time, default to mode='defer' (do not execute now) unless user explicitly asks for both immediate and delayed output.\n\
+            9. Prefer schedule.kind='at' for one-shot requests like \"in 1 minute\", \"after 2 hours\", \"today at 10 PM\", or \"tomorrow 8:15 AM\". Use schedule.kind='every' only for true repeating intervals. Use schedule.kind='daily' or 'weekly' only when the user asks for recurring wall-clock schedules.\n\
+            10. Never emit placeholder schedule payloads like \"{{}}\", \"null\", or empty objects. Always send a concrete schedule object with a kind.\n\
+            11. {}\n",
+            now_utc.to_rfc3339(),
+            now_local.format("%Y-%m-%d %H:%M:%S %:z"),
+            provider_variant
+        );
+        let mut system_prompt = format!("{}\n\n{}", agent_system_prompt, meta_instructions);
+        let mut blocks = context_blocks;
+        if let Some(tool_block) = tool_section {
+            blocks.push(ContextBlock {
+                kind: ContextBlockKind::ToolInstructions,
+                label: "Tool fallback instructions".into(),
+                token_estimate: Self::estimate_token_count(&tool_block) as u32,
+                content: tool_block,
+            });
+        }
+        system_prompt = system_prompt.trim().to_string();
+        ExecutionContextPack {
+            system_prompt,
+            history_messages: history_messages.to_vec(),
+            context_blocks: blocks,
+            user_request: user_text,
+            channel: request.channel,
+            execution_contract: None,
+            retrieved_context: None,
+        }
+    }
+
+    pub fn render_execution_context_pack(pack: &ExecutionContextPack) -> String {
+        let mut rendered = format!(
+            "Prompt Mode: {:?}\nSystem Prompt:\n{}",
+            PromptMode::Execution,
+            pack.system_prompt
+        );
+        if let Some(contract) = &pack.execution_contract {
+            rendered.push_str("\n\nExecution Contract:\n");
+            rendered.push_str(&format!(
+                "kind={:?}; required_artifacts={:?}; fallback={:?}",
+                contract.kind, contract.required_artifact_kinds, contract.fallback_mode
+            ));
+        }
+        for block in &pack.context_blocks {
+            rendered.push_str("\n\n");
+            rendered.push_str(&Self::render_context_block_label(block));
+            rendered.push('\n');
+            rendered.push_str(&block.content);
+        }
+        if let Some(bundle) = &pack.retrieved_context {
+            rendered.push_str("\n\nRetrieved Context Summary:\n");
+            if let Some(plan) = &bundle.plan_summary {
+                rendered.push_str(plan);
+                rendered.push('\n');
+            }
+            for block in &bundle.blocks {
+                rendered.push_str(&format!(
+                    "- {:?} {} score={:?}\n",
+                    block.source_kind, block.label, block.score
+                ));
+            }
+        }
+        rendered.push_str("\n\nSession History:\n");
+        for message in &pack.history_messages {
+            rendered.push_str(&format!("{}: {}\n", message.role, message.content));
+        }
+        rendered.push_str(&format!(
+            "\nUser Request (channel={:?}):\n{}",
+            pack.channel, pack.user_request
+        ));
+        rendered
+    }
+
     pub fn build_execution_prompt_arena(
         arena: &PromptArena,
         agent_system_prompt: &str,
@@ -102,73 +207,120 @@ impl PromptManager {
         tools: &[CachedTool],
         capability_profile: Option<&ModelCapabilityProfile>,
     ) -> String {
-        let user_text = Self::render_user_text(arena, request);
-        let tools_section = if tools.is_empty() {
-            ""
-        } else {
-            let mut tools_buffer = bumpalo::collections::String::new_in(&arena.bump);
-            use std::fmt::Write;
-            let _ = writeln!(tools_buffer, "\n--- Available Tools ---");
-            let _ = writeln!(
-                tools_buffer,
-                "To call a tool, respond with ONLY the following JSON and nothing else:"
-            );
-            let _ = writeln!(
-                tools_buffer,
-                r#"{{"tool": "<tool_name>", "args": {{<key>: <value>, ...}}}}"#
-            );
-            let _ = writeln!(tools_buffer, "\nTools:");
-            for t in tools {
-                let _ = writeln!(tools_buffer, "- {}: {}", t.name, t.description);
-                if !t.parameters_schema.is_empty() && t.parameters_schema != "{}" {
-                    let rendered_schema = normalize_tool_schema(&t.parameters_schema)
-                        .unwrap_or_else(|_| t.parameters_schema.clone());
-                    let _ = writeln!(tools_buffer, "  Schema: {}", rendered_schema);
-                }
-            }
-            let _ = writeln!(
-                tools_buffer,
-                "\nIf no tool is needed, reply with plain text."
-            );
-            arena.alloc(tools_buffer.as_str())
-        };
-
-        let now_utc = chrono::Utc::now();
-        let now_local = chrono::Local::now();
-        let provider_variant = Self::provider_execution_guidance(capability_profile);
-        let meta_instructions = format!(
-            "\n--- System Directives ---\n\
-            1. You are a precise, concise AI agent. Follow the defined system prompt strictly.\n\
-            2. If you need to use a tool, return ONLY the tool call JSON shown above.\n\
-            3. Do not over-explain. Provide direct answers.\n\
-            4. Current UTC time: {}.\n\
-            5. Current local time: {}.\n\
-            6. For reminders/scheduling, always pass a structured 'schedule' object. Use kind='at' with RFC3339 timestamps for one-shot events, kind='every' for fixed intervals, kind='daily' for daily wall-clock time, kind='weekly' for weekly or biweekly wall-clock time, and kind='cron' for advanced cron expressions.\n\
-            7. For schedule_message/set_reminder, use mode='notify' for static reminders, mode='defer' to execute work at trigger time, and mode='both' if both are needed.\n\
-            8. If user asks to perform work \"in X\" time, default to mode='defer' (do not execute now) unless user explicitly asks for both immediate and delayed output.\n\
-            9. Prefer schedule.kind='at' for one-shot requests like \"in 1 minute\", \"after 2 hours\", \"today at 10 PM\", or \"tomorrow 8:15 AM\". Use schedule.kind='every' only for true repeating intervals. Use schedule.kind='daily' or 'weekly' only when the user asks for recurring wall-clock schedules.\n\
-            10. {}\n",
-            now_utc.to_rfc3339(),
-            now_local.format("%Y-%m-%d %H:%M:%S %:z"),
-            provider_variant
-        );
-
-        format!(
-            "Prompt Mode: {:?}\nSystem Prompt:\n{}{}\n{}\nRAG Context:\n{}\n\nSession History:\n{}\n\nUser Request (channel={:?}):\n{}",
-            PromptMode::Execution,
+        let history_messages = history_context
+            .lines()
+            .filter_map(|line| {
+                let (role, content) = line.split_once(':')?;
+                Some(PromptContextMessage {
+                    role: role.trim().to_string(),
+                    content: content.trim().to_string(),
+                    timestamp_us: 0,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut blocks = Vec::new();
+        if !rag_context.trim().is_empty() {
+            blocks.push(ContextBlock {
+                kind: ContextBlockKind::Retrieval,
+                label: "RAG Context".into(),
+                token_estimate: Self::estimate_token_count(rag_context) as u32,
+                content: rag_context.to_string(),
+            });
+        }
+        let pack = Self::build_execution_context_pack(
+            arena,
             agent_system_prompt,
-            tools_section,
-            meta_instructions,
-            rag_context,
-            history_context,
-            request.channel,
-            user_text
-        )
+            request,
+            &history_messages,
+            blocks,
+            tools,
+            capability_profile,
+            None,
+        );
+        Self::render_execution_context_pack(&pack)
+    }
+
+    fn render_context_block_label(block: &ContextBlock) -> String {
+        match block.kind {
+            ContextBlockKind::Retrieval => format!("RAG Context [{}]:", block.label),
+            ContextBlockKind::ControlDocument => {
+                format!("Control Documents [{}]:", block.label)
+            }
+            ContextBlockKind::DurableConstraint => {
+                format!("Durable Constraints [{}]:", block.label)
+            }
+            ContextBlockKind::SubAgentResult => format!("Sub-Agent Results [{}]:", block.label),
+            ContextBlockKind::ToolInstructions => {
+                format!("Tool Instructions [{}]:", block.label)
+            }
+            ContextBlockKind::PromptAsset => format!("Prompt Assets [{}]:", block.label),
+            ContextBlockKind::ResourceContext => format!("Resource Context [{}]:", block.label),
+            ContextBlockKind::CapabilityIndex => format!("Capability Index [{}]:", block.label),
+            ContextBlockKind::DocumentIndex => format!("Document Index [{}]:", block.label),
+            ContextBlockKind::ContractRequirements => {
+                format!("Execution Contract [{}]:", block.label)
+            }
+        }
+    }
+
+    fn textual_tool_instruction_block(
+        tools: &[CachedTool],
+        capability_profile: Option<&ModelCapabilityProfile>,
+        tool_calling_mode: Option<ToolCallingMode>,
+    ) -> Option<String> {
+        if tools.is_empty() {
+            return None;
+        }
+        let should_inline = match capability_profile {
+            _ if matches!(
+                tool_calling_mode,
+                Some(ToolCallingMode::TextFallbackWithRepair)
+            ) =>
+            {
+                true
+            }
+            Some(profile) => {
+                matches!(
+                    profile.tool_calling,
+                    CapabilitySupport::Unsupported | CapabilitySupport::Unknown
+                ) || matches!(profile.adapter_family, AdapterFamily::TextOnlyCli)
+            }
+            None => true,
+        };
+        if !should_inline {
+            return None;
+        }
+        let mut tools_buffer = String::new();
+        use std::fmt::Write;
+        let _ = writeln!(tools_buffer, "--- Available Tools ---");
+        let _ = writeln!(
+            tools_buffer,
+            "To call a tool, respond with ONLY the following JSON and nothing else:"
+        );
+        let _ = writeln!(
+            tools_buffer,
+            r#"{{"tool": "<tool_name>", "args": {{<key>: <value>, ...}}}}"#
+        );
+        let _ = writeln!(tools_buffer, "\nTools:");
+        for t in tools {
+            let _ = writeln!(tools_buffer, "- {}: {}", t.name, t.description);
+            if !t.parameters_schema.is_empty() && t.parameters_schema != "{}" {
+                let rendered_schema = normalize_tool_schema(&t.parameters_schema)
+                    .unwrap_or_else(|_| t.parameters_schema.clone());
+                let _ = writeln!(tools_buffer, "  Schema: {}", rendered_schema);
+            }
+        }
+        let _ = writeln!(
+            tools_buffer,
+            "\nIf no tool is needed, reply with plain text."
+        );
+        Some(tools_buffer.trim().to_string())
     }
 
     fn provider_execution_guidance(capability_profile: Option<&ModelCapabilityProfile>) -> String {
         let Some(profile) = capability_profile else {
-            return "Use the simplest valid tool call format available to the current model.".into();
+            return "Use the simplest valid tool call format available to the current model."
+                .into();
         };
         match profile.adapter_family {
             AdapterFamily::OpenAiCompatible => {
@@ -257,6 +409,10 @@ impl PromptManager {
         );
         lines.push(
             "Prefer schedule.kind='at' for one-shot requests. Use schedule.kind='every' only for true repeating intervals. Use schedule.kind='daily' or 'weekly' only for recurring wall-clock schedules.".to_string(),
+        );
+        lines.push(
+            "Never send schedule='{}' or an empty schedule object; use normalized_schedule_json when present."
+                .to_string(),
         );
         lines.push("</request_classifier>".to_string());
         lines.join("\n")

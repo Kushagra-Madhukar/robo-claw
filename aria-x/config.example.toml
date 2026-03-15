@@ -1,8 +1,8 @@
 ## ARIA-X Example Configuration (full schema)
 
 [llm]
-backend = "openrouter"
-model = "arcee-ai/trinity-large-preview:free"
+backend = "gemini"
+model = "gemini-3-flash-preview"
 max_tool_rounds = 5
 
 [policy]
@@ -35,7 +35,14 @@ adapter = "cli" # or "telegram" or "websocket"
 # telegram_port = 8080          # Webhook listen port (only if telegram_mode = webhook)
 # telegram_mode = "polling"     # polling = no webhook (default). webhook = needs public URL
 # Env: TELEGRAM_BOT_TOKEN. Also load from .env or ~/.aria/.env
-# stt_backend = "local_whisper" # local_whisper | cloud_http
+# stt_mode = "auto"             # auto | local | cloud | off
+# stt_backend = "local_whisper" # legacy backend selector for provider wiring
+# Local Whisper requirements:
+# WHISPER_CPP_MODEL=/absolute/path/to/model.bin
+# WHISPER_CPP_BIN=whisper-cli
+# FFMPEG_BIN=ffmpeg
+# Optional language hint:
+# WHISPER_CPP_LANGUAGE=en
 # stt_cloud_fallback = false    # if true, fallback to cloud STT on local failure
 # stt_cloud_endpoint = ""       # required for cloud_http or fallback (JSON API)
 # stt_cloud_api_key_env = "OPENAI_API_KEY"

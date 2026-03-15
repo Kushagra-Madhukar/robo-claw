@@ -32,7 +32,10 @@ use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 
 pub mod backends;
-pub use backends::{LLMBackend, ModelMetadata, ModelProvider};
+pub use backends::{
+    EgressCredentialBroker, EgressSecretAuditRecord, EgressSecretOutcome, LLMBackend,
+    ModelMetadata, ModelProvider,
+};
 
 mod hardware;
 mod orchestrator;
@@ -47,10 +50,10 @@ mod tools;
 
 pub(crate) use hardware::render_tool_result_for_model;
 pub use hardware::*;
-pub(crate) use orchestrator::append_tool_results_to_prompt;
 #[cfg(test)]
 pub(crate) use orchestrator::maybe_finalize_after_scheduler_tools;
 pub use orchestrator::*;
+pub(crate) use orchestrator::{append_tool_results_to_context_pack, append_tool_results_to_prompt};
 pub use prompting::*;
 pub use router::*;
 #[cfg(test)]
@@ -59,6 +62,4 @@ pub use runtime::*;
 pub(crate) use runtime::{approval_required_tool_name, extract_tool_name_candidate};
 pub use scheduler::*;
 pub use telemetry::*;
-#[cfg(test)]
-pub(crate) use tools::tool_schema_fidelity_bonus;
 pub use tools::*;

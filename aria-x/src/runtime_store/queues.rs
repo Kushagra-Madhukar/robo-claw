@@ -322,25 +322,33 @@ impl RuntimeStore {
             )
             .map_err(|e| format!("prepare list durable DLQ failed: {}", e))?;
         let rows = stmt
-            .query_map(params![queue_kind_name(queue), tenant_id, workspace_scope], |row| {
-                Ok(DurableQueueDlqRecord {
-                    dlq_id: row.get("dlq_id")?,
-                    message_id: row.get("message_id")?,
-                    queue: parse_queue_kind(&row.get::<_, String>("queue_name")?).map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
-                        )
-                    })?,
-                    tenant_id: row.get("tenant_id")?,
-                    workspace_scope: row.get("workspace_scope")?,
-                    payload_json: row.get("payload_json")?,
-                    final_error: row.get("final_error")?,
-                    attempt_count: row.get::<_, i64>("attempt_count")? as u32,
-                    created_at_us: row.get::<_, i64>("created_at_us")? as u64,
-                })
-            })
+            .query_map(
+                params![queue_kind_name(queue), tenant_id, workspace_scope],
+                |row| {
+                    Ok(DurableQueueDlqRecord {
+                        dlq_id: row.get("dlq_id")?,
+                        message_id: row.get("message_id")?,
+                        queue: parse_queue_kind(&row.get::<_, String>("queue_name")?).map_err(
+                            |err| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    0,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        err,
+                                    )),
+                                )
+                            },
+                        )?,
+                        tenant_id: row.get("tenant_id")?,
+                        workspace_scope: row.get("workspace_scope")?,
+                        payload_json: row.get("payload_json")?,
+                        final_error: row.get("final_error")?,
+                        attempt_count: row.get::<_, i64>("attempt_count")? as u32,
+                        created_at_us: row.get::<_, i64>("created_at_us")? as u64,
+                    })
+                },
+            )
             .map_err(|e| format!("query durable DLQ failed: {}", e))?;
         let mut out = Vec::new();
         for row in rows {
@@ -369,13 +377,18 @@ impl RuntimeStore {
                     Ok(DurableQueueDlqRecord {
                         dlq_id: row.get("dlq_id")?,
                         message_id: row.get("message_id")?,
-                        queue: parse_queue_kind(&row.get::<_, String>("queue_name")?).map_err(|err| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                rusqlite::types::Type::Text,
-                                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
-                            )
-                        })?,
+                        queue: parse_queue_kind(&row.get::<_, String>("queue_name")?).map_err(
+                            |err| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    0,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        err,
+                                    )),
+                                )
+                            },
+                        )?,
                         tenant_id: row.get("tenant_id")?,
                         workspace_scope: row.get("workspace_scope")?,
                         payload_json: row.get("payload_json")?,
@@ -405,8 +418,11 @@ impl RuntimeStore {
             ],
         )
         .map_err(|e| format!("replay durable message failed: {}", e))?;
-        tx.execute("DELETE FROM durable_queue_dlq WHERE dlq_id=?1", params![dlq_id])
-            .map_err(|e| format!("delete durable DLQ record failed: {}", e))?;
+        tx.execute(
+            "DELETE FROM durable_queue_dlq WHERE dlq_id=?1",
+            params![dlq_id],
+        )
+        .map_err(|e| format!("delete durable DLQ record failed: {}", e))?;
         tx.commit()
             .map_err(|e| format!("commit durable DLQ replay failed: {}", e))?;
         Ok(Some(DurableQueueMessage {

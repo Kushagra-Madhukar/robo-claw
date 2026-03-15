@@ -1,8 +1,8 @@
+use std::collections::VecDeque;
 use std::io::{stdout, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-use std::collections::VecDeque;
 
 use crate::{default_project_config_path, resolve_config_path};
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -27,7 +27,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StartupMode {
-    Runtime { config_path: String },
+    Runtime {
+        config_path: String,
+    },
     Tui {
         config_path: String,
         attach_url: Option<String>,
@@ -38,10 +40,30 @@ pub(crate) fn parse_startup_mode(
     args: &[String],
     fallback_config_path: Option<String>,
 ) -> StartupMode {
-    let default_config = fallback_config_path.unwrap_or_else(|| {
-        default_project_config_path().to_string_lossy().to_string()
-    });
+    let default_config = fallback_config_path
+        .unwrap_or_else(|| default_project_config_path().to_string_lossy().to_string());
     match args.get(1).map(|value| value.as_str()) {
+        Some("channels")
+        | Some("inspect")
+        | Some("explain")
+        | Some("--inspect-context")
+        | Some("--inspect-provider-payloads")
+        | Some("--explain-context")
+        | Some("--explain-provider-payloads")
+        | Some("doctor")
+        | Some("setup")
+        | Some("status")
+        | Some("stop")
+        | Some("help")
+        | Some("install")
+        | Some("completion")
+        | Some("-h")
+        | Some("--help") => StartupMode::Runtime {
+            config_path: default_config,
+        },
+        Some("run") => StartupMode::Runtime {
+            config_path: args.get(2).cloned().unwrap_or(default_config),
+        },
         Some("tui") | Some("--tui") => {
             let mut config_path = default_config;
             let mut attach_url = None;
@@ -69,16 +91,22 @@ pub(crate) fn parse_startup_mode(
     }
 }
 
-pub(crate) async fn run_tui_mode(config_path: &str, attach_url: Option<&str>) -> Result<(), String> {
+pub(crate) async fn run_tui_mode(
+    config_path: &str,
+    attach_url: Option<&str>,
+) -> Result<(), String> {
     let resolved = resolve_config_path(config_path);
     let websocket_port = if let Some(url) = attach_url {
         websocket_port_from_url(url).unwrap_or(0)
     } else {
         pick_open_port().await?
     };
-    let parent = resolved
-        .parent()
-        .ok_or_else(|| format!("config path '{}' has no parent directory", resolved.display()))?;
+    let parent = resolved.parent().ok_or_else(|| {
+        format!(
+            "config path '{}' has no parent directory",
+            resolved.display()
+        )
+    })?;
     let stem = resolved
         .file_stem()
         .and_then(|value| value.to_str())
@@ -92,7 +120,12 @@ pub(crate) async fn run_tui_mode(config_path: &str, attach_url: Option<&str>) ->
     let ws_url = if let Some(url) = attach_url {
         url.to_string()
     } else {
-        prepare_tui_runtime_config(&resolved, &temp_config_path, &temp_runtime_path, websocket_port)?;
+        prepare_tui_runtime_config(
+            &resolved,
+            &temp_config_path,
+            &temp_runtime_path,
+            websocket_port,
+        )?;
         child = Some(spawn_tui_runtime(&temp_config_path, &temp_log_path)?);
         wait_for_websocket(websocket_port).await?;
         format!("ws://127.0.0.1:{}/ws", websocket_port)
@@ -117,9 +150,18 @@ pub(crate) async fn run_tui_mode(config_path: &str, attach_url: Option<&str>) ->
 
     let prefs = load_tui_preferences();
     let bootstrap_agent = prefs.active_agent.clone();
-    let mut state = TuiState::new(config_path.to_string(), websocket_port, prefs, temp_log_path);
+    let mut state = TuiState::new(
+        config_path.to_string(),
+        websocket_port,
+        prefs,
+        temp_log_path,
+    );
     state.render(&mut guard.stdout)?;
-    send_ws_text(&mut sink, state.make_request(&format!("/agent {}", bootstrap_agent))).await?;
+    send_ws_text(
+        &mut sink,
+        state.make_request(&format!("/agent {}", bootstrap_agent)),
+    )
+    .await?;
     state.push_system(format!(
         "Connected. Establishing session agent override: {}.",
         bootstrap_agent
@@ -236,7 +278,8 @@ async fn pick_open_port() -> Result<u16, String> {
 }
 
 fn spawn_tui_runtime(config_path: &Path, log_path: &Path) -> Result<Child, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("resolve current executable failed: {}", e))?;
+    let exe =
+        std::env::current_exe().map_err(|e| format!("resolve current executable failed: {}", e))?;
     let stderr = std::fs::File::create(log_path)
         .map_err(|e| format!("create TUI runtime log failed: {}", e))?;
     Command::new(exe)
@@ -279,8 +322,7 @@ fn prepare_tui_runtime_config(
         )
         .map_err(|e| format!("parse runtime config failed: {}", e))?;
         runtime_json["gateway"]["adapter"] = serde_json::Value::String("websocket".into());
-        runtime_json["gateway"]["adapters"] =
-            serde_json::json!(["websocket"]);
+        runtime_json["gateway"]["adapters"] = serde_json::json!(["websocket"]);
         runtime_json["gateway"]["websocket_bind_address"] =
             serde_json::Value::String("127.0.0.1".into());
         runtime_json["gateway"]["websocket_port"] =
@@ -306,7 +348,10 @@ async fn wait_for_websocket(port: u16) -> Result<(), String> {
             Err(_) => tokio::time::sleep(Duration::from_millis(150)).await,
         }
     }
-    Err(format!("websocket runtime on port {} did not become ready", port))
+    Err(format!(
+        "websocket runtime on port {} did not become ready",
+        port
+    ))
 }
 
 struct TuiTerminalGuard {
@@ -426,10 +471,7 @@ impl TuiState {
 
     fn push_assistant(&mut self, text: String) {
         self.ingest_runtime_signal(&text);
-        self.lines.push(TuiLine {
-            role: "aria",
-            text,
-        });
+        self.lines.push(TuiLine { role: "aria", text });
         self.scroll = 0;
     }
 
@@ -454,12 +496,14 @@ impl TuiState {
 
     fn handle_event(&mut self, evt: Event) -> Option<TuiAction> {
         match evt {
-            Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers, .. })
-                if modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                Some(TuiAction::Quit)
-            }
-            Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers,
+                ..
+            }) if modifiers.contains(KeyModifiers::CONTROL) => Some(TuiAction::Quit),
+            Event::Key(KeyEvent {
+                code: KeyCode::Esc, ..
+            }) => {
                 if self.show_approval_detail {
                     self.show_approval_detail = false;
                     None
@@ -467,28 +511,47 @@ impl TuiState {
                     Some(TuiAction::Quit)
                 }
             }
-            Event::Key(KeyEvent { code: KeyCode::F(2), .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::F(2),
+                ..
+            }) => {
                 self.sidebar_tab = SidebarTab::Agents;
                 Some(TuiAction::Send("/agents".into()))
             }
-            Event::Key(KeyEvent { code: KeyCode::F(3), .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::F(3),
+                ..
+            }) => {
                 self.sidebar_tab = SidebarTab::Approvals;
                 Some(TuiAction::Send("/approvals".into()))
             }
-            Event::Key(KeyEvent { code: KeyCode::F(4), .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::F(4),
+                ..
+            }) => {
                 self.sidebar_tab = SidebarTab::Session;
                 Some(TuiAction::Send("/runs".into()))
             }
-            Event::Key(KeyEvent { code: KeyCode::F(5), .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::F(5),
+                ..
+            }) => {
                 self.lines.clear();
                 self.push_system("Transcript cleared.".into());
                 None
             }
-            Event::Key(KeyEvent { code: KeyCode::F(1), .. }) => {
-                self.push_system("Shortcuts: F2 /agents, F3 /approvals, F4 /runs, Ctrl+C quit.".into());
+            Event::Key(KeyEvent {
+                code: KeyCode::F(1),
+                ..
+            }) => {
+                self.push_system(
+                    "Shortcuts: F2 /agents, F3 /approvals, F4 /runs, Ctrl+C quit.".into(),
+                );
                 None
             }
-            Event::Key(KeyEvent { code: KeyCode::Tab, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Tab, ..
+            }) => {
                 self.sidebar_tab = self.sidebar_tab.next();
                 None
             }
@@ -504,64 +567,93 @@ impl TuiState {
                 MouseEventKind::Down(_) => self.handle_mouse_click(mouse.column, mouse.row),
                 _ => None,
             },
-            Event::Key(KeyEvent { code: KeyCode::Up, modifiers, .. })
-                if !modifiers.contains(KeyModifiers::SHIFT) =>
-            {
+            Event::Key(KeyEvent {
+                code: KeyCode::Up,
+                modifiers,
+                ..
+            }) if !modifiers.contains(KeyModifiers::SHIFT) => {
                 self.move_selection_up();
                 None
             }
-            Event::Key(KeyEvent { code: KeyCode::Down, modifiers, .. })
-                if !modifiers.contains(KeyModifiers::SHIFT) =>
-            {
+            Event::Key(KeyEvent {
+                code: KeyCode::Down,
+                modifiers,
+                ..
+            }) if !modifiers.contains(KeyModifiers::SHIFT) => {
                 self.move_selection_down();
                 None
             }
-            Event::Key(KeyEvent { code: KeyCode::PageUp, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            }) => {
                 self.scroll = self.scroll.saturating_add(5);
                 None
             }
-            Event::Key(KeyEvent { code: KeyCode::PageDown, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            }) => {
                 self.scroll = self.scroll.saturating_sub(5);
                 None
             }
-            Event::Key(KeyEvent { code: KeyCode::Up, modifiers, .. })
-                if modifiers.contains(KeyModifiers::SHIFT) =>
-            {
+            Event::Key(KeyEvent {
+                code: KeyCode::Up,
+                modifiers,
+                ..
+            }) if modifiers.contains(KeyModifiers::SHIFT) => {
                 self.scroll = self.scroll.saturating_add(1);
                 None
             }
-            Event::Key(KeyEvent { code: KeyCode::Down, modifiers, .. })
-                if modifiers.contains(KeyModifiers::SHIFT) =>
-            {
+            Event::Key(KeyEvent {
+                code: KeyCode::Down,
+                modifiers,
+                ..
+            }) if modifiers.contains(KeyModifiers::SHIFT) => {
                 self.scroll = self.scroll.saturating_sub(1);
                 None
             }
-            Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            }) => {
                 self.input.pop();
                 None
             }
-            Event::Key(KeyEvent { code: KeyCode::Char('i'), modifiers, .. })
-                if !modifiers.contains(KeyModifiers::CONTROL)
-                    && self.sidebar_tab == SidebarTab::Approvals =>
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('i'),
+                modifiers,
+                ..
+            }) if !modifiers.contains(KeyModifiers::CONTROL)
+                && self.sidebar_tab == SidebarTab::Approvals =>
             {
                 self.show_approval_detail = !self.show_approval_detail;
                 None
             }
-            Event::Key(KeyEvent { code: KeyCode::Char('a'), modifiers, .. })
-                if !modifiers.contains(KeyModifiers::CONTROL)
-                    && self.sidebar_tab == SidebarTab::Approvals =>
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers,
+                ..
+            }) if !modifiers.contains(KeyModifiers::CONTROL)
+                && self.sidebar_tab == SidebarTab::Approvals =>
             {
                 self.selected_approval()
                     .map(|item| TuiAction::Send(format!("/approve {}", item.handle)))
             }
-            Event::Key(KeyEvent { code: KeyCode::Char('d'), modifiers, .. })
-                if !modifiers.contains(KeyModifiers::CONTROL)
-                    && self.sidebar_tab == SidebarTab::Approvals =>
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('d'),
+                modifiers,
+                ..
+            }) if !modifiers.contains(KeyModifiers::CONTROL)
+                && self.sidebar_tab == SidebarTab::Approvals =>
             {
                 self.selected_approval()
                     .map(|item| TuiAction::Send(format!("/deny {}", item.handle)))
             }
-            Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            }) => {
                 if self.input.trim().is_empty() {
                     if let Some(action) = self.activate_sidebar_selection() {
                         return Some(action);
@@ -581,9 +673,12 @@ impl TuiState {
                     Some(TuiAction::Send(text))
                 }
             }
-            Event::Key(KeyEvent { code: KeyCode::Char(ch), modifiers, .. })
-                if !modifiers.contains(KeyModifiers::CONTROL)
-                    && !modifiers.contains(KeyModifiers::ALT) =>
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            }) if !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) =>
             {
                 self.input.push(ch);
                 None
@@ -593,7 +688,8 @@ impl TuiState {
     }
 
     fn render(&mut self, stdout: &mut std::io::Stdout) -> Result<(), String> {
-        let (cols, rows) = terminal::size().map_err(|e| format!("read terminal size failed: {}", e))?;
+        let (cols, rows) =
+            terminal::size().map_err(|e| format!("read terminal size failed: {}", e))?;
         let right_w: u16 = if cols < 96 { 26 } else { 32 };
         let input_h: u16 = 4;
         let header_h: u16 = 3;
@@ -610,9 +706,20 @@ impl TuiState {
             header_h,
             right_w,
             chat_h + 1,
-            if layout.compact_mode { " Panel " } else { " Status " },
+            if layout.compact_mode {
+                " Panel "
+            } else {
+                " Status "
+            },
         )?;
-        draw_box(stdout, 0, header_h + chat_h + 1, cols, input_h + 1, " Input ")?;
+        draw_box(
+            stdout,
+            0,
+            header_h + chat_h + 1,
+            cols,
+            input_h + 1,
+            " Input ",
+        )?;
 
         let ws_label = format!("ws {}", self.websocket_port);
         let ws_x = cols.saturating_sub((ws_label.len() as u16).saturating_add(2));
@@ -622,30 +729,65 @@ impl TuiState {
             2,
             1,
             Color::Blue,
-            &truncate_with_ellipsis(&format!("config {}", self.config_path), config_room.saturating_sub(2) as usize),
+            &truncate_with_ellipsis(
+                &format!("config {}", self.config_path),
+                config_room.saturating_sub(2) as usize,
+            ),
         )?;
         let scroll_hint = if self.scroll == 0 { "live" } else { "scroll" };
         let mut badge_x = 2u16.max(config_room.saturating_sub(38));
         badge_x = badge_x.max(22);
-        badge_x = draw_header_badge(stdout, badge_x, 1, Color::Green, &format!("agent {}", self.active_agent))?;
-        badge_x = draw_header_badge(stdout, badge_x, 1, Color::Yellow, &format!("appr {}", self.pending_approvals))?;
-        badge_x = draw_header_badge(stdout, badge_x, 1, Color::Cyan, &format!("runs {}", self.recent_runs))?;
+        badge_x = draw_header_badge(
+            stdout,
+            badge_x,
+            1,
+            Color::Green,
+            &format!("agent {}", self.active_agent),
+        )?;
+        badge_x = draw_header_badge(
+            stdout,
+            badge_x,
+            1,
+            Color::Yellow,
+            &format!("appr {}", self.pending_approvals),
+        )?;
+        badge_x = draw_header_badge(
+            stdout,
+            badge_x,
+            1,
+            Color::Cyan,
+            &format!("runs {}", self.recent_runs),
+        )?;
         if !self.notifications.is_empty() && badge_x < ws_x.saturating_sub(10) {
-            badge_x = draw_header_badge(stdout, badge_x, 1, Color::Magenta, &format!("notes {}", self.notifications.len()))?;
+            badge_x = draw_header_badge(
+                stdout,
+                badge_x,
+                1,
+                Color::Magenta,
+                &format!("notes {}", self.notifications.len()),
+            )?;
         }
         if self.last_error.is_some() && badge_x < ws_x.saturating_sub(8) {
             let _ = draw_header_badge(stdout, badge_x, 1, Color::Red, "error")?;
         }
         write_at(stdout, ws_x, 1, Color::DarkCyan, &ws_label)?;
         if ws_x > 8 {
-            write_at(stdout, ws_x.saturating_sub(scroll_hint.len() as u16 + 2), 1, Color::Yellow, scroll_hint)?;
+            write_at(
+                stdout,
+                ws_x.saturating_sub(scroll_hint.len() as u16 + 2),
+                1,
+                Color::Yellow,
+                scroll_hint,
+            )?;
         }
 
         self.draw_sidebar_tabs(stdout, &layout)?;
 
         let mut transcript_lines = Vec::new();
         for line in &self.lines {
-            for wrapped in transcript_display_lines(line.role, &line.text, chat_w.saturating_sub(4) as usize) {
+            for wrapped in
+                transcript_display_lines(line.role, &line.text, chat_w.saturating_sub(4) as usize)
+            {
                 transcript_lines.push(wrapped);
             }
         }
@@ -705,11 +847,16 @@ impl TuiState {
             self.draw_approval_overlay(stdout, cols, rows)?;
         }
         let cursor_input = truncate_from_end(&self.input, cols.saturating_sub(6) as usize);
-        queue!(stdout, MoveTo((2 + cursor_input.len()) as u16, header_h + chat_h + 2))
-            .map_err(|e| e.to_string())?;
+        queue!(
+            stdout,
+            MoveTo((2 + cursor_input.len()) as u16, header_h + chat_h + 2)
+        )
+        .map_err(|e| e.to_string())?;
         // Render updates layout for mouse interaction after all coordinates are known.
         self.last_layout = Some(layout);
-        stdout.flush().map_err(|e| format!("flush TUI failed: {}", e))
+        stdout
+            .flush()
+            .map_err(|e| format!("flush TUI failed: {}", e))
     }
 
     fn draw_sidebar_tabs(
@@ -804,8 +951,16 @@ impl TuiState {
                     lines.push("no agent list loaded".into());
                 } else {
                     for (idx, agent) in self.available_agents.iter().enumerate() {
-                        let marker = if idx == self.selected_agent_idx { ">" } else { " " };
-                        let current = if agent == &self.active_agent { " *" } else { "" };
+                        let marker = if idx == self.selected_agent_idx {
+                            ">"
+                        } else {
+                            " "
+                        };
+                        let current = if agent == &self.active_agent {
+                            " *"
+                        } else {
+                            ""
+                        };
                         lines.push(format!("{} {}{}", marker, agent, current));
                     }
                 }
@@ -827,11 +982,12 @@ impl TuiState {
                     lines.push("no pending approvals".into());
                 } else {
                     for (idx, item) in self.approval_items.iter().enumerate() {
-                        let marker = if idx == self.selected_approval_idx { ">" } else { " " };
-                        lines.push(format!(
-                            "{} {} [{}]",
-                            marker, item.summary, item.handle
-                        ));
+                        let marker = if idx == self.selected_approval_idx {
+                            ">"
+                        } else {
+                            " "
+                        };
+                        lines.push(format!("{} {} [{}]", marker, item.summary, item.handle));
                     }
                     if let Some(selected) = self.selected_approval() {
                         lines.push(String::new());
@@ -858,14 +1014,22 @@ impl TuiState {
                 lines.join("\n")
             }
             SidebarTab::Session => {
-                let transcript_state = if self.scroll == 0 { "live tail" } else { "manual scroll" };
+                let transcript_state = if self.scroll == 0 {
+                    "live tail"
+                } else {
+                    "manual scroll"
+                };
                 let mut lines = vec![
                     "tab session".into(),
                     format!(
                         "config {}",
                         truncate_with_ellipsis(
                             &self.config_path,
-                            if self.last_layout.is_some_and(|layout| layout.compact_mode) { 18 } else { 28 }
+                            if self.last_layout.is_some_and(|layout| layout.compact_mode) {
+                                18
+                            } else {
+                                28
+                            }
                         )
                     ),
                     format!("ws 127.0.0.1:{}", self.websocket_port),
@@ -1375,7 +1539,10 @@ fn transcript_display_lines(role: &str, text: &str, width: usize) -> Vec<Display
         let source = if trimmed.is_empty() { " " } else { trimmed };
         let marker = transcript_marker(trimmed);
         let content_width = width.saturating_sub(prefix.len() + 2 + marker.len());
-        for (index, wrapped) in wrap_text(source, width.saturating_sub(prefix.len() + 2)).into_iter().enumerate() {
+        for (index, wrapped) in wrap_text(source, width.saturating_sub(prefix.len() + 2))
+            .into_iter()
+            .enumerate()
+        {
             let line = if marker.is_empty() || index > 0 {
                 wrapped
             } else {
@@ -1710,6 +1877,58 @@ mod tests {
     }
 
     #[test]
+    fn parse_startup_mode_treats_admin_commands_as_runtime_commands() {
+        for command in [
+            "doctor",
+            "inspect",
+            "explain",
+            "--inspect-context",
+            "--inspect-provider-payloads",
+            "--explain-context",
+            "--explain-provider-payloads",
+        ] {
+            let args = vec!["aria-x".into(), command.into(), "context".into()];
+            let mode = parse_startup_mode(&args, Some("aria-x/config.toml".into()));
+            assert_eq!(
+                mode,
+                StartupMode::Runtime {
+                    config_path: "aria-x/config.toml".into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn parse_startup_mode_treats_help_and_install_as_runtime_commands() {
+        for command in ["help", "install", "completion", "--help"] {
+            let args = vec!["aria-x".into(), command.into()];
+            let mode = parse_startup_mode(&args, Some("aria-x/config.toml".into()));
+            assert_eq!(
+                mode,
+                StartupMode::Runtime {
+                    config_path: "aria-x/config.toml".into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn parse_startup_mode_supports_run_subcommand() {
+        let args = vec![
+            "aria-x".into(),
+            "run".into(),
+            "nodes/orchestrator.toml".into(),
+        ];
+        let mode = parse_startup_mode(&args, Some("aria-x/config.toml".into()));
+        assert_eq!(
+            mode,
+            StartupMode::Runtime {
+                config_path: "nodes/orchestrator.toml".into()
+            }
+        );
+    }
+
+    #[test]
     fn handle_event_blocks_freeform_input_until_bootstrap_completes() {
         let mut state = TuiState::new(
             "config.toml".into(),
@@ -1718,7 +1937,10 @@ mod tests {
             std::path::PathBuf::from("runtime.log"),
         );
         state.input = "reply only OK".into();
-        let action = state.handle_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        let action = state.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
         assert!(action.is_none());
         assert!(state
             .lines
@@ -1747,11 +1969,17 @@ mod tests {
         state.ingest_runtime_signal("Session override set to agent: researcher.");
         state.ingest_runtime_signal("Stored pending approval 'abc' (handle: `apv-x`).");
         state.ingest_runtime_signal("Found 3 runs for current session.");
-        state.ingest_runtime_signal("Approved 'browser_act', but execution failed: tool error: browser session is paused");
+        state.ingest_runtime_signal(
+            "Approved 'browser_act', but execution failed: tool error: browser session is paused",
+        );
         assert_eq!(state.active_agent, "researcher");
         assert_eq!(state.pending_approvals, 0);
         assert_eq!(state.recent_runs, 3);
-        assert!(state.last_error.as_deref().unwrap_or_default().contains("Approved 'browser_act'"));
+        assert!(state
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Approved 'browser_act'"));
         assert!(!state.notifications.is_empty());
     }
 
@@ -1761,7 +1989,10 @@ mod tests {
             extract_prefixed_count("Found 12 runs for current session.", "Found ", " runs"),
             Some(12)
         );
-        assert_eq!(extract_prefixed_count("Nothing here", "Found ", " runs"), None);
+        assert_eq!(
+            extract_prefixed_count("Nothing here", "Found ", " runs"),
+            None
+        );
     }
 
     #[test]
@@ -1802,7 +2033,9 @@ mod tests {
             40,
         );
         assert!(lines.iter().any(|line| line.text.contains("┌ code")));
-        assert!(lines.iter().any(|line| line.text.contains("│ fn main() {}")));
+        assert!(lines
+            .iter()
+            .any(|line| line.text.contains("│ fn main() {}")));
         assert!(lines.iter().any(|line| line.text.contains("└ code")));
     }
 
@@ -1825,9 +2058,15 @@ mod tests {
             "Executed browser action 'Click' for session 'browser-session-123' on profile 'work-default' with a very long explanation that should wrap across multiple lines cleanly.",
             60,
         );
-        assert!(lines.first().is_some_and(|line| line.text.contains("┌ tool")));
-        assert!(lines.iter().any(|line| line.text.contains("│ Executed browser action")));
-        assert!(lines.last().is_some_and(|line| line.text.contains("└ tool")));
+        assert!(lines
+            .first()
+            .is_some_and(|line| line.text.contains("┌ tool")));
+        assert!(lines
+            .iter()
+            .any(|line| line.text.contains("│ Executed browser action")));
+        assert!(lines
+            .last()
+            .is_some_and(|line| line.text.contains("└ tool")));
     }
 
     #[test]
@@ -1917,7 +2156,9 @@ mod tests {
         let toggle = Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
         assert!(state.handle_event(toggle.clone()).is_none());
         assert!(state.show_approval_detail);
-        assert!(state.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))).is_none());
+        assert!(state
+            .handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .is_none());
         assert!(!state.show_approval_detail);
     }
 }

@@ -1,11 +1,14 @@
 use super::{
-    adapter_for_family, build_openai_compatible_followup_body, collect_sse_like_stream,
-    default_model_capability_profile, LLMBackend, ModelMetadata, ModelProvider, SecretRef,
+    adapter_for_family, build_openai_compatible_context_body,
+    build_openai_compatible_followup_body, collect_sse_like_stream,
+    default_model_capability_profile, send_with_response_start_timeout, EgressCredentialBroker,
+    LLMBackend, ModelMetadata, ModelProvider, ProviderHealthIdentity, SecretRef,
 };
 use crate::{CachedTool, ExecutedToolCall, LLMResponse, OrchestratorError, ToolCall};
 use aria_core::{
-    AdapterFamily, CapabilitySourceKind, CapabilitySupport, ModelCapabilityProbeRecord,
-    ModelCapabilityProfile, ModelRef, ToolCallingMode, ToolRuntimePolicy,
+    AdapterFamily, CapabilitySourceKind, CapabilitySupport, ExecutionContextPack,
+    ModelCapabilityProbeRecord, ModelCapabilityProfile, ModelRef, ToolCallingMode,
+    ToolRuntimePolicy,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -18,6 +21,7 @@ pub struct OpenAiBackend {
     pub base_url: String,
     capability_profile: ModelCapabilityProfile,
     client: reqwest::Client,
+    egress_broker: EgressCredentialBroker,
 }
 
 impl OpenAiBackend {
@@ -37,6 +41,7 @@ impl OpenAiBackend {
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_default(),
+            egress_broker: EgressCredentialBroker::new(),
         }
     }
 
@@ -54,7 +59,13 @@ impl OpenAiBackend {
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_default(),
+            egress_broker: EgressCredentialBroker::new(),
         }
+    }
+
+    pub fn with_egress_broker(mut self, broker: EgressCredentialBroker) -> Self {
+        self.egress_broker = broker;
+        self
     }
 
     fn translated_tool_definitions(&self, tools: &[CachedTool]) -> Vec<Value> {
@@ -102,7 +113,11 @@ impl LLMBackend for OpenAiBackend {
         tools: &[CachedTool],
         policy: &ToolRuntimePolicy,
     ) -> Result<LLMResponse, OrchestratorError> {
-        let api_key = self.api_key.resolve("api.openai.com")?;
+        let api_key = self.api_key.resolve_with_broker(
+            "api.openai.com",
+            "openai_provider",
+            &self.egress_broker,
+        )?;
         let url = format!("{}/chat/completions", self.base_url);
         let adapter = adapter_for_family(self.capability_profile.adapter_family);
         let filtered_tools = adapter.filter_tools(&self.capability_profile, tools);
@@ -129,14 +144,15 @@ impl LLMBackend for OpenAiBackend {
             super::apply_openai_compatible_tool_policy(&mut body, &tool_defs, policy);
         }
 
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::LLMError(format!("OpenAI request failed: {}", e)))?;
+        let resp = send_with_response_start_timeout(
+            "OpenAI",
+            self.client
+                .post(&url)
+                .bearer_auth(api_key)
+                .json(&body)
+                .send(),
+        )
+        .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -183,13 +199,103 @@ impl LLMBackend for OpenAiBackend {
         ))
     }
 
+    async fn query_context_with_policy(
+        &self,
+        context: &ExecutionContextPack,
+        tools: &[CachedTool],
+        policy: &ToolRuntimePolicy,
+    ) -> Result<LLMResponse, OrchestratorError> {
+        let api_key = self.api_key.resolve_with_broker(
+            "api.openai.com",
+            "openai_provider",
+            &self.egress_broker,
+        )?;
+        let url = format!("{}/chat/completions", self.base_url);
+        let adapter = adapter_for_family(self.capability_profile.adapter_family);
+        let filtered_tools = adapter.filter_tools(&self.capability_profile, tools);
+        let tool_mode = adapter.tool_calling_mode(&self.capability_profile);
+        let tool_defs = filtered_tools
+            .iter()
+            .filter_map(|tool| {
+                adapter
+                    .translate_tool_definition(&self.capability_profile, tool)
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+        let body = super::build_openai_compatible_context_body(
+            &self.model,
+            context,
+            if matches!(
+                tool_mode,
+                ToolCallingMode::NativeTools | ToolCallingMode::CompatTools
+            ) {
+                tool_defs
+            } else {
+                Vec::new()
+            },
+            policy,
+        );
+        let resp = send_with_response_start_timeout(
+            "OpenAI",
+            self.client
+                .post(&url)
+                .bearer_auth(api_key)
+                .json(&body)
+                .send(),
+        )
+        .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(OrchestratorError::LLMError(format!(
+                "OpenAI returned {}: {}",
+                status, text
+            )));
+        }
+        let res_json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| OrchestratorError::LLMError(format!("OpenAI JSON parse failed: {}", e)))?;
+        if let Some(tool_calls) = res_json["choices"][0]["message"]["tool_calls"].as_array() {
+            let normalized = tool_calls
+                .iter()
+                .filter_map(|call| {
+                    let name = call["function"]["name"].as_str()?.to_string();
+                    let arguments = if call["function"]["arguments"].is_string() {
+                        call["function"]["arguments"].as_str()?.to_string()
+                    } else {
+                        call["function"]["arguments"].to_string()
+                    };
+                    Some(ToolCall {
+                        invocation_id: call["id"].as_str().map(|v| v.to_string()),
+                        name,
+                        arguments,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !normalized.is_empty() {
+                return Ok(LLMResponse::ToolCalls(normalized));
+            }
+        }
+        if let Some(content) = res_json["choices"][0]["message"]["content"].as_str() {
+            return Ok(LLMResponse::TextAnswer(content.to_string()));
+        }
+        Err(OrchestratorError::LLMError(
+            "OpenAI returned no content".into(),
+        ))
+    }
+
     async fn query_stream_with_policy(
         &self,
         prompt: &str,
         tools: &[CachedTool],
         policy: &ToolRuntimePolicy,
     ) -> Result<LLMResponse, OrchestratorError> {
-        let api_key = self.api_key.resolve("api.openai.com")?;
+        let api_key = self.api_key.resolve_with_broker(
+            "api.openai.com",
+            "openai_provider",
+            &self.egress_broker,
+        )?;
         let url = format!("{}/chat/completions", self.base_url);
         let adapter = adapter_for_family(self.capability_profile.adapter_family);
         let filtered_tools = adapter.filter_tools(&self.capability_profile, tools);
@@ -214,16 +320,15 @@ impl LLMBackend for OpenAiBackend {
         {
             super::apply_openai_compatible_tool_policy(&mut body, &tool_defs, policy);
         }
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                OrchestratorError::LLMError(format!("OpenAI streaming request failed: {}", e))
-            })?;
+        let resp = send_with_response_start_timeout(
+            "OpenAI streaming",
+            self.client
+                .post(&url)
+                .bearer_auth(api_key)
+                .json(&body)
+                .send(),
+        )
+        .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -257,7 +362,11 @@ impl LLMBackend for OpenAiBackend {
         executed_tools: &[ExecutedToolCall],
         policy: &ToolRuntimePolicy,
     ) -> Result<LLMResponse, OrchestratorError> {
-        let api_key = self.api_key.resolve("api.openai.com")?;
+        let api_key = self.api_key.resolve_with_broker(
+            "api.openai.com",
+            "openai_provider",
+            &self.egress_broker,
+        )?;
         let url = format!("{}/chat/completions", self.base_url);
         let adapter = adapter_for_family(self.capability_profile.adapter_family);
         let tool_defs = self.translated_tool_definitions(tools);
@@ -274,14 +383,15 @@ impl LLMBackend for OpenAiBackend {
         } else {
             super::apply_openai_compatible_tool_policy(&mut body, &tool_defs, policy);
         }
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::LLMError(format!("OpenAI request failed: {}", e)))?;
+        let resp = send_with_response_start_timeout(
+            "OpenAI",
+            self.client
+                .post(&url)
+                .bearer_auth(api_key)
+                .json(&body)
+                .send(),
+        )
+        .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -328,7 +438,11 @@ impl LLMBackend for OpenAiBackend {
         executed_tools: &[ExecutedToolCall],
         policy: &ToolRuntimePolicy,
     ) -> Result<LLMResponse, OrchestratorError> {
-        let api_key = self.api_key.resolve("api.openai.com")?;
+        let api_key = self.api_key.resolve_with_broker(
+            "api.openai.com",
+            "openai_provider",
+            &self.egress_broker,
+        )?;
         let url = format!("{}/chat/completions", self.base_url);
         let adapter = adapter_for_family(self.capability_profile.adapter_family);
         let tool_defs = self.translated_tool_definitions(tools);
@@ -346,16 +460,15 @@ impl LLMBackend for OpenAiBackend {
         } else {
             super::apply_openai_compatible_tool_policy(&mut body, &tool_defs, policy);
         }
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                OrchestratorError::LLMError(format!("OpenAI streaming request failed: {}", e))
-            })?;
+        let resp = send_with_response_start_timeout(
+            "OpenAI streaming",
+            self.client
+                .post(&url)
+                .bearer_auth(api_key)
+                .json(&body)
+                .send(),
+        )
+        .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -367,12 +480,34 @@ impl LLMBackend for OpenAiBackend {
         collect_sse_like_stream(resp, adapter).await
     }
 
+    fn inspect_context_payload(
+        &self,
+        context: &ExecutionContextPack,
+        tools: &[CachedTool],
+        policy: &ToolRuntimePolicy,
+    ) -> Option<serde_json::Value> {
+        let tool_defs = self.translated_tool_definitions(tools);
+        Some(build_openai_compatible_context_body(
+            &self.model,
+            context,
+            tool_defs,
+            policy,
+        ))
+    }
+
     fn model_ref(&self) -> Option<ModelRef> {
         Some(self.capability_profile.model_ref.clone())
     }
 
     fn capability_profile(&self) -> Option<ModelCapabilityProfile> {
         Some(self.capability_profile.clone())
+    }
+
+    fn provider_health_identity(&self) -> ProviderHealthIdentity {
+        ProviderHealthIdentity {
+            provider_family: self.capability_profile.model_ref.provider_id.clone(),
+            upstream_identity: self.base_url.clone(),
+        }
     }
 }
 
@@ -404,7 +539,6 @@ mod tests {
             modalities: vec![aria_core::ToolModality::Text],
         }
     }
-
     fn executed_tool() -> ExecutedToolCall {
         ExecutedToolCall {
             call: ToolCall {
@@ -417,6 +551,27 @@ mod tests {
                 "write_file",
                 json!({"ok": true, "bytes": 5}),
             ),
+        }
+    }
+
+    fn context_pack() -> ExecutionContextPack {
+        ExecutionContextPack {
+            system_prompt: String::from("system guidance"),
+            history_messages: vec![aria_core::PromptContextMessage {
+                role: String::from("user"),
+                content: String::from("hello"),
+                timestamp_us: 1,
+            }],
+            context_blocks: vec![aria_core::ContextBlock {
+                kind: aria_core::ContextBlockKind::Retrieval,
+                label: String::from("retrieval"),
+                content: String::from("source text"),
+                token_estimate: 3,
+            }],
+            user_request: String::from("save this"),
+            channel: aria_core::GatewayChannel::Cli,
+            execution_contract: None,
+            retrieved_context: None,
         }
     }
 
@@ -461,11 +616,24 @@ mod tests {
         assert_eq!(body["tool_choice"]["function"]["name"], json!("write_file"));
         assert_eq!(body["parallel_tool_calls"], json!(false));
     }
+
+    #[test]
+    fn openai_inspect_context_payload_includes_messages_and_tools() {
+        let backend = backend();
+        let payload = backend
+            .inspect_context_payload(&context_pack(), &[tool()], &ToolRuntimePolicy::default())
+            .expect("payload");
+
+        assert_eq!(payload["model"], json!("gpt-4o-mini"));
+        assert!(payload["messages"].is_array());
+        assert_eq!(payload["tools"][0]["function"]["name"], json!("write_file"));
+    }
 }
 
 pub struct OpenAiProvider {
     pub api_key: SecretRef,
     pub base_url: String,
+    pub egress_broker: Option<EgressCredentialBroker>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -507,7 +675,13 @@ impl ModelProvider for OpenAiProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelMetadata>, OrchestratorError> {
-        let api_key = self.api_key.resolve("api.openai.com")?;
+        let broker = self
+            .egress_broker
+            .clone()
+            .unwrap_or_else(EgressCredentialBroker::new);
+        let api_key =
+            self.api_key
+                .resolve_with_broker("api.openai.com", "openai_provider", &broker)?;
         let url = format!("{}/models", self.base_url.trim_end_matches('/'));
         let resp = reqwest::Client::new()
             .get(&url)
@@ -541,22 +715,32 @@ impl ModelProvider for OpenAiProvider {
     }
 
     fn create_backend(&self, model_id: &str) -> Result<Box<dyn LLMBackend>, OrchestratorError> {
-        Ok(Box::new(OpenAiBackend::new(
-            self.api_key.clone(),
-            model_id,
-            self.base_url.clone(),
-        )))
+        Ok(Box::new(
+            OpenAiBackend::new(self.api_key.clone(), model_id, self.base_url.clone())
+                .with_egress_broker(
+                    self.egress_broker
+                        .clone()
+                        .unwrap_or_else(EgressCredentialBroker::new),
+                ),
+        ))
     }
 
     fn create_backend_with_profile(
         &self,
         profile: &ModelCapabilityProfile,
     ) -> Result<Box<dyn LLMBackend>, OrchestratorError> {
-        Ok(Box::new(OpenAiBackend::with_capability_profile(
-            self.api_key.clone(),
-            profile.clone(),
-            self.base_url.clone(),
-        )))
+        Ok(Box::new(
+            OpenAiBackend::with_capability_profile(
+                self.api_key.clone(),
+                profile.clone(),
+                self.base_url.clone(),
+            )
+            .with_egress_broker(
+                self.egress_broker
+                    .clone()
+                    .unwrap_or_else(EgressCredentialBroker::new),
+            ),
+        ))
     }
 
     async fn probe_model_capabilities(

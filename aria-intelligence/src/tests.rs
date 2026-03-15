@@ -149,7 +149,10 @@ mod tests {
         let tools = vec![make_tool("web_fetch")];
         let json = "```json\n{\n  \"tool\": \"web_fetch\",\n  \"args\": {\n    \"url\": \"https://example.com\"\n  }\n}\n```";
         let result = repair_tool_call_json(json, &tools);
-        assert!(result.is_some(), "expected fenced json tool payload to be repaired");
+        assert!(
+            result.is_some(),
+            "expected fenced json tool payload to be repaired"
+        );
         let call = result.expect("repaired call");
         assert_eq!(call.name, "web_fetch");
         assert!(call.arguments.contains("https://example.com"));
@@ -1767,7 +1770,7 @@ trust_profile = "untrusted_web"
 
         assert!(prompt.contains("Prompt Mode: Execution"));
         assert!(prompt.contains("--- Available Tools ---"));
-        assert!(prompt.contains("RAG Context:\nworkspace context"));
+        assert!(prompt.contains("RAG Context [RAG Context]:\nworkspace context"));
         assert!(prompt.contains("Session History:\nassistant: previous answer"));
         assert!(prompt.contains("build a cli app"));
     }
@@ -1815,11 +1818,233 @@ trust_profile = "untrusted_web"
     }
 
     #[test]
+    fn prompt_manager_omits_textual_tool_schemas_for_native_tool_models() {
+        let request = AgentRequest {
+            request_id: [7; 16],
+            session_id: [8; 16],
+            channel: aria_core::GatewayChannel::Cli,
+            user_id: "u1".to_string(),
+            content: MessageContent::Text("use a tool".to_string()),
+            tool_runtime_policy: None,
+            timestamp_us: 42,
+        };
+        let arena = PromptArena::new();
+        let profile = aria_core::ModelCapabilityProfile {
+            model_ref: aria_core::ModelRef::new("openrouter", "openai/gpt-4o-mini"),
+            adapter_family: aria_core::AdapterFamily::OpenAiCompatible,
+            tool_calling: aria_core::CapabilitySupport::Supported,
+            parallel_tool_calling: aria_core::CapabilitySupport::Supported,
+            streaming: aria_core::CapabilitySupport::Supported,
+            vision: aria_core::CapabilitySupport::Unsupported,
+            json_mode: aria_core::CapabilitySupport::Supported,
+            max_context_tokens: None,
+            tool_schema_mode: aria_core::ToolSchemaMode::StrictJsonSchema,
+            tool_result_mode: aria_core::ToolResultMode::NativeStructured,
+            supports_images: aria_core::CapabilitySupport::Unsupported,
+            supports_audio: aria_core::CapabilitySupport::Unsupported,
+            source: aria_core::CapabilitySourceKind::RuntimeProbe,
+            source_detail: Some("test".into()),
+            observed_at_us: 1,
+            expires_at_us: None,
+        };
+        let pack = PromptManager::build_execution_context_pack(
+            &arena,
+            "You are a developer.",
+            &request,
+            &[],
+            Vec::new(),
+            &[make_tool("read_file")],
+            Some(&profile),
+            None,
+        );
+        let rendered = PromptManager::render_execution_context_pack(&pack);
+        assert!(!rendered.contains("--- Available Tools ---"));
+    }
+
+    #[test]
+    fn prompt_manager_inlines_textual_tool_schemas_for_repair_mode_even_when_native_schema_support_is_unavailable(
+    ) {
+        let request = AgentRequest {
+            request_id: [7; 16],
+            session_id: [8; 16],
+            channel: aria_core::GatewayChannel::Cli,
+            user_id: "u1".to_string(),
+            content: MessageContent::Text("use a tool".to_string()),
+            tool_runtime_policy: None,
+            timestamp_us: 42,
+        };
+        let arena = PromptArena::new();
+        let profile = aria_core::ModelCapabilityProfile {
+            model_ref: aria_core::ModelRef::new("openrouter", "repair-text-only"),
+            adapter_family: aria_core::AdapterFamily::OpenAiCompatible,
+            tool_calling: aria_core::CapabilitySupport::Unknown,
+            parallel_tool_calling: aria_core::CapabilitySupport::Unknown,
+            streaming: aria_core::CapabilitySupport::Supported,
+            vision: aria_core::CapabilitySupport::Unsupported,
+            json_mode: aria_core::CapabilitySupport::Supported,
+            max_context_tokens: None,
+            tool_schema_mode: aria_core::ToolSchemaMode::Unsupported,
+            tool_result_mode: aria_core::ToolResultMode::TextBlock,
+            supports_images: aria_core::CapabilitySupport::Unsupported,
+            supports_audio: aria_core::CapabilitySupport::Unsupported,
+            source: aria_core::CapabilitySourceKind::RuntimeProbe,
+            source_detail: Some("test".into()),
+            observed_at_us: 1,
+            expires_at_us: None,
+        };
+        let pack = PromptManager::build_execution_context_pack(
+            &arena,
+            "You are a developer.",
+            &request,
+            &[],
+            Vec::new(),
+            &[make_tool("search_web")],
+            Some(&profile),
+            Some(aria_core::ToolCallingMode::TextFallbackWithRepair),
+        );
+        let rendered = PromptManager::render_execution_context_pack(&pack);
+        assert!(rendered.contains("--- Available Tools ---"));
+        assert!(rendered.contains("search_web"));
+    }
+
+    #[test]
+    fn openai_initial_messages_preserve_structure() {
+        let pack = aria_core::ExecutionContextPack {
+            system_prompt: "system".into(),
+            history_messages: vec![aria_core::PromptContextMessage {
+                role: "assistant".into(),
+                content: "prior answer".into(),
+                timestamp_us: 1,
+            }],
+            context_blocks: vec![aria_core::ContextBlock {
+                kind: aria_core::ContextBlockKind::Retrieval,
+                label: "retrieval".into(),
+                content: "retrieved evidence".into(),
+                token_estimate: 3,
+            }],
+            user_request: "current question".into(),
+            channel: aria_core::GatewayChannel::Cli,
+            execution_contract: None,
+            retrieved_context: None,
+        };
+        let messages = crate::backends::build_openai_compatible_initial_messages(&pack);
+        assert_eq!(messages[0]["role"], serde_json::json!("system"));
+        assert_eq!(messages[1]["role"], serde_json::json!("assistant"));
+        assert!(messages[2]["content"]
+            .as_str()
+            .expect("context message")
+            .contains("retrieved evidence"));
+        assert_eq!(
+            messages[3]["content"],
+            serde_json::json!("current question")
+        );
+    }
+
+    #[test]
+    fn anthropic_initial_messages_preserve_structure() {
+        let pack = aria_core::ExecutionContextPack {
+            system_prompt: "system".into(),
+            history_messages: vec![aria_core::PromptContextMessage {
+                role: "assistant".into(),
+                content: "prior answer".into(),
+                timestamp_us: 1,
+            }],
+            context_blocks: vec![aria_core::ContextBlock {
+                kind: aria_core::ContextBlockKind::Retrieval,
+                label: "retrieval".into(),
+                content: "retrieved evidence".into(),
+                token_estimate: 3,
+            }],
+            user_request: "current question".into(),
+            channel: aria_core::GatewayChannel::Cli,
+            execution_contract: None,
+            retrieved_context: None,
+        };
+        let messages = crate::backends::build_anthropic_initial_messages(&pack);
+        assert_eq!(messages[0]["role"], serde_json::json!("assistant"));
+        assert!(messages[1]["content"]
+            .as_str()
+            .expect("context message")
+            .contains("retrieved evidence"));
+        assert_eq!(
+            messages[2]["content"],
+            serde_json::json!("current question")
+        );
+    }
+
+    #[test]
+    fn gemini_initial_contents_preserve_structure() {
+        let pack = aria_core::ExecutionContextPack {
+            system_prompt: "system".into(),
+            history_messages: vec![aria_core::PromptContextMessage {
+                role: "assistant".into(),
+                content: "prior answer".into(),
+                timestamp_us: 1,
+            }],
+            context_blocks: vec![aria_core::ContextBlock {
+                kind: aria_core::ContextBlockKind::Retrieval,
+                label: "retrieval".into(),
+                content: "retrieved evidence".into(),
+                token_estimate: 3,
+            }],
+            user_request: "current question".into(),
+            channel: aria_core::GatewayChannel::Cli,
+            execution_contract: None,
+            retrieved_context: None,
+        };
+        let (system, contents) = crate::backends::build_gemini_initial_contents(&pack);
+        assert_eq!(
+            system.expect("system instruction")["parts"][0]["text"],
+            serde_json::json!("system")
+        );
+        assert_eq!(contents[0]["role"], serde_json::json!("model"));
+        assert!(contents[1]["parts"][0]["text"]
+            .as_str()
+            .expect("context")
+            .contains("retrieved evidence"));
+        assert_eq!(
+            contents[2]["parts"][0]["text"],
+            serde_json::json!("current question")
+        );
+    }
+
+    #[test]
+    fn ollama_inspect_context_payload_uses_structured_messages_without_tools() {
+        let pack = aria_core::ExecutionContextPack {
+            system_prompt: "system".into(),
+            history_messages: vec![aria_core::PromptContextMessage {
+                role: "assistant".into(),
+                content: "prior answer".into(),
+                timestamp_us: 1,
+            }],
+            context_blocks: vec![aria_core::ContextBlock {
+                kind: aria_core::ContextBlockKind::Retrieval,
+                label: "retrieval".into(),
+                content: "retrieved evidence".into(),
+                token_estimate: 3,
+            }],
+            user_request: "current question".into(),
+            channel: aria_core::GatewayChannel::Cli,
+            execution_contract: None,
+            retrieved_context: None,
+        };
+        let backend =
+            crate::backends::ollama::OllamaBackend::new("http://127.0.0.1:11434", "llama3");
+        let payload = backend
+            .inspect_context_payload(&pack, &[], &aria_core::ToolRuntimePolicy::default())
+            .expect("payload");
+        assert!(payload.get("messages").is_some());
+        assert!(payload.get("prompt").is_none());
+    }
+
+    #[test]
     fn tool_visibility_explains_hidden_reason_for_strict_schema_tool() {
         let tool = CachedTool {
             name: "strict_tool".into(),
             description: "Strict tool".into(),
-            parameters_schema: r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#.into(),
+            parameters_schema:
+                r#"{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}"#
+                    .into(),
             embedding: Vec::new(),
             requires_strict_schema: true,
             streaming_safe: false,
@@ -1856,7 +2081,9 @@ trust_profile = "untrusted_web"
         store.register(CachedTool {
             name: "strict_tool".into(),
             description: "Strict schema search".into(),
-            parameters_schema: r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#.into(),
+            parameters_schema:
+                r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}"#
+                    .into(),
             embedding: Vec::new(),
             requires_strict_schema: true,
             streaming_safe: false,
@@ -1894,6 +2121,29 @@ trust_profile = "untrusted_web"
     }
 
     #[test]
+    fn tool_provider_catalog_collects_native_entries() {
+        let mut store = ToolManifestStore::new();
+        store.register(CachedTool {
+            name: "read_file".into(),
+            description: "Read a file".into(),
+            parameters_schema: "{}".into(),
+            embedding: Vec::new(),
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
+        });
+        let mut catalog = crate::tools::ToolProviderCatalog::default();
+        catalog.add_native_store(&store);
+        assert_eq!(catalog.tools.len(), 1);
+        assert_eq!(catalog.tools[0].public_name, "read_file");
+        assert_eq!(
+            catalog.tools[0].provider_kind,
+            aria_core::ToolProviderKind::Native
+        );
+    }
+
+    #[test]
     fn tool_registry_startup_validation_rejects_invalid_schema() {
         let mut store = ToolManifestStore::new();
         store.register(CachedTool {
@@ -1910,6 +2160,39 @@ trust_profile = "untrusted_web"
             .validate_strict_startup_contract()
             .expect_err("invalid schema should fail");
         assert!(err.contains("broken"));
+    }
+
+    #[test]
+    fn tool_provider_catalog_aliases_external_name_collisions_after_native_entries() {
+        let native = make_tool("read_file");
+        let mut catalog = crate::tools::ToolProviderCatalog::default();
+        catalog.add_tool_entries(vec![native.catalog_entry()]);
+        catalog.add_tool_entries(vec![aria_core::ToolCatalogEntry {
+            tool_id: "tool.remote.read_file".into(),
+            public_name: "read_file".into(),
+            description: "Remote read".into(),
+            parameters_json_schema: "{}".into(),
+            execution_kind: aria_core::ToolExecutionKind::Native,
+            provider_kind: aria_core::ToolProviderKind::Remote,
+            runner_class: aria_core::ToolRunnerClass::Remote,
+            origin: aria_core::ToolOrigin {
+                provider_kind: aria_core::ToolProviderKind::Remote,
+                provider_id: "remote".into(),
+                origin_id: Some("read_file".into()),
+                display_name: None,
+            },
+            artifact_kind: None,
+            requires_approval: aria_core::ToolApprovalClass::None,
+            side_effect_level: aria_core::ToolSideEffectLevel::ReadOnly,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
+            capability_requirements: Vec::new(),
+        }]);
+        assert_eq!(catalog.tools.len(), 2);
+        assert_eq!(catalog.tools[0].public_name, "read_file");
+        assert_ne!(catalog.tools[1].public_name, "read_file");
+        assert!(catalog.tools[1].public_name.contains("remote"));
     }
 
     #[test]
@@ -2069,7 +2352,7 @@ trust_profile = "untrusted_web"
     }
 
     #[tokio::test]
-    async fn orchestrator_dynamic_registry_hot_swap_path() {
+    async fn orchestrator_dynamic_registry_search_is_discovery_only() {
         #[derive(Clone)]
         struct RegistryFlowLLM {
             calls: Arc<AtomicUsize>,
@@ -2079,7 +2362,7 @@ trust_profile = "untrusted_web"
             async fn query(
                 &self,
                 _prompt: &str,
-                tools: &[CachedTool],
+                _tools: &[CachedTool],
             ) -> Result<LLMResponse, OrchestratorError> {
                 let n = self.calls.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
@@ -2087,17 +2370,6 @@ trust_profile = "untrusted_web"
                         invocation_id: None,
                         name: "search_tool_registry".into(),
                         arguments: r#"{"query":"push branch to remote"}"#.into(),
-                    }]))
-                } else if n == 1 {
-                    let has_git_push = tools.iter().any(|t| t.name == "git_push");
-                    assert!(
-                        has_git_push,
-                        "git_push should be injected after registry search"
-                    );
-                    Ok(LLMResponse::ToolCalls(vec![ToolCall {
-                        invocation_id: None,
-                        name: "git_push".into(),
-                        arguments: "{}".into(),
                     }]))
                 } else {
                     Ok(LLMResponse::TextAnswer("done".into()))
@@ -2150,7 +2422,10 @@ trust_profile = "untrusted_web"
                 request: &request,
                 history_context: "history",
                 rag_context: "rag",
+                history_messages: &[],
+                context_blocks: &[],
                 prompt_tools: None,
+                tool_selection: None,
                 cache: &mut cache,
                 tool_registry: &registry,
                 embedder: &embedder,
@@ -2162,6 +2437,10 @@ trust_profile = "untrusted_web"
             .await
             .unwrap();
         assert_eq!(result, OrchestratorResult::Completed("done".to_string()));
+        assert!(!cache
+            .active_tools()
+            .iter()
+            .any(|tool| tool.name == "git_push"));
     }
 
     #[tokio::test]
@@ -2244,7 +2523,10 @@ trust_profile = "untrusted_web"
                 request: &request,
                 history_context: "",
                 rag_context: "",
+                history_messages: &[],
+                context_blocks: &[],
                 prompt_tools: None,
+                tool_selection: None,
                 cache: &mut cache,
                 tool_registry: &registry,
                 embedder: &embedder,
@@ -2261,6 +2543,153 @@ trust_profile = "untrusted_web"
             1,
             "scheduler tool should short-circuit without additional LLM rounds",
         );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_dynamic_repair_mode_enforces_tool_round_for_tool_obligated_requests() {
+        #[derive(Clone)]
+        struct RepairObligationLlm {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl LLMBackend for RepairObligationLlm {
+            async fn query(
+                &self,
+                _prompt: &str,
+                _tools: &[CachedTool],
+            ) -> Result<LLMResponse, OrchestratorError> {
+                unreachable!("dynamic request path uses context/policy methods")
+            }
+
+            async fn query_context_with_policy(
+                &self,
+                _context: &aria_core::ExecutionContextPack,
+                _tools: &[CachedTool],
+                _policy: &ToolRuntimePolicy,
+            ) -> Result<LLMResponse, OrchestratorError> {
+                assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+                Ok(LLMResponse::TextAnswer(
+                    "I'll fetch the latest news for you.".into(),
+                ))
+            }
+
+            async fn query_with_policy(
+                &self,
+                prompt: &str,
+                tools: &[CachedTool],
+                _policy: &ToolRuntimePolicy,
+            ) -> Result<LLMResponse, OrchestratorError> {
+                let call_index = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call_index == 1 {
+                    assert!(
+                        prompt.contains("A relevant tool path is available for this request"),
+                        "repair-mode interrupt should be injected into prompt override"
+                    );
+                    assert!(tools.iter().any(|tool| tool.name == "search_web"));
+                    Ok(LLMResponse::ToolCalls(vec![ToolCall {
+                        invocation_id: None,
+                        name: "search_web".into(),
+                        arguments: r#"{"query":"latest news"}"#.into(),
+                    }]))
+                } else {
+                    Ok(LLMResponse::TextAnswer("done".into()))
+                }
+            }
+
+            async fn query_with_tool_results_and_policy(
+                &self,
+                _prompt: &str,
+                _tools: &[CachedTool],
+                executed_tools: &[ExecutedToolCall],
+                _policy: &ToolRuntimePolicy,
+            ) -> Result<LLMResponse, OrchestratorError> {
+                assert_eq!(executed_tools.len(), 1);
+                assert_eq!(executed_tools[0].call.name, "search_web");
+                Ok(LLMResponse::TextAnswer("done".into()))
+            }
+        }
+
+        let llm = RepairObligationLlm {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let orchestrator = AgentOrchestrator::new(llm, MockToolExecutor).with_repair_fallback(true);
+        let request = AgentRequest {
+            request_id: [3; 16],
+            session_id: [4; 16],
+            channel: aria_core::GatewayChannel::Cli,
+            user_id: "u1".to_string(),
+            content: MessageContent::Text("latest news".to_string()),
+            tool_runtime_policy: None,
+            timestamp_us: 42,
+        };
+        let embedder = LocalHashEmbedder::new(64);
+        let search_tool = CachedTool {
+            name: "search_web".into(),
+            description: "Search the web for latest news and current headlines.".into(),
+            parameters_schema: "{}".into(),
+            embedding: embedder.embed("latest news headlines"),
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
+        };
+        let mut cache = DynamicToolCache::new(8, 15);
+        cache.insert(search_tool.clone()).unwrap();
+        let mut registry = ToolManifestStore::new();
+        registry.register(search_tool);
+        let capability = aria_core::ModelCapabilityProfile {
+            model_ref: aria_core::ModelRef::new("openrouter", "repair-text-only"),
+            adapter_family: aria_core::AdapterFamily::OpenAiCompatible,
+            tool_calling: aria_core::CapabilitySupport::Unknown,
+            parallel_tool_calling: aria_core::CapabilitySupport::Unknown,
+            streaming: aria_core::CapabilitySupport::Supported,
+            vision: aria_core::CapabilitySupport::Unsupported,
+            json_mode: aria_core::CapabilitySupport::Supported,
+            max_context_tokens: None,
+            tool_schema_mode: aria_core::ToolSchemaMode::Unsupported,
+            tool_result_mode: aria_core::ToolResultMode::TextBlock,
+            supports_images: aria_core::CapabilitySupport::Unsupported,
+            supports_audio: aria_core::CapabilitySupport::Unsupported,
+            source: aria_core::CapabilitySourceKind::RuntimeProbe,
+            source_detail: Some("test".into()),
+            observed_at_us: 1,
+            expires_at_us: None,
+        };
+
+        let result = orchestrator
+            .run_for_request_with_dynamic_tools(DynamicRunContext {
+                agent_system_prompt: "mock sys",
+                request: &request,
+                history_context: "",
+                rag_context: "",
+                history_messages: &[],
+                context_blocks: &[],
+                prompt_tools: None,
+                tool_selection: Some(&aria_core::ToolSelectionDecision {
+                    tool_choice: aria_core::ToolChoicePolicy::Auto,
+                    tool_calling_mode: aria_core::ToolCallingMode::TextFallbackWithRepair,
+                    text_fallback_mode: true,
+                    relevance_threshold_millis: Some(250),
+                    available_tool_names: vec!["search_web".into()],
+                    selected_tool_names: vec!["search_web".into()],
+                    candidate_scores: vec![aria_core::ToolSelectionScore {
+                        tool_name: "search_web".into(),
+                        score: 410,
+                        source: "active".into(),
+                    }],
+                }),
+                cache: &mut cache,
+                tool_registry: &registry,
+                embedder: &embedder,
+                max_tool_rounds: 5,
+                model_capability: Some(&capability),
+                steering_rx: None,
+                global_estop: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(result, OrchestratorResult::Completed("done".into()));
     }
 
     #[tokio::test]
@@ -2358,6 +2787,185 @@ trust_profile = "untrusted_web"
         assert!(pool.is_cooling_down("primary"));
     }
 
+    #[tokio::test]
+    async fn llm_backend_pool_skips_provider_siblings_when_circuit_opens() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct ProviderFailingLLM {
+            calls: Arc<Mutex<u32>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LLMBackend for ProviderFailingLLM {
+            async fn query(
+                &self,
+                _prompt: &str,
+                _tools: &[CachedTool],
+            ) -> Result<LLMResponse, OrchestratorError> {
+                *self.calls.lock().expect("calls lock") += 1;
+                Err(OrchestratorError::BackendOverloaded(
+                    "timed out waiting for first token".into(),
+                ))
+            }
+
+            fn provider_health_identity(&self) -> ProviderHealthIdentity {
+                ProviderHealthIdentity {
+                    provider_family: "openai-compatible".into(),
+                    upstream_identity: "https://shared.example/v1".into(),
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct ProviderSiblingLLM {
+            calls: Arc<Mutex<u32>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LLMBackend for ProviderSiblingLLM {
+            async fn query(
+                &self,
+                _prompt: &str,
+                _tools: &[CachedTool],
+            ) -> Result<LLMResponse, OrchestratorError> {
+                *self.calls.lock().expect("calls lock") += 1;
+                Ok(LLMResponse::TextAnswer("should have been skipped".into()))
+            }
+
+            fn provider_health_identity(&self) -> ProviderHealthIdentity {
+                ProviderHealthIdentity {
+                    provider_family: "openai-compatible".into(),
+                    upstream_identity: "https://shared.example/v1".into(),
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct OtherProviderLLM;
+
+        #[async_trait::async_trait]
+        impl LLMBackend for OtherProviderLLM {
+            async fn query(
+                &self,
+                _prompt: &str,
+                _tools: &[CachedTool],
+            ) -> Result<LLMResponse, OrchestratorError> {
+                Ok(LLMResponse::TextAnswer("ok".into()))
+            }
+
+            fn provider_health_identity(&self) -> ProviderHealthIdentity {
+                ProviderHealthIdentity {
+                    provider_family: "gemini".into(),
+                    upstream_identity: "https://generativelanguage.googleapis.com/v1beta".into(),
+                }
+            }
+        }
+
+        let failing_calls = Arc::new(Mutex::new(0));
+        let sibling_calls = Arc::new(Mutex::new(0));
+        let pool = LlmBackendPool::new(
+            vec!["primary".into(), "sibling".into(), "other".into()],
+            Duration::from_millis(10),
+        )
+        .with_provider_circuit_breaker(Duration::from_millis(50), 1);
+        pool.register_backend(
+            "primary",
+            Box::new(ProviderFailingLLM {
+                calls: Arc::clone(&failing_calls),
+            }),
+        );
+        pool.register_backend(
+            "sibling",
+            Box::new(ProviderSiblingLLM {
+                calls: Arc::clone(&sibling_calls),
+            }),
+        );
+        pool.register_backend("other", Box::new(OtherProviderLLM));
+
+        let result = pool.query_with_fallback("p", &[]).await.unwrap();
+        assert_eq!(result, LLMResponse::TextAnswer("ok".into()));
+        assert_eq!(*failing_calls.lock().expect("calls lock"), 1);
+        assert_eq!(*sibling_calls.lock().expect("calls lock"), 0);
+
+        let state = pool.provider_circuit_state();
+        assert_eq!(state.len(), 1);
+        assert!(state[0].circuit_open);
+        assert_eq!(state[0].provider_family, "openai-compatible");
+        assert_eq!(state[0].impacted_backends, vec!["primary", "sibling"]);
+    }
+
+    #[tokio::test]
+    async fn llm_backend_pool_does_not_open_provider_circuit_for_non_retryable_errors() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct NonRetryableFailingLLM;
+
+        #[async_trait::async_trait]
+        impl LLMBackend for NonRetryableFailingLLM {
+            async fn query(
+                &self,
+                _prompt: &str,
+                _tools: &[CachedTool],
+            ) -> Result<LLMResponse, OrchestratorError> {
+                Err(OrchestratorError::LLMError(
+                    "schema validation failed".into(),
+                ))
+            }
+
+            fn provider_health_identity(&self) -> ProviderHealthIdentity {
+                ProviderHealthIdentity {
+                    provider_family: "openai-compatible".into(),
+                    upstream_identity: "https://shared.example/v1".into(),
+                }
+            }
+        }
+
+        #[derive(Clone)]
+        struct SameProviderSuccessLLM {
+            calls: Arc<Mutex<u32>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LLMBackend for SameProviderSuccessLLM {
+            async fn query(
+                &self,
+                _prompt: &str,
+                _tools: &[CachedTool],
+            ) -> Result<LLMResponse, OrchestratorError> {
+                *self.calls.lock().expect("calls lock") += 1;
+                Ok(LLMResponse::TextAnswer("ok".into()))
+            }
+
+            fn provider_health_identity(&self) -> ProviderHealthIdentity {
+                ProviderHealthIdentity {
+                    provider_family: "openai-compatible".into(),
+                    upstream_identity: "https://shared.example/v1".into(),
+                }
+            }
+        }
+
+        let sibling_calls = Arc::new(Mutex::new(0));
+        let pool = LlmBackendPool::new(
+            vec!["primary".into(), "sibling".into()],
+            Duration::from_millis(10),
+        )
+        .with_provider_circuit_breaker(Duration::from_millis(50), 1);
+        pool.register_backend("primary", Box::new(NonRetryableFailingLLM));
+        pool.register_backend(
+            "sibling",
+            Box::new(SameProviderSuccessLLM {
+                calls: Arc::clone(&sibling_calls),
+            }),
+        );
+
+        let result = pool.query_with_fallback("p", &[]).await.unwrap();
+        assert_eq!(result, LLMResponse::TextAnswer("ok".into()));
+        assert_eq!(*sibling_calls.lock().expect("calls lock"), 1);
+        assert!(pool.provider_circuit_state().is_empty());
+    }
+
     #[test]
     fn filter_tools_for_model_capability_hides_tools_when_unsupported() {
         let tools = vec![make_tool("read_file"), make_tool("search_web")];
@@ -2443,6 +3051,34 @@ trust_profile = "untrusted_web"
         let no_repair =
             filter_tools_for_model_capability_with_repair(&tools, Some(&profile), false);
         assert!(no_repair.is_empty());
+
+        let with_repair =
+            filter_tools_for_model_capability_with_repair(&tools, Some(&profile), true);
+        assert_eq!(with_repair, tools);
+    }
+
+    #[test]
+    fn filter_tools_for_model_capability_with_repair_preserves_text_tools_when_schema_support_is_unsupported(
+    ) {
+        let tools = vec![make_tool("read_file"), make_tool("search_web")];
+        let profile = aria_core::ModelCapabilityProfile {
+            model_ref: aria_core::ModelRef::new("openrouter", "repair-text-only"),
+            adapter_family: aria_core::AdapterFamily::OpenAiCompatible,
+            tool_calling: aria_core::CapabilitySupport::Unknown,
+            parallel_tool_calling: aria_core::CapabilitySupport::Unknown,
+            streaming: aria_core::CapabilitySupport::Supported,
+            vision: aria_core::CapabilitySupport::Unknown,
+            json_mode: aria_core::CapabilitySupport::Supported,
+            max_context_tokens: None,
+            tool_schema_mode: aria_core::ToolSchemaMode::Unsupported,
+            tool_result_mode: aria_core::ToolResultMode::TextBlock,
+            supports_images: aria_core::CapabilitySupport::Unsupported,
+            supports_audio: aria_core::CapabilitySupport::Unsupported,
+            source: aria_core::CapabilitySourceKind::RuntimeProbe,
+            source_detail: Some("test".into()),
+            observed_at_us: 1,
+            expires_at_us: None,
+        };
 
         let with_repair =
             filter_tools_for_model_capability_with_repair(&tools, Some(&profile), true);
@@ -2547,9 +3183,20 @@ trust_profile = "untrusted_web"
                 &self,
                 _prompt: &str,
                 _tools: &[CachedTool],
+                _executed_tools: &[ExecutedToolCall],
+            ) -> Result<LLMResponse, OrchestratorError> {
+                panic!("prompt-based follow-up should not be used in structured context mode");
+            }
+
+            async fn query_context_with_tool_results_and_policy(
+                &self,
+                context: &aria_core::ExecutionContextPack,
+                _tools: &[CachedTool],
                 executed_tools: &[ExecutedToolCall],
+                _policy: &ToolRuntimePolicy,
             ) -> Result<LLMResponse, OrchestratorError> {
                 self.followup_calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(context.user_request, "read it");
                 assert_eq!(executed_tools.len(), 1);
                 assert_eq!(executed_tools[0].call.name, "read_file");
                 assert!(executed_tools[0].result.contains("contents"));
@@ -2588,12 +3235,24 @@ trust_profile = "untrusted_web"
         }];
         let mut rounds = 0usize;
         let mut prompt = String::from("read it");
+        let mut context_pack = aria_core::ExecutionContextPack {
+            system_prompt: String::new(),
+            history_messages: Vec::new(),
+            context_blocks: Vec::new(),
+            user_request: prompt.clone(),
+            channel: aria_core::GatewayChannel::Cli,
+            execution_contract: None,
+            retrieved_context: None,
+        };
+        let mut uses_prompt_override = false;
         let mut last_progress = Instant::now();
         let steering_rx = None;
         let mut progress = ToolLoopProgress {
             rounds: &mut rounds,
             max_tool_rounds: 3,
             prompt: &mut prompt,
+            context_pack: &mut context_pack,
+            uses_prompt_override: &mut uses_prompt_override,
             last_progress: &mut last_progress,
         };
         let runtime_policy = ToolRuntimePolicy::default();
@@ -3380,5 +4039,77 @@ trust_profile = "untrusted_web"
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn egress_broker_resolves_vault_secret_and_emits_audit() {
+        let temp = tempfile::tempdir().expect("vault tempdir");
+        let vault_path = temp.path().join("vault.json");
+        let vault = aria_vault::CredentialVault::new(&vault_path, [7u8; 32]);
+        vault
+            .store_secret(
+                "system",
+                "openai_key",
+                "sk-test",
+                vec!["api.openai.com".into()],
+            )
+            .expect("store secret");
+        let audits = Arc::new(Mutex::new(Vec::new()));
+        let broker = crate::backends::EgressCredentialBroker::new().with_audit_sink({
+            let audits = Arc::clone(&audits);
+            move |record| {
+                audits.lock().unwrap().push(record);
+            }
+        });
+        let value = crate::backends::SecretRef::Vault {
+            key_name: "openai_key".into(),
+            vault,
+        }
+        .resolve_with_broker("api.openai.com", "openai_provider", &broker)
+        .expect("resolve");
+        assert_eq!(value, "sk-test");
+        let audits = audits.lock().unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].scope, "openai_provider");
+        assert_eq!(audits[0].key_name, "openai_key");
+        assert_eq!(
+            audits[0].outcome,
+            crate::backends::EgressSecretOutcome::Allowed
+        );
+    }
+
+    #[test]
+    fn egress_broker_denies_unauthorized_domain_and_emits_denial_audit() {
+        let temp = tempfile::tempdir().expect("vault tempdir");
+        let vault_path = temp.path().join("vault.json");
+        let vault = aria_vault::CredentialVault::new(&vault_path, [9u8; 32]);
+        vault
+            .store_secret(
+                "system",
+                "openai_key",
+                "sk-test",
+                vec!["api.openai.com".into()],
+            )
+            .expect("store secret");
+        let audits = Arc::new(Mutex::new(Vec::new()));
+        let broker = crate::backends::EgressCredentialBroker::new().with_audit_sink({
+            let audits = Arc::clone(&audits);
+            move |record| {
+                audits.lock().unwrap().push(record);
+            }
+        });
+        let err = crate::backends::SecretRef::Vault {
+            key_name: "openai_key".into(),
+            vault,
+        }
+        .resolve_with_broker("api.evil.example", "openai_provider", &broker)
+        .expect_err("unauthorized domain must fail");
+        assert!(format!("{}", err).contains("Vault resolution failed"));
+        let audits = audits.lock().unwrap();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(
+            audits[0].outcome,
+            crate::backends::EgressSecretOutcome::Denied
+        );
     }
 }

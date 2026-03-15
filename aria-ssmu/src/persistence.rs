@@ -2,6 +2,9 @@ use crate::{Message, SessionState};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +81,7 @@ pub struct SqlitePersistence {
 
 impl SqlitePersistence {
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         let _ = conn.execute("PRAGMA journal_mode = WAL", []);
 
         conn.execute_batch(
@@ -110,6 +113,8 @@ impl SqlitePersistence {
                 FOREIGN KEY(session_id) REFERENCES sessions(id)
             );",
         )?;
+        migrate_legacy_session_schema(&conn, path)?;
+        migrate_legacy_session_history_sources(&mut conn, path)?;
 
         Ok(Self { conn })
     }
@@ -278,6 +283,215 @@ impl SqlitePersistence {
         }
         Ok(state.history.into_iter().collect())
     }
+}
+
+fn migrate_legacy_session_schema(conn: &Connection, _path: &Path) -> Result<()> {
+    if !table_has_column(conn, "sessions", "version")? {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !table_has_column(conn, "sessions", "durable_constraints")? {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN durable_constraints TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
+    if !table_has_column(conn, "sessions", "current_agent")? {
+        conn.execute("ALTER TABLE sessions ADD COLUMN current_agent TEXT", [])?;
+    }
+    if !table_has_column(conn, "sessions", "current_model")? {
+        conn.execute("ALTER TABLE sessions ADD COLUMN current_model TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn migrate_legacy_session_history_sources(conn: &mut Connection, db_path: &Path) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    if let Some(sessions_dir) = db_path.parent() {
+        import_jsonl_audits_without_events(&tx, sessions_dir)?;
+    }
+    import_legacy_messages_without_events(&tx)?;
+    tx.commit()
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn session_has_events(tx: &rusqlite::Transaction<'_>, session_id: Uuid) -> Result<bool> {
+    let count: i64 = tx.query_row(
+        "SELECT COUNT(1) FROM session_events WHERE session_id=?1",
+        params![session_id.to_string()],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn import_jsonl_audits_without_events(
+    tx: &rusqlite::Transaction<'_>,
+    sessions_dir: &Path,
+) -> Result<()> {
+    let entries = match fs::read_dir(sessions_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Ok(session_id) = Uuid::parse_str(stem) else {
+            continue;
+        };
+        if session_has_events(tx, session_id)? {
+            continue;
+        }
+        let messages = load_messages_from_jsonl(&path);
+        if messages.is_empty() {
+            continue;
+        }
+        import_snapshot_event(tx, session_id, messages)?;
+    }
+    Ok(())
+}
+
+fn import_legacy_messages_without_events(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let mut stmt = tx.prepare("SELECT id FROM sessions")?;
+    let session_ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    for raw_id in session_ids {
+        let Ok(session_id) = Uuid::parse_str(&raw_id) else {
+            continue;
+        };
+        if session_has_events(tx, session_id)? {
+            continue;
+        }
+        let messages = load_legacy_messages(tx, session_id)?;
+        if messages.is_empty() {
+            continue;
+        }
+        import_snapshot_event(tx, session_id, messages)?;
+    }
+    Ok(())
+}
+
+fn load_messages_from_jsonl(path: &Path) -> Vec<Message> {
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut messages = BufReader::new(file)
+        .lines()
+        .filter_map(|line| line.ok())
+        .filter_map(|line| serde_json::from_str::<Message>(&line).ok())
+        .collect::<Vec<_>>();
+    messages.sort_by_key(|message| message.timestamp_us);
+    messages
+}
+
+fn load_legacy_messages(tx: &rusqlite::Transaction<'_>, session_id: Uuid) -> Result<Vec<Message>> {
+    let mut stmt = tx.prepare(
+        "SELECT role, content, timestamp_us
+         FROM messages
+         WHERE session_id=?1
+         ORDER BY timestamp_us ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![session_id.to_string()], |row| {
+        Ok(Message {
+            role: row.get(0)?,
+            content: row.get(1)?,
+            timestamp_us: row.get::<_, i64>(2)? as u64,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+}
+
+fn import_snapshot_event(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: Uuid,
+    messages: Vec<Message>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO sessions (id, durable_constraints, version) VALUES (?1, '[]', 0)",
+        params![session_id.to_string()],
+    )?;
+    let row: (Option<String>, Option<String>, String, i64) = tx.query_row(
+        "SELECT current_agent, current_model, durable_constraints, version FROM sessions WHERE id=?1",
+        params![session_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    let expected_version = row.3 as u64;
+    let next_version = expected_version.saturating_add(1);
+    let snapshot = SessionEvent::SnapshotReplace {
+        state: PersistedSessionState {
+            history: messages,
+            durable_constraints: serde_json::from_str(&row.2).unwrap_or_default(),
+            current_agent: row.0.clone(),
+            current_model: row.1.clone(),
+        },
+    };
+    tx.execute(
+        "UPDATE sessions
+         SET current_agent=?2, current_model=?3, durable_constraints=?4, version=?5
+         WHERE id=?1",
+        params![
+            session_id.to_string(),
+            row.0,
+            row.1,
+            row.2,
+            next_version as i64
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO session_events
+         (session_id, expected_version, applied_version, kind, payload_json, created_at_us)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            session_id.to_string(),
+            expected_version as i64,
+            next_version as i64,
+            "snapshot_replace",
+            serde_json::to_string(&snapshot)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+            snapshot_timestamp_us(&snapshot) as i64
+        ],
+    )?;
+    Ok(())
+}
+
+fn snapshot_timestamp_us(event: &SessionEvent) -> u64 {
+    match event {
+        SessionEvent::SnapshotReplace { state } => state
+            .history
+            .last()
+            .map(|message| message.timestamp_us)
+            .unwrap_or_else(current_time_us),
+        _ => current_time_us(),
+    }
+}
+
+fn current_time_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_micros() as u64)
+        .unwrap_or(0)
 }
 
 fn replay_session_events_from_tx(

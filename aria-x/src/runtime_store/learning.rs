@@ -1,7 +1,72 @@
 use super::*;
+use crate::runtime_resource_budget;
+use std::path::PathBuf;
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::time::Duration;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeWriteDurability {
+    Critical,
+    Normal,
+    Deferred,
+}
+
+enum DeferredRuntimeWrite {
+    ExecutionTrace {
+        path: PathBuf,
+        trace: ExecutionTrace,
+    },
+    LearningDerivativeEvent {
+        path: PathBuf,
+        event: LearningDerivativeEvent,
+    },
+}
+
+fn deferred_runtime_writer() -> &'static Mutex<Option<mpsc::SyncSender<DeferredRuntimeWrite>>> {
+    static WRITER: OnceLock<Mutex<Option<mpsc::SyncSender<DeferredRuntimeWrite>>>> =
+        OnceLock::new();
+    WRITER.get_or_init(|| Mutex::new(None))
+}
+
+fn ensure_deferred_runtime_writer() -> Result<mpsc::SyncSender<DeferredRuntimeWrite>, String> {
+    let mut guard = deferred_runtime_writer()
+        .lock()
+        .map_err(|_| "lock deferred runtime writer failed".to_string())?;
+    if let Some(writer) = guard.as_ref() {
+        return Ok(writer.clone());
+    }
+    let (tx, rx) = mpsc::sync_channel::<DeferredRuntimeWrite>(256);
+    std::thread::Builder::new()
+        .name("aria-runtime-store-deferred".into())
+        .spawn(move || {
+            while let Ok(item) = rx.recv() {
+                match item {
+                    DeferredRuntimeWrite::ExecutionTrace { path, trace } => {
+                        let _ = RuntimeStore { path }.record_execution_trace_immediate(&trace);
+                    }
+                    DeferredRuntimeWrite::LearningDerivativeEvent { path, event } => {
+                        let _ = RuntimeStore { path }
+                            .append_learning_derivative_event_immediate(&event);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+        .map_err(|e| format!("spawn deferred runtime writer failed: {}", e))?;
+    *guard = Some(tx.clone());
+    Ok(tx)
+}
 
 impl RuntimeStore {
     pub fn record_execution_trace(&self, trace: &ExecutionTrace) -> Result<(), String> {
+        if !runtime_resource_budget().learning_enabled {
+            return Ok(());
+        }
+        self.record_execution_trace_with_durability(trace, RuntimeWriteDurability::Deferred)
+    }
+
+    fn record_execution_trace_immediate(&self, trace: &ExecutionTrace) -> Result<(), String> {
         let conn = self.connect()?;
         let payload = serde_json::to_string(trace)
             .map_err(|e| format!("serialize execution trace failed: {}", e))?;
@@ -34,6 +99,27 @@ impl RuntimeStore {
         )
         .map_err(|e| format!("write execution trace failed: {}", e))?;
         Ok(())
+    }
+
+    pub fn record_execution_trace_with_durability(
+        &self,
+        trace: &ExecutionTrace,
+        durability: RuntimeWriteDurability,
+    ) -> Result<(), String> {
+        if !runtime_resource_budget().learning_enabled {
+            return Ok(());
+        }
+        match durability {
+            RuntimeWriteDurability::Critical | RuntimeWriteDurability::Normal => {
+                self.record_execution_trace_immediate(trace)
+            }
+            RuntimeWriteDurability::Deferred => ensure_deferred_runtime_writer()?
+                .send(DeferredRuntimeWrite::ExecutionTrace {
+                    path: self.path.clone(),
+                    trace: trace.clone(),
+                })
+                .map_err(|e| format!("queue deferred execution trace failed: {}", e)),
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -441,6 +527,19 @@ impl RuntimeStore {
         &self,
         event: &LearningDerivativeEvent,
     ) -> Result<(), String> {
+        if !runtime_resource_budget().learning_enabled {
+            return Ok(());
+        }
+        self.append_learning_derivative_event_with_durability(
+            event,
+            RuntimeWriteDurability::Deferred,
+        )
+    }
+
+    fn append_learning_derivative_event_immediate(
+        &self,
+        event: &LearningDerivativeEvent,
+    ) -> Result<(), String> {
         let conn = self.connect()?;
         let payload = serde_json::to_string(event)
             .map_err(|e| format!("serialize learning derivative event failed: {}", e))?;
@@ -459,6 +558,27 @@ impl RuntimeStore {
         )
         .map_err(|e| format!("write learning derivative event failed: {}", e))?;
         Ok(())
+    }
+
+    pub fn append_learning_derivative_event_with_durability(
+        &self,
+        event: &LearningDerivativeEvent,
+        durability: RuntimeWriteDurability,
+    ) -> Result<(), String> {
+        if !runtime_resource_budget().learning_enabled {
+            return Ok(());
+        }
+        match durability {
+            RuntimeWriteDurability::Critical | RuntimeWriteDurability::Normal => {
+                self.append_learning_derivative_event_immediate(event)
+            }
+            RuntimeWriteDurability::Deferred => ensure_deferred_runtime_writer()?
+                .send(DeferredRuntimeWrite::LearningDerivativeEvent {
+                    path: self.path.clone(),
+                    event: event.clone(),
+                })
+                .map_err(|e| format!("queue deferred learning derivative event failed: {}", e)),
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

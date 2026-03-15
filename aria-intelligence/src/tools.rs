@@ -62,6 +62,58 @@ const fn default_tool_parallel_safe() -> bool {
     true
 }
 
+impl CachedTool {
+    pub fn canonical_spec(&self) -> aria_core::CanonicalToolSpec {
+        aria_core::CanonicalToolSpec {
+            tool_id: format!("tool.{}", self.name),
+            name: self.name.clone(),
+            description_short: self.description.clone(),
+            description_long: self.description.clone(),
+            schema: aria_core::CanonicalToolSchema {
+                parameters_json_schema: self.parameters_schema.clone(),
+                result_json_schema: None,
+            },
+            execution_kind: aria_core::ToolExecutionKind::Native,
+            requires_approval: aria_core::ToolApprovalClass::None,
+            side_effect_level: aria_core::ToolSideEffectLevel::ReadOnly,
+            streaming_safe: self.streaming_safe,
+            parallel_safe: self.parallel_safe,
+            modalities: self.modalities.clone(),
+            provider_hints: aria_core::ProviderCompatibilityHints {
+                provider_names: Vec::new(),
+                requires_strict_schema: self.requires_strict_schema,
+                prefers_reduced_schema: false,
+                supports_parallel_calls: self.parallel_safe,
+            },
+        }
+    }
+
+    pub fn catalog_entry(&self) -> aria_core::ToolCatalogEntry {
+        aria_core::ToolCatalogEntry {
+            tool_id: format!("tool.{}", self.name),
+            public_name: self.name.clone(),
+            description: self.description.clone(),
+            parameters_json_schema: self.parameters_schema.clone(),
+            execution_kind: aria_core::ToolExecutionKind::Native,
+            provider_kind: aria_core::ToolProviderKind::Native,
+            runner_class: aria_core::ToolRunnerClass::Native,
+            origin: aria_core::ToolOrigin {
+                provider_kind: aria_core::ToolProviderKind::Native,
+                provider_id: "native".into(),
+                origin_id: Some(format!("tool:{}", self.name)),
+                display_name: None,
+            },
+            artifact_kind: None,
+            requires_approval: aria_core::ToolApprovalClass::None,
+            side_effect_level: aria_core::ToolSideEffectLevel::ReadOnly,
+            streaming_safe: self.streaming_safe,
+            parallel_safe: self.parallel_safe,
+            modalities: self.modalities.clone(),
+            capability_requirements: Vec::new(),
+        }
+    }
+}
+
 pub fn normalize_tool_schema(schema: &str) -> Result<String, String> {
     let raw = schema.trim();
     let value = if raw.is_empty() {
@@ -202,7 +254,7 @@ pub fn tool_is_compatible_with_model(
     normalize_tool_schema(&tool.parameters_schema).is_ok()
 }
 
-pub(crate) fn tool_schema_fidelity_bonus(
+pub fn tool_schema_fidelity_bonus(
     tool: &CachedTool,
     profile: Option<&ModelCapabilityProfile>,
 ) -> f32 {
@@ -308,7 +360,10 @@ pub fn explain_tool_visibility(
                 .unwrap_or_else(ToolVisibilityReason::InvalidSchema),
         };
     };
-    if matches!(profile.tool_schema_mode, aria_core::ToolSchemaMode::Unsupported) {
+    if matches!(
+        profile.tool_schema_mode,
+        aria_core::ToolSchemaMode::Unsupported
+    ) {
         return ToolVisibilityDecision {
             tool_name: tool.name.clone(),
             available: false,
@@ -491,6 +546,128 @@ pub struct ToolManifestStore {
     tools: Vec<CachedTool>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolProviderCatalog {
+    #[serde(default)]
+    pub tools: Vec<aria_core::ToolCatalogEntry>,
+    #[serde(default)]
+    pub prompt_assets: Vec<aria_core::PromptAssetEntry>,
+    #[serde(default)]
+    pub resource_entries: Vec<aria_core::ResourceContextEntry>,
+    #[serde(default)]
+    pub provider_readiness: Vec<aria_core::ToolProviderReadiness>,
+}
+
+impl ToolProviderCatalog {
+    pub fn add_native_store(&mut self, store: &ToolManifestStore) {
+        self.merge_tools(store.list_catalog_entries());
+    }
+
+    pub fn add_tool_entries(&mut self, entries: Vec<aria_core::ToolCatalogEntry>) {
+        self.merge_tools(entries);
+    }
+
+    pub fn add_prompt_assets(&mut self, entries: Vec<aria_core::PromptAssetEntry>) {
+        self.prompt_assets.extend(entries);
+    }
+
+    pub fn add_resource_entries(&mut self, entries: Vec<aria_core::ResourceContextEntry>) {
+        self.resource_entries.extend(entries);
+    }
+
+    pub fn add_provider_readiness(&mut self, readiness: aria_core::ToolProviderReadiness) {
+        self.provider_readiness.push(readiness);
+    }
+
+    fn merge_tools(&mut self, entries: Vec<aria_core::ToolCatalogEntry>) {
+        for mut entry in entries {
+            if self
+                .tools
+                .iter()
+                .any(|existing| existing.public_name == entry.public_name)
+            {
+                let existing_idx = self
+                    .tools
+                    .iter()
+                    .position(|existing| existing.public_name == entry.public_name);
+                let existing_precedence = existing_idx
+                    .and_then(|idx| self.tools.get(idx))
+                    .map(|existing| tool_provider_precedence(existing.provider_kind))
+                    .unwrap_or(u8::MAX);
+                if existing_precedence <= tool_provider_precedence(entry.provider_kind) {
+                    entry.public_name = collision_alias_for_entry(&entry, &self.tools);
+                } else if let Some(idx) = existing_idx {
+                    let snapshot = self.tools[idx].clone();
+                    let aliased = collision_alias_for_entry(&snapshot, &self.tools);
+                    if let Some(existing) = self.tools.get_mut(idx) {
+                        existing.public_name = aliased;
+                    }
+                }
+            }
+            self.tools.push(entry);
+        }
+    }
+}
+
+fn tool_provider_precedence(kind: aria_core::ToolProviderKind) -> u8 {
+    match kind {
+        aria_core::ToolProviderKind::Native => 0,
+        aria_core::ToolProviderKind::WasmSkill => 1,
+        aria_core::ToolProviderKind::Mcp => 2,
+        aria_core::ToolProviderKind::ExternalCompat => 3,
+        aria_core::ToolProviderKind::Remote => 4,
+    }
+}
+
+fn collision_alias_for_entry(
+    entry: &aria_core::ToolCatalogEntry,
+    existing: &[aria_core::ToolCatalogEntry],
+) -> String {
+    let base = format!(
+        "{}__{}",
+        format!("{:?}", entry.provider_kind).to_ascii_lowercase(),
+        entry.public_name
+    );
+    if !existing
+        .iter()
+        .any(|candidate| candidate.public_name == base)
+    {
+        return base;
+    }
+    for suffix in 2..1000 {
+        let candidate = format!("{}__{}", base, suffix);
+        if !existing
+            .iter()
+            .any(|existing_entry| existing_entry.public_name == candidate)
+        {
+            return candidate;
+        }
+    }
+    format!("{}__fallback", base)
+}
+
+pub trait ToolProvider: Send + Sync {
+    fn readiness(&self) -> aria_core::ToolProviderReadiness;
+    fn list_tools(&self) -> Vec<aria_core::ToolCatalogEntry>;
+    fn list_prompt_assets(&self) -> Vec<aria_core::PromptAssetEntry> {
+        Vec::new()
+    }
+    fn list_resource_entries(&self) -> Vec<aria_core::ResourceContextEntry> {
+        Vec::new()
+    }
+}
+
+pub fn build_tool_provider_catalog(providers: &[&dyn ToolProvider]) -> ToolProviderCatalog {
+    let mut catalog = ToolProviderCatalog::default();
+    for provider in providers {
+        catalog.add_provider_readiness(provider.readiness());
+        catalog.add_tool_entries(provider.list_tools());
+        catalog.add_prompt_assets(provider.list_prompt_assets());
+        catalog.add_resource_entries(provider.list_resource_entries());
+    }
+    catalog
+}
+
 impl Default for ToolManifestStore {
     fn default() -> Self {
         Self::new()
@@ -529,6 +706,10 @@ impl ToolManifestStore {
 
     pub fn get_by_name(&self, name: &str) -> Option<CachedTool> {
         self.tools.iter().find(|t| t.name == name).cloned()
+    }
+
+    pub fn list_catalog_entries(&self) -> Vec<aria_core::ToolCatalogEntry> {
+        self.tools.iter().map(CachedTool::catalog_entry).collect()
     }
 
     pub fn search<E: EmbeddingModel>(
@@ -603,15 +784,30 @@ impl ToolManifestStore {
             })
             .collect();
         ranked.sort_by(|a, b| match (a.score, b.score) {
-            (Some(left), Some(right)) => {
-                right.partial_cmp(&left).unwrap_or(std::cmp::Ordering::Equal)
-            }
+            (Some(left), Some(right)) => right
+                .partial_cmp(&left)
+                .unwrap_or(std::cmp::Ordering::Equal),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.tool.name.cmp(&b.tool.name),
         });
         ranked.truncate(top_k);
         Ok(ranked)
+    }
+
+    pub fn search_catalog_entries<E: EmbeddingModel>(
+        &self,
+        query: &str,
+        embedder: &E,
+        top_k: usize,
+        profile: Option<&ModelCapabilityProfile>,
+    ) -> Result<Vec<aria_core::ToolCatalogEntry>, ToolRegistryError> {
+        self.search(query, embedder, top_k, profile).map(|entries| {
+            entries
+                .into_iter()
+                .map(|(tool, _)| tool.catalog_entry())
+                .collect()
+        })
     }
 
     pub fn persist_to_path(&self, path: &Path) -> Result<(), String> {
@@ -658,9 +854,8 @@ impl ToolManifestStore {
 
     pub fn validate_strict_startup_contract(&self) -> Result<(), String> {
         for tool in &self.tools {
-            normalize_tool_schema(&tool.parameters_schema).map_err(|err| {
-                format!("tool '{}' failed schema validation: {}", tool.name, err)
-            })?;
+            normalize_tool_schema(&tool.parameters_schema)
+                .map_err(|err| format!("tool '{}' failed schema validation: {}", tool.name, err))?;
         }
         Ok(())
     }

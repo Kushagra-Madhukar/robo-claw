@@ -1,5 +1,5 @@
 use super::*;
-use aria_core::{RetrievalTraceRecord, SecretUsageAuditRecord};
+use aria_core::{ContextInspectionRecord, RetrievalTraceRecord, SecretUsageAuditRecord};
 
 impl RuntimeStore {
     pub fn append_retrieval_trace(&self, record: &RetrievalTraceRecord) -> Result<(), String> {
@@ -90,7 +90,9 @@ impl RuntimeStore {
             }
             (None, None) => {
                 let mut stmt = conn
-                    .prepare("SELECT payload_json FROM retrieval_traces ORDER BY created_at_us DESC")
+                    .prepare(
+                        "SELECT payload_json FROM retrieval_traces ORDER BY created_at_us DESC",
+                    )
                     .map_err(|e| format!("prepare retrieval trace query failed: {}", e))?;
                 let rows = stmt
                     .query_map([], |row| row.get::<_, String>(0))
@@ -108,10 +110,118 @@ impl RuntimeStore {
         Ok(out)
     }
 
-    pub fn append_secret_usage_audit(
+    pub fn append_context_inspection(
         &self,
-        record: &SecretUsageAuditRecord,
+        record: &ContextInspectionRecord,
     ) -> Result<(), String> {
+        let conn = self.connect()?;
+        let payload = serde_json::to_string(record)
+            .map_err(|e| format!("serialize context inspection failed: {}", e))?;
+        conn.execute(
+            "INSERT INTO context_inspections
+             (context_id, request_id, session_id, agent_id, payload_json, created_at_us)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                record.context_id,
+                uuid::Uuid::from_bytes(record.request_id).to_string(),
+                uuid::Uuid::from_bytes(record.session_id).to_string(),
+                record.agent_id,
+                payload,
+                record.created_at_us as i64,
+            ],
+        )
+        .map_err(|e| format!("append context inspection failed: {}", e))?;
+        Ok(())
+    }
+
+    pub fn list_context_inspections(
+        &self,
+        session_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<ContextInspectionRecord>, String> {
+        let conn = self.connect()?;
+        let mut out = Vec::new();
+        match (session_id, agent_id) {
+            (Some(session_id), Some(agent_id)) => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT payload_json FROM context_inspections
+                         WHERE session_id=?1 AND agent_id=?2 ORDER BY created_at_us DESC",
+                    )
+                    .map_err(|e| format!("prepare context inspection query failed: {}", e))?;
+                let rows = stmt
+                    .query_map(params![session_id, agent_id], |row| row.get::<_, String>(0))
+                    .map_err(|e| format!("query context inspections failed: {}", e))?;
+                for row in rows {
+                    let payload =
+                        row.map_err(|e| format!("read context inspection row failed: {}", e))?;
+                    out.push(
+                        serde_json::from_str(&payload)
+                            .map_err(|e| format!("parse context inspection failed: {}", e))?,
+                    );
+                }
+            }
+            (Some(session_id), None) => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT payload_json FROM context_inspections
+                         WHERE session_id=?1 ORDER BY created_at_us DESC",
+                    )
+                    .map_err(|e| format!("prepare context inspection query failed: {}", e))?;
+                let rows = stmt
+                    .query_map(params![session_id], |row| row.get::<_, String>(0))
+                    .map_err(|e| format!("query context inspections failed: {}", e))?;
+                for row in rows {
+                    let payload =
+                        row.map_err(|e| format!("read context inspection row failed: {}", e))?;
+                    out.push(
+                        serde_json::from_str(&payload)
+                            .map_err(|e| format!("parse context inspection failed: {}", e))?,
+                    );
+                }
+            }
+            (None, Some(agent_id)) => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT payload_json FROM context_inspections
+                         WHERE agent_id=?1 ORDER BY created_at_us DESC",
+                    )
+                    .map_err(|e| format!("prepare context inspection query failed: {}", e))?;
+                let rows = stmt
+                    .query_map(params![agent_id], |row| row.get::<_, String>(0))
+                    .map_err(|e| format!("query context inspections failed: {}", e))?;
+                for row in rows {
+                    let payload =
+                        row.map_err(|e| format!("read context inspection row failed: {}", e))?;
+                    out.push(
+                        serde_json::from_str(&payload)
+                            .map_err(|e| format!("parse context inspection failed: {}", e))?,
+                    );
+                }
+            }
+            (None, None) => {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT payload_json FROM context_inspections ORDER BY created_at_us DESC",
+                    )
+                    .map_err(|e| format!("prepare context inspection query failed: {}", e))?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(|e| format!("query context inspections failed: {}", e))?;
+                for row in rows {
+                    let payload =
+                        row.map_err(|e| format!("read context inspection row failed: {}", e))?;
+                    out.push(
+                        serde_json::from_str(&payload)
+                            .map_err(|e| format!("parse context inspection failed: {}", e))?,
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn append_secret_usage_audit(&self, record: &SecretUsageAuditRecord) -> Result<(), String> {
         let conn = self.connect()?;
         let payload = serde_json::to_string(record)
             .map_err(|e| format!("serialize secret usage audit failed: {}", e))?;

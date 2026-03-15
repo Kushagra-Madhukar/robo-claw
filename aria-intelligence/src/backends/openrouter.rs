@@ -1,12 +1,14 @@
 use super::{
     adapter_for_family, build_openai_compatible_followup_body, collect_sse_like_stream,
     default_model_capability_profile, extract_openai_compatible_content,
-    parse_openai_compatible_tool_calls, LLMBackend, ModelMetadata, ModelProvider, SecretRef,
+    parse_openai_compatible_tool_calls, send_with_response_start_timeout, EgressCredentialBroker,
+    LLMBackend, ModelMetadata, ModelProvider, ProviderHealthIdentity, SecretRef,
 };
 use crate::{CachedTool, ExecutedToolCall, LLMResponse, OrchestratorError};
 use aria_core::{
-    AdapterFamily, CapabilitySourceKind, CapabilitySupport, ModelCapabilityProbeRecord,
-    ModelCapabilityProfile, ModelRef, ToolCallingMode, ToolRuntimePolicy,
+    AdapterFamily, CapabilitySourceKind, CapabilitySupport, ExecutionContextPack,
+    ModelCapabilityProbeRecord, ModelCapabilityProfile, ModelRef, ToolCallingMode,
+    ToolRuntimePolicy,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -21,6 +23,7 @@ pub struct OpenRouterBackend {
     pub site_title: String,
     capability_profile: ModelCapabilityProfile,
     client: reqwest::Client,
+    egress_broker: EgressCredentialBroker,
 }
 
 impl OpenRouterBackend {
@@ -49,6 +52,7 @@ impl OpenRouterBackend {
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_default(),
+            egress_broker: EgressCredentialBroker::new(),
         }
     }
 
@@ -68,7 +72,13 @@ impl OpenRouterBackend {
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_default(),
+            egress_broker: EgressCredentialBroker::new(),
         }
+    }
+
+    pub fn with_egress_broker(mut self, broker: EgressCredentialBroker) -> Self {
+        self.egress_broker = broker;
+        self
     }
 
     fn translated_tool_definitions(&self, tools: &[CachedTool]) -> Vec<Value> {
@@ -118,8 +128,8 @@ impl OpenRouterBackend {
             .unwrap_or(Self::DEFAULT_SEND_ATTEMPTS)
     }
 
-    fn should_retry_transport_error(error: &reqwest::Error) -> bool {
-        error.is_timeout() || error.is_connect() || error.is_request() || error.is_body()
+    fn should_retry_transport_error(error: &OrchestratorError) -> bool {
+        matches!(error, OrchestratorError::BackendOverloaded(_))
     }
 
     async fn send_completion_request(
@@ -129,17 +139,19 @@ impl OpenRouterBackend {
         body: &Value,
     ) -> Result<reqwest::Response, OrchestratorError> {
         let attempts = self.send_attempts();
-        let mut last_error: Option<reqwest::Error> = None;
+        let mut last_error: Option<String> = None;
         for attempt in 1..=attempts {
-            match self
-                .client
-                .post(url)
-                .header("Authorization", format!("Bearer {}", api_key))
-                .header("HTTP-Referer", &self.site_url)
-                .header("X-Title", &self.site_title)
-                .json(body)
-                .send()
-                .await
+            match send_with_response_start_timeout(
+                "OpenRouter",
+                self.client
+                    .post(url)
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .header("HTTP-Referer", &self.site_url)
+                    .header("X-Title", &self.site_title)
+                    .json(body)
+                    .send(),
+            )
+            .await
             {
                 Ok(response) => return Ok(response),
                 Err(err) => {
@@ -154,20 +166,17 @@ impl OpenRouterBackend {
                             "Retrying OpenRouter transport request after transient failure"
                         );
                         tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                        last_error = Some(err);
+                        last_error = Some(err.to_string());
                         continue;
                     }
-                    return Err(OrchestratorError::LLMError(format!(
-                        "OpenRouter request failed after {} attempt(s): {}",
-                        attempt, err
-                    )));
+                    return Err(err);
                 }
             }
         }
         let message = last_error
             .map(|err| err.to_string())
             .unwrap_or_else(|| "unknown transport error".to_string());
-        Err(OrchestratorError::LLMError(format!(
+        Err(OrchestratorError::BackendOverloaded(format!(
             "OpenRouter request failed after {} attempt(s): {}",
             attempts, message
         )))
@@ -186,7 +195,11 @@ impl OpenRouterBackend {
         body.as_object_mut().map(|value| {
             value.remove("tool_choice");
         });
-        let api_key = self.api_key.resolve("openrouter.ai")?;
+        let api_key = self.api_key.resolve_with_broker(
+            "openrouter.ai",
+            "openrouter_provider",
+            &self.egress_broker,
+        )?;
         self.send_completion_request(url, &api_key, &body).await
     }
 
@@ -201,8 +214,15 @@ impl OpenRouterBackend {
             return Ok(Some(LLMResponse::ToolCalls(tool_calls)));
         }
         if let Some(content) = extract_openai_compatible_content(message) {
-            if let Some(repaired) = crate::runtime::repair_tool_call_json(&content, tools) {
-                return Ok(Some(LLMResponse::ToolCalls(vec![repaired])));
+            let repair_allowed = matches!(
+                adapter_for_family(self.capability_profile.adapter_family)
+                    .tool_calling_mode(&self.capability_profile),
+                ToolCallingMode::TextFallbackWithRepair
+            );
+            if repair_allowed {
+                if let Some(repaired) = crate::runtime::repair_tool_call_json(&content, tools) {
+                    return Ok(Some(LLMResponse::ToolCalls(vec![repaired])));
+                }
             }
             return Ok(Some(LLMResponse::TextAnswer(content)));
         }
@@ -215,7 +235,11 @@ impl OpenRouterBackend {
         tools: &[CachedTool],
     ) -> Result<Option<LLMResponse>, OrchestratorError> {
         let url = "https://openrouter.ai/api/v1/chat/completions";
-        let api_key = self.api_key.resolve("openrouter.ai")?;
+        let api_key = self.api_key.resolve_with_broker(
+            "openrouter.ai",
+            "openrouter_provider",
+            &self.egress_broker,
+        )?;
         let mut body = json!({
             "model": self.model,
             "messages": [
@@ -246,6 +270,44 @@ impl OpenRouterBackend {
         })?;
         self.parse_response_json(&res_json, tools)
     }
+
+    async fn retry_context_without_native_tools(
+        &self,
+        context: &ExecutionContextPack,
+        tools: &[CachedTool],
+        policy: &ToolRuntimePolicy,
+    ) -> Result<Option<LLMResponse>, OrchestratorError> {
+        let url = "https://openrouter.ai/api/v1/chat/completions";
+        let api_key = self.api_key.resolve_with_broker(
+            "openrouter.ai",
+            "openrouter_provider",
+            &self.egress_broker,
+        )?;
+        let mut body =
+            super::build_openai_compatible_context_body(&self.model, context, Vec::new(), policy);
+        self.apply_completion_cap(&mut body);
+        let resp = self
+            .send_completion_request(url, &api_key, &body)
+            .await
+            .map_err(|e| {
+                OrchestratorError::LLMError(format!(
+                    "OpenRouter context compatibility retry failed: {}",
+                    e
+                ))
+            })?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(OrchestratorError::LLMError(format!(
+                "OpenRouter context compatibility retry returned {}: {}",
+                status, text
+            )));
+        }
+        let res_json: serde_json::Value = resp.json().await.map_err(|e| {
+            OrchestratorError::LLMError(format!("OpenRouter JSON parse failed: {}", e))
+        })?;
+        self.parse_response_json(&res_json, tools)
+    }
 }
 
 #[async_trait]
@@ -266,7 +328,11 @@ impl LLMBackend for OpenRouterBackend {
         policy: &ToolRuntimePolicy,
     ) -> Result<LLMResponse, OrchestratorError> {
         let url = "https://openrouter.ai/api/v1/chat/completions";
-        let api_key = self.api_key.resolve("openrouter.ai")?;
+        let api_key = self.api_key.resolve_with_broker(
+            "openrouter.ai",
+            "openrouter_provider",
+            &self.egress_broker,
+        )?;
         let adapter = adapter_for_family(self.capability_profile.adapter_family);
         let filtered_tools = adapter.filter_tools(&self.capability_profile, tools);
         let tool_mode = adapter.tool_calling_mode(&self.capability_profile);
@@ -341,6 +407,118 @@ impl LLMBackend for OpenRouterBackend {
         )))
     }
 
+    async fn query_context_with_policy(
+        &self,
+        context: &ExecutionContextPack,
+        tools: &[CachedTool],
+        policy: &ToolRuntimePolicy,
+    ) -> Result<LLMResponse, OrchestratorError> {
+        let url = "https://openrouter.ai/api/v1/chat/completions";
+        let api_key = self.api_key.resolve_with_broker(
+            "openrouter.ai",
+            "openrouter_provider",
+            &self.egress_broker,
+        )?;
+        let adapter = adapter_for_family(self.capability_profile.adapter_family);
+        let filtered_tools = adapter.filter_tools(&self.capability_profile, tools);
+        let tool_mode = adapter.tool_calling_mode(&self.capability_profile);
+        let tool_defs = filtered_tools
+            .iter()
+            .filter_map(|tool| {
+                adapter
+                    .translate_tool_definition(&self.capability_profile, tool)
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+        let mut body = super::build_openai_compatible_context_body(
+            &self.model,
+            context,
+            if matches!(
+                tool_mode,
+                ToolCallingMode::NativeTools | ToolCallingMode::CompatTools
+            ) {
+                tool_defs.clone()
+            } else {
+                Vec::new()
+            },
+            policy,
+        );
+        self.apply_completion_cap(&mut body);
+        let resp = self.send_completion_request(url, &api_key, &body).await?;
+        let mut resp = resp;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if !tool_defs.is_empty() && Self::should_retry_without_tool_choice(status, &text) {
+                resp = self.resend_without_tool_choice(url, body.clone()).await?;
+            } else {
+                return Err(OrchestratorError::LLMError(format!(
+                    "OpenRouter returned {}: {}",
+                    status, text
+                )));
+            }
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(OrchestratorError::LLMError(format!(
+                "OpenRouter returned {}: {}",
+                status, text
+            )));
+        }
+        let res_json: serde_json::Value = resp.json().await.map_err(|e| {
+            OrchestratorError::LLMError(format!("OpenRouter JSON parse failed: {}", e))
+        })?;
+        if let Some(response) = self.parse_response_json(&res_json, tools)? {
+            return Ok(response);
+        }
+        if !tool_defs.is_empty() {
+            if let Some(response) = self
+                .retry_context_without_native_tools(context, tools, policy)
+                .await?
+            {
+                return Ok(response);
+            }
+        }
+        Err(OrchestratorError::LLMError(format!(
+            "OpenRouter returned no content: {}",
+            res_json["choices"][0]["message"]
+        )))
+    }
+
+    fn inspect_context_payload(
+        &self,
+        context: &ExecutionContextPack,
+        tools: &[CachedTool],
+        policy: &ToolRuntimePolicy,
+    ) -> Option<serde_json::Value> {
+        let adapter = adapter_for_family(self.capability_profile.adapter_family);
+        let filtered_tools = adapter.filter_tools(&self.capability_profile, tools);
+        let tool_defs = filtered_tools
+            .iter()
+            .filter_map(|tool| {
+                adapter
+                    .translate_tool_definition(&self.capability_profile, tool)
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+        let mut body = super::build_openai_compatible_context_body(
+            &self.model,
+            context,
+            if matches!(
+                adapter.tool_calling_mode(&self.capability_profile),
+                ToolCallingMode::NativeTools | ToolCallingMode::CompatTools
+            ) {
+                tool_defs
+            } else {
+                Vec::new()
+            },
+            policy,
+        );
+        self.apply_completion_cap(&mut body);
+        Some(body)
+    }
+
     async fn query_stream_with_policy(
         &self,
         prompt: &str,
@@ -348,7 +526,11 @@ impl LLMBackend for OpenRouterBackend {
         policy: &ToolRuntimePolicy,
     ) -> Result<LLMResponse, OrchestratorError> {
         let url = "https://openrouter.ai/api/v1/chat/completions";
-        let api_key = self.api_key.resolve("openrouter.ai")?;
+        let api_key = self.api_key.resolve_with_broker(
+            "openrouter.ai",
+            "openrouter_provider",
+            &self.egress_broker,
+        )?;
         let adapter = adapter_for_family(self.capability_profile.adapter_family);
         let filtered_tools = adapter.filter_tools(&self.capability_profile, tools);
         let tool_mode = adapter.tool_calling_mode(&self.capability_profile);
@@ -373,18 +555,17 @@ impl LLMBackend for OpenRouterBackend {
         {
             super::apply_openai_compatible_tool_policy(&mut body, &tool_defs, policy);
         }
-        let resp = self
-            .client
-            .post(url)
-            .bearer_auth(api_key)
-            .header("HTTP-Referer", &self.site_url)
-            .header("X-Title", &self.site_title)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                OrchestratorError::LLMError(format!("OpenRouter streaming request failed: {}", e))
-            })?;
+        let resp = send_with_response_start_timeout(
+            "OpenRouter streaming",
+            self.client
+                .post(url)
+                .bearer_auth(api_key)
+                .header("HTTP-Referer", &self.site_url)
+                .header("X-Title", &self.site_title)
+                .json(&body)
+                .send(),
+        )
+        .await?;
         let mut resp = resp;
         if !resp.status().is_success() {
             let status = resp.status();
@@ -431,7 +612,11 @@ impl LLMBackend for OpenRouterBackend {
         executed_tools: &[ExecutedToolCall],
         policy: &ToolRuntimePolicy,
     ) -> Result<LLMResponse, OrchestratorError> {
-        let api_key = self.api_key.resolve("openrouter.ai")?;
+        let api_key = self.api_key.resolve_with_broker(
+            "openrouter.ai",
+            "openrouter_provider",
+            &self.egress_broker,
+        )?;
         let url = "https://openrouter.ai/api/v1/chat/completions";
         let adapter = adapter_for_family(self.capability_profile.adapter_family);
         let tool_defs = self.translated_tool_definitions(tools);
@@ -496,7 +681,11 @@ impl LLMBackend for OpenRouterBackend {
         policy: &ToolRuntimePolicy,
     ) -> Result<LLMResponse, OrchestratorError> {
         let url = "https://openrouter.ai/api/v1/chat/completions";
-        let api_key = self.api_key.resolve("openrouter.ai")?;
+        let api_key = self.api_key.resolve_with_broker(
+            "openrouter.ai",
+            "openrouter_provider",
+            &self.egress_broker,
+        )?;
         let adapter = adapter_for_family(self.capability_profile.adapter_family);
         let tool_defs = self.translated_tool_definitions(tools);
         let mut body = self.build_tool_follow_up_body(prompt, &tool_defs, executed_tools);
@@ -514,18 +703,17 @@ impl LLMBackend for OpenRouterBackend {
         } else {
             super::apply_openai_compatible_tool_policy(&mut body, &tool_defs, policy);
         }
-        let resp = self
-            .client
-            .post(url)
-            .bearer_auth(api_key)
-            .header("HTTP-Referer", &self.site_url)
-            .header("X-Title", &self.site_title)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                OrchestratorError::LLMError(format!("OpenRouter streaming request failed: {}", e))
-            })?;
+        let resp = send_with_response_start_timeout(
+            "OpenRouter streaming",
+            self.client
+                .post(url)
+                .bearer_auth(api_key)
+                .header("HTTP-Referer", &self.site_url)
+                .header("X-Title", &self.site_title)
+                .json(&body)
+                .send(),
+        )
+        .await?;
         let mut resp = resp;
         if !resp.status().is_success() {
             let status = resp.status();
@@ -556,6 +744,13 @@ impl LLMBackend for OpenRouterBackend {
 
     fn capability_profile(&self) -> Option<ModelCapabilityProfile> {
         Some(self.capability_profile.clone())
+    }
+
+    fn provider_health_identity(&self) -> ProviderHealthIdentity {
+        ProviderHealthIdentity {
+            provider_family: self.capability_profile.model_ref.provider_id.clone(),
+            upstream_identity: "https://openrouter.ai/api/v1".into(),
+        }
     }
 }
 
@@ -706,6 +901,7 @@ pub struct OpenRouterProvider {
     pub api_key: SecretRef,
     pub site_url: String,
     pub site_title: String,
+    pub egress_broker: Option<EgressCredentialBroker>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -850,24 +1046,38 @@ impl ModelProvider for OpenRouterProvider {
     }
 
     fn create_backend(&self, model_id: &str) -> Result<Box<dyn LLMBackend>, OrchestratorError> {
-        Ok(Box::new(OpenRouterBackend::new(
-            self.api_key.clone(),
-            model_id,
-            self.site_url.clone(),
-            self.site_title.clone(),
-        )))
+        Ok(Box::new(
+            OpenRouterBackend::new(
+                self.api_key.clone(),
+                model_id,
+                self.site_url.clone(),
+                self.site_title.clone(),
+            )
+            .with_egress_broker(
+                self.egress_broker
+                    .clone()
+                    .unwrap_or_else(EgressCredentialBroker::new),
+            ),
+        ))
     }
 
     fn create_backend_with_profile(
         &self,
         profile: &ModelCapabilityProfile,
     ) -> Result<Box<dyn LLMBackend>, OrchestratorError> {
-        Ok(Box::new(OpenRouterBackend::with_capability_profile(
-            self.api_key.clone(),
-            profile.clone(),
-            self.site_url.clone(),
-            self.site_title.clone(),
-        )))
+        Ok(Box::new(
+            OpenRouterBackend::with_capability_profile(
+                self.api_key.clone(),
+                profile.clone(),
+                self.site_url.clone(),
+                self.site_title.clone(),
+            )
+            .with_egress_broker(
+                self.egress_broker
+                    .clone()
+                    .unwrap_or_else(EgressCredentialBroker::new),
+            ),
+        ))
     }
 
     async fn probe_model_capabilities(

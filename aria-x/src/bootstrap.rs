@@ -1,6 +1,436 @@
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+
+struct ShutdownCoordinator {
+    stopping: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl ShutdownCoordinator {
+    fn new() -> Self {
+        Self {
+            stopping: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn signal_shutdown(&self) {
+        if !self.stopping.swap(true, AtomicOrdering::SeqCst) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(AtomicOrdering::SeqCst)
+    }
+
+    async fn wait(&self) {
+        if self.is_stopping() {
+            return;
+        }
+        self.notify.notified().await;
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuntimePidRecord {
+    pid: u32,
+    config_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InstallMode {
+    Copy,
+}
+
+fn render_cli_help(topic: Option<&str>) -> String {
+    match topic.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(topic) if topic == "doctor" => [
+            "aria-x doctor",
+            "",
+            "Usage:",
+            "  aria-x doctor",
+            "  aria-x doctor stt",
+            "  aria-x doctor env",
+            "  aria-x doctor gateway",
+            "  aria-x doctor browser",
+            "",
+            "Commands:",
+            "  doctor         Show a runtime/operator health summary.",
+            "  doctor stt     Show detailed speech-to-text availability and configuration.",
+            "  doctor env     Show resolved local environment/runtime input status.",
+            "  doctor gateway Show configured gateway/channel status.",
+            "  doctor browser Show browser automation/runtime configuration status.",
+        ]
+        .join("\n"),
+        Some(topic) if topic == "install" => [
+            "aria-x install",
+            "",
+            "Usage:",
+            "  aria-x install",
+            "  aria-x install --bin-dir <path>",
+            "  aria-x install --with-default-config",
+            "  aria-x install --with-default-config --overwrite-config",
+            "",
+            "Behavior:",
+            "  Copies the current aria-x binary into a user-level bin directory.",
+            "  The default target is ~/.local/bin/aria-x.",
+            "  The command does not edit shell startup files automatically.",
+            "  With --with-default-config it seeds the standard ARIA config path.",
+        ]
+        .join("\n"),
+        Some(topic) if topic == "completion" => [
+            "aria-x completion",
+            "",
+            "Usage:",
+            "  aria-x completion bash",
+            "  aria-x completion zsh",
+            "  aria-x completion fish",
+            "",
+            "Prints shell completion scripts to stdout.",
+        ]
+        .join("\n"),
+        Some(topic) if topic == "channels" => [
+            "aria-x channels",
+            "",
+            "Usage:",
+            "  aria-x channels list",
+            "  aria-x channels status",
+            "  aria-x channels add <channel>",
+            "  aria-x channels remove <channel>",
+        ]
+        .join("\n"),
+        Some(topic) if topic == "inspect" => [
+            "aria-x inspect",
+            "",
+            "Usage:",
+            "  aria-x inspect context [session_id] [agent_id]",
+            "  aria-x inspect provider-payloads [session_id] [agent_id]",
+            "  aria-x inspect provider-payload [session_id] [agent_id]",
+            "",
+            "Renders JSON inspection output for persisted context and provider payload records.",
+        ]
+        .join("\n"),
+        Some(topic) if topic == "explain" => [
+            "aria-x explain",
+            "",
+            "Usage:",
+            "  aria-x explain context [session_id] [agent_id]",
+            "  aria-x explain provider-payloads [session_id] [agent_id]",
+            "  aria-x explain provider-payload [session_id] [agent_id]",
+            "",
+            "Renders human-readable inspection output for persisted context and provider payload records.",
+        ]
+        .join("\n"),
+        Some(topic) if topic == "run" => [
+            "aria-x run",
+            "",
+            "Usage:",
+            "  aria-x run [config]",
+            "",
+            "Starts the main runtime/gateway process. If config is omitted, the default",
+            "project config path is used.",
+        ]
+        .join("\n"),
+        Some(topic) if topic == "tui" => [
+            "aria-x tui",
+            "",
+            "Usage:",
+            "  aria-x tui [config]",
+            "  aria-x tui [config] --attach ws://127.0.0.1:8090/ws",
+            "",
+            "Starts the terminal UI. Without --attach it spawns a local runtime.",
+        ]
+        .join("\n"),
+        _ => [
+            "aria-x",
+            "",
+            "Usage:",
+            "  aria-x run [config]",
+            "  aria-x tui [config] [--attach <ws-url>]",
+            "  aria-x status",
+            "  aria-x stop",
+            "  aria-x install [--bin-dir <path>]",
+            "  aria-x completion <bash|zsh|fish>",
+            "  aria-x doctor",
+            "  aria-x doctor stt",
+            "  aria-x doctor env",
+            "  aria-x doctor gateway",
+            "  aria-x doctor browser",
+            "  aria-x inspect context [session_id] [agent_id]",
+            "  aria-x inspect provider-payloads [session_id] [agent_id]",
+            "  aria-x inspect provider-payload [session_id] [agent_id]",
+            "  aria-x explain context [session_id] [agent_id]",
+            "  aria-x explain provider-payloads [session_id] [agent_id]",
+            "  aria-x explain provider-payload [session_id] [agent_id]",
+            "  aria-x --explain-context <session_id> [agent_id]",
+            "  aria-x --explain-provider-payloads <session_id> [agent_id]",
+            "  aria-x setup stt --local",
+            "  aria-x channels <list|status|add|remove> [channel]",
+            "  aria-x help [topic]",
+            "",
+            "Common topics:",
+            "  run, tui, install, completion, doctor, channels, inspect, explain",
+        ]
+        .join("\n"),
+    }
+}
+
+fn standard_project_config_path() -> Result<PathBuf, String> {
+    let dirs = project_dirs()
+        .ok_or_else(|| "unable to resolve application config directory".to_string())?;
+    Ok(dirs.config_dir().join("config.toml"))
+}
+
+fn default_install_bin_dir() -> Result<PathBuf, String> {
+    let user_dirs = directories::UserDirs::new()
+        .ok_or_else(|| "unable to resolve user home directory for install".to_string())?;
+    Ok(user_dirs.home_dir().join(".local").join("bin"))
+}
+
+fn path_contains_dir(path_var: &str, dir: &Path) -> bool {
+    std::env::split_paths(path_var).any(|entry| entry == dir)
+}
+
+fn install_target_path(bin_dir: &Path) -> PathBuf {
+    bin_dir.join("aria-x")
+}
+
+fn install_binary(current_exe: &Path, target: &Path, mode: InstallMode) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("install target '{}' has no parent directory", target.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("create install directory '{}' failed: {}", parent.display(), e))?;
+    if target.exists() {
+        std::fs::remove_file(target)
+            .map_err(|e| format!("remove existing install target '{}' failed: {}", target.display(), e))?;
+    }
+    match mode {
+        InstallMode::Copy => {
+            std::fs::copy(current_exe, target).map_err(|e| {
+                format!(
+                    "copy '{}' to '{}' failed: {}",
+                    current_exe.display(),
+                    target.display(),
+                    e
+                )
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(target)
+                    .map_err(|e| format!("read install target metadata '{}' failed: {}", target.display(), e))?
+                    .permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(target, perms).map_err(|e| {
+                    format!("set executable permissions on '{}' failed: {}", target.display(), e)
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_install_command(args: &[String]) -> Result<String, String> {
+    let mut bin_dir = None;
+    let mut seed_default_config = false;
+    let mut overwrite_config = false;
+    let mut idx = 2usize;
+    while let Some(arg) = args.get(idx) {
+        match arg.as_str() {
+            "--bin-dir" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "Usage: aria-x install [--bin-dir <path>]".to_string())?;
+                bin_dir = Some(PathBuf::from(value));
+                idx += 2;
+            }
+            "--with-default-config" => {
+                seed_default_config = true;
+                idx += 1;
+            }
+            "--overwrite-config" => {
+                overwrite_config = true;
+                idx += 1;
+            }
+            _ => {
+                return Err(
+                    "Usage: aria-x install [--bin-dir <path>] [--with-default-config] [--overwrite-config]"
+                        .into(),
+                )
+            }
+        }
+    }
+    let bin_dir = bin_dir.unwrap_or(default_install_bin_dir()?);
+    let target = install_target_path(&bin_dir);
+    let current_exe = std::env::current_exe()
+        .map_err(|e| format!("resolve current executable failed: {}", e))?;
+    install_binary(&current_exe, &target, InstallMode::Copy)?;
+    let config_seed_status = if seed_default_config {
+        Some(seed_default_runtime_config(overwrite_config)?)
+    } else {
+        None
+    };
+
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let path_hint = if path_contains_dir(&path_var, &bin_dir) {
+        "PATH status: target bin directory is already on PATH.".to_string()
+    } else {
+        format!(
+            "PATH status: '{}' is not on PATH.\nAdd this to your shell profile:\n  export PATH=\"{}:$PATH\"",
+            bin_dir.display(),
+            bin_dir.display()
+        )
+    };
+
+    Ok(format!(
+        "Installed aria-x.\nsource: {}\ntarget: {}\ninstall_mode: copy\n{}\n{}",
+        current_exe.display(),
+        target.display(),
+        config_seed_status.unwrap_or_else(|| "config_seed: skipped".to_string()),
+        path_hint
+    ))
+}
+
+fn seed_default_runtime_config(overwrite: bool) -> Result<String, String> {
+    let target = standard_project_config_path()?;
+    seed_default_runtime_config_at(&target, overwrite)
+}
+
+fn seed_default_runtime_config_at(target: &Path, overwrite: bool) -> Result<String, String> {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.toml");
+    let target_dir = target
+        .parent()
+        .ok_or_else(|| format!("config target '{}' has no parent directory", target.display()))?;
+    std::fs::create_dir_all(target_dir).map_err(|e| {
+        format!(
+            "create config directory '{}' failed: {}",
+            target_dir.display(),
+            e
+        )
+    })?;
+    if target.exists() && !overwrite {
+        return Ok(format!(
+            "config_seed: existing config preserved at {}",
+            target.display()
+        ));
+    }
+    std::fs::copy(&source, &target).map_err(|e| {
+        format!(
+            "copy default config '{}' to '{}' failed: {}",
+            source.display(),
+            target.display(),
+            e
+        )
+    })?;
+    Ok(format!(
+        "config_seed: installed default config at {}",
+        target.display()
+    ))
+}
+
+fn render_shell_completion(shell: &str) -> Result<String, String> {
+    match shell.trim().to_ascii_lowercase().as_str() {
+        "bash" => Ok(
+            r#"_aria_x_completions() {
+    local cur prev words cword
+    _init_completion || return
+    local commands="run tui status stop install completion doctor setup channels inspect explain help"
+    local doctor_topics="stt env gateway browser"
+    local completion_shells="bash zsh fish"
+    local channel_subcommands="list status add remove"
+    case "${words[1]}" in
+        doctor)
+            COMPREPLY=( $(compgen -W "${doctor_topics}" -- "$cur") )
+            ;;
+        inspect|explain)
+            COMPREPLY=( $(compgen -W "context provider-payloads provider-payload" -- "$cur") )
+            ;;
+        completion)
+            COMPREPLY=( $(compgen -W "${completion_shells}" -- "$cur") )
+            ;;
+        channels)
+            COMPREPLY=( $(compgen -W "${channel_subcommands}" -- "$cur") )
+            ;;
+        *)
+            COMPREPLY=( $(compgen -W "${commands}" -- "$cur") )
+            ;;
+    esac
+}
+complete -F _aria_x_completions aria-x
+"#
+            .to_string(),
+        ),
+        "zsh" => Ok(
+            r#"#compdef aria-x
+_aria_x() {
+  local -a commands
+  commands=(
+    'run:Run the main runtime'
+    'tui:Run the terminal UI'
+    'status:Show runtime status'
+    'stop:Stop the runtime'
+    'install:Install aria-x into a user bin directory'
+    'completion:Print shell completion script'
+    'doctor:Run operator health checks'
+    'setup:Run setup flows'
+    'channels:Manage configured channels'
+    'inspect:Render JSON inspection output'
+    'explain:Render human-readable inspection output'
+    'help:Show help'
+  )
+  if (( CURRENT == 2 )); then
+    _describe 'command' commands
+    return
+  fi
+  case "$words[2]" in
+    doctor)
+      _values 'doctor topic' stt env gateway browser
+      ;;
+    inspect|explain)
+      _values 'inspection topic' context provider-payloads provider-payload
+      ;;
+    completion)
+      _values 'shell' bash zsh fish
+      ;;
+    channels)
+      _values 'channel command' list status add remove
+      ;;
+  esac
+}
+_aria_x
+"#
+            .to_string(),
+        ),
+        "fish" => Ok(
+            r#"complete -c aria-x -f
+complete -c aria-x -n '__fish_use_subcommand' -a 'run tui status stop install completion doctor setup channels inspect explain help'
+complete -c aria-x -n '__fish_seen_subcommand_from doctor' -a 'stt env gateway browser'
+complete -c aria-x -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
+complete -c aria-x -n '__fish_seen_subcommand_from channels' -a 'list status add remove'
+complete -c aria-x -n '__fish_seen_subcommand_from inspect explain' -a 'context provider-payloads provider-payload'
+"#
+            .to_string(),
+        ),
+        _ => Err("Usage: aria-x completion <bash|zsh|fish>".into()),
+    }
+}
+
+fn run_preflight_cli_command(args: &[String]) -> Option<Result<String, String>> {
+    match args.get(1).map(String::as_str) {
+        Some("help") => Some(Ok(render_cli_help(args.get(2).map(String::as_str)))),
+        Some("-h") | Some("--help") => Some(Ok(render_cli_help(None))),
+        Some("install") => Some(run_install_command(args)),
+        Some("completion") => Some(render_shell_completion(
+            args.get(2).map(String::as_str).unwrap_or_default(),
+        )),
+        _ => None,
+    }
+}
 
 pub(crate) fn run_main() {
     tokio::runtime::Builder::new_multi_thread()
@@ -34,6 +464,7 @@ fn node_supports_scheduler(role: &str) -> bool {
 fn spawn_supervised_adapter<F, Fut>(
     adapter_name: &'static str,
     channel: GatewayChannel,
+    shutdown: Arc<ShutdownCoordinator>,
     make_future: F,
 ) -> tokio::task::JoinHandle<()>
 where
@@ -43,44 +474,70 @@ where
     tokio::spawn(async move {
         let mut attempt = 0u32;
         loop {
+            if shutdown.is_stopping() {
+                crate::channel_health::mark_channel_adapter_state(channel, "stopped");
+                break;
+            }
             attempt = attempt.saturating_add(1);
             crate::channel_health::mark_channel_adapter_state(channel, "starting");
             crate::channel_health::record_channel_health_event(
                 channel,
                 crate::channel_health::ChannelHealthEventKind::AdapterStarted,
             );
-            let join = tokio::spawn(make_future()).await;
-            match join {
-                Ok(()) => {
-                    crate::channel_health::record_channel_health_event(
-                        channel,
-                        crate::channel_health::ChannelHealthEventKind::AdapterExited,
-                    );
-                    warn!(
-                        adapter = adapter_name,
-                        attempt = attempt,
-                        "Adapter exited; scheduling restart"
-                    );
+            let child = tokio::spawn(make_future());
+            tokio::pin!(child);
+            let restart = tokio::select! {
+                join = &mut child => {
+                    match join {
+                        Ok(()) => {
+                            crate::channel_health::record_channel_health_event(
+                                channel,
+                                crate::channel_health::ChannelHealthEventKind::AdapterExited,
+                            );
+                            warn!(
+                                adapter = adapter_name,
+                                attempt = attempt,
+                                "Adapter exited; scheduling restart"
+                            );
+                        }
+                        Err(err) => {
+                            crate::channel_health::record_channel_health_event(
+                                channel,
+                                crate::channel_health::ChannelHealthEventKind::AdapterPanicked,
+                            );
+                            warn!(
+                                adapter = adapter_name,
+                                attempt = attempt,
+                                error = %err,
+                                "Adapter task panicked; scheduling restart"
+                            );
+                        }
+                    }
+                    true
                 }
-                Err(err) => {
-                    crate::channel_health::record_channel_health_event(
-                        channel,
-                        crate::channel_health::ChannelHealthEventKind::AdapterPanicked,
-                    );
-                    warn!(
-                        adapter = adapter_name,
-                        attempt = attempt,
-                        error = %err,
-                        "Adapter task panicked; scheduling restart"
-                    );
+                _ = shutdown.wait() => {
+                    crate::channel_health::mark_channel_adapter_state(channel, "stopping");
+                    child.as_mut().abort();
+                    let _ = child.await;
+                    false
                 }
+            };
+            if !restart || shutdown.is_stopping() {
+                crate::channel_health::mark_channel_adapter_state(channel, "stopped");
+                break;
             }
             crate::channel_health::record_channel_health_event(
                 channel,
                 crate::channel_health::ChannelHealthEventKind::AdapterRestarted,
             );
             let backoff_secs = u64::from(attempt.min(5));
-            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs.max(1))).await;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs.max(1))) => {}
+                _ = shutdown.wait() => {
+                    crate::channel_health::mark_channel_adapter_state(channel, "stopped");
+                    break;
+                }
+            }
         }
     })
 }
@@ -95,6 +552,19 @@ async fn actual_main() {
         std::process::exit(1);
     });
 
+    if let Some(output) = run_preflight_cli_command(&args) {
+        match output {
+            Ok(text) => {
+                println!("{}", text);
+                return;
+            }
+            Err(err) => {
+                eprintln!("[aria-x] Command failed: {}", err);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let startup_mode = crate::tui::parse_startup_mode(&args, runtime_env.config_path.clone());
     let tui_mode = matches!(startup_mode, crate::tui::StartupMode::Tui { .. });
     let config_path = match &startup_mode {
@@ -106,6 +576,19 @@ async fn actual_main() {
     } else {
         resolve_config_path(&config_path).with_extension("runtime.json")
     };
+
+    if let Some(output) = run_process_control_command(&args) {
+        match output {
+            Ok(text) => {
+                println!("{}", text);
+                return;
+            }
+            Err(err) => {
+                eprintln!("[aria-x] Process command failed: {}", err);
+                std::process::exit(1);
+            }
+        }
+    }
 
     if tui_mode {
         let attach_url = match &startup_mode {
@@ -148,6 +631,19 @@ async fn actual_main() {
         }
     }
 
+    if let Some(output) = run_stt_management_command(&config, &args) {
+        match output {
+            Ok(text) => {
+                println!("{}", text);
+                return;
+            }
+            Err(err) => {
+                eprintln!("[aria-x] STT command failed: {}", err);
+                std::process::exit(1);
+            }
+        }
+    }
+
     if let Err(err) = validate_config(&config) {
         eprintln!("[aria-x] Config validation error: {}", err);
         eprintln!("[aria-x] For Telegram: set TELEGRAM_BOT_TOKEN or add telegram_token to config");
@@ -156,6 +652,14 @@ async fn actual_main() {
     }
     let config = Arc::new(config);
     install_app_runtime(Arc::clone(&config));
+    let runtime_pid_guard = match register_runtime_pid(&config.path) {
+        Ok(guard) => Some(guard),
+        Err(err) => {
+            warn!(error = %err, "Failed to register runtime pid file");
+            None
+        }
+    };
+    let shutdown_coordinator = Arc::new(ShutdownCoordinator::new());
 
     RuntimeStore::configure_operator_retention(
         config.ssmu.operator_skill_signature_max_rows,
@@ -167,6 +671,19 @@ async fn actual_main() {
         config.ssmu.operator_browser_action_audit_max_rows,
         config.ssmu.operator_browser_challenge_event_max_rows,
     );
+
+    if let Some(result) = run_operator_cli_command(&config, &args) {
+        match result {
+            Ok(text) => {
+                println!("{}", text);
+                return;
+            }
+            Err(err) => {
+                eprintln!("[aria-x] Operator command failed: {}", err);
+                std::process::exit(1);
+            }
+        }
+    }
 
     match run_admin_inspect_command(&config, &args) {
         Ok(Some(json)) => {
@@ -180,6 +697,17 @@ async fn actual_main() {
         Ok(None) => {}
         Err(err) => {
             eprintln!("[aria-x] Inspect command failed: {}", err);
+            std::process::exit(1);
+        }
+    }
+    match run_admin_explain_command(&config, &args) {
+        Ok(Some(text)) => {
+            println!("{}", text);
+            return;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("[aria-x] Explain command failed: {}", err);
             std::process::exit(1);
         }
     }
@@ -462,11 +990,11 @@ async fn actual_main() {
                     ),
                     "manage_cron" => (
                         "Manage scheduled jobs. Supports add, update, delete, list. Use a structured schedule object with kind=at/every/daily/weekly/cron. DO NOT use tool/agent prefixes in response tool field.",
-                        r#"{"action": {"type":"string","enum":["add","update","delete","list"],"description":"CRUD action to perform"}, "id": {"type":"string","description":"Unique job ID (required for update/delete)"}, "agent_id": {"type":"string","description":"Agent ID to trigger"}, "prompt": {"type":"string","description":"Prompt to send"}, "schedule": {"type":"object","description":"Structured schedule object. Examples: {\"kind\":\"at\",\"at\":\"2026-08-28T19:00:00+05:30\"}, {\"kind\":\"every\",\"seconds\":120}, {\"kind\":\"daily\",\"hour\":19,\"minute\":30,\"timezone\":\"Asia/Kolkata\"}, {\"kind\":\"weekly\",\"weekday\":\"sat\",\"hour\":11,\"minute\":0,\"interval_weeks\":2,\"timezone\":\"Asia/Kolkata\"}, {\"kind\":\"cron\",\"expr\":\"0 30 19 * * *\",\"timezone\":\"Asia/Kolkata\"}"}}"#,
+                        r#"{"type":"object","properties":{"action": {"type":"string","enum":["add","update","delete","list"],"description":"CRUD action to perform"}, "id": {"type":"string","description":"Unique job ID, primarily for update and delete"}, "agent_id": {"type":"string","description":"Agent ID to trigger"}, "prompt": {"type":"string","description":"Prompt to send"}, "schedule": {"type":"object","description":"Structured schedule object. Examples: {\"kind\":\"at\",\"at\":\"2026-08-28T19:00:00+05:30\"}, {\"kind\":\"every\",\"seconds\":120}, {\"kind\":\"daily\",\"hour\":19,\"minute\":30,\"timezone\":\"Asia/Kolkata\"}, {\"kind\":\"weekly\",\"weekday\":\"sat\",\"hour\":11,\"minute\":0,\"interval_weeks\":2,\"timezone\":\"Asia/Kolkata\"}, {\"kind\":\"cron\",\"expr\":\"0 30 19 * * *\",\"timezone\":\"Asia/Kolkata\"}"}},"required":["action"],"additionalProperties":false}"#,
                     ),
                     "schedule_message" | "set_reminder" => (
                         "Schedule reminder behavior. Modes: notify (default, sends message at due time), defer (run task prompt at due time via agent), both (notify and defer).",
-                        r#"{"task": {"type":"string","description":"Reminder text or deferred task prompt"}, "schedule": {"type":"object","description":"Structured schedule object. Examples: {\"kind\":\"at\",\"at\":\"2026-08-28T19:00:00+05:30\"}, {\"kind\":\"every\",\"seconds\":120}, {\"kind\":\"daily\",\"hour\":19,\"minute\":30,\"timezone\":\"Asia/Kolkata\"}, {\"kind\":\"weekly\",\"weekday\":\"sat\",\"hour\":11,\"minute\":0,\"interval_weeks\":2,\"timezone\":\"Asia/Kolkata\"}, {\"kind\":\"cron\",\"expr\":\"0 30 19 * * *\",\"timezone\":\"Asia/Kolkata\"}"}, "mode": {"type":"string","enum":["notify","defer","both"],"description":"Execution mode"}, "deferred_prompt": {"type":"string","description":"Optional task prompt executed at trigger time when mode is defer/both"}, "agent_id": {"type":"string","description":"Agent to execute deferred task with"}}"#,
+                        r#"{"type":"object","properties":{"task": {"type":"string","description":"Reminder text or deferred task prompt"}, "schedule": {"type":"object","description":"Structured schedule object. Examples: {\"kind\":\"at\",\"at\":\"2026-08-28T19:00:00+05:30\"}, {\"kind\":\"every\",\"seconds\":120}, {\"kind\":\"daily\",\"hour\":19,\"minute\":30,\"timezone\":\"Asia/Kolkata\"}, {\"kind\":\"weekly\",\"weekday\":\"sat\",\"hour\":11,\"minute\":0,\"interval_weeks\":2,\"timezone\":\"Asia/Kolkata\"}, {\"kind\":\"cron\",\"expr\":\"0 30 19 * * *\",\"timezone\":\"Asia/Kolkata\"}"}, "mode": {"type":"string","enum":["notify","defer","both"],"description":"Execution mode"}, "deferred_prompt": {"type":"string","description":"Optional task prompt executed at trigger time when mode is defer/both"}, "agent_id": {"type":"string","description":"Agent to execute deferred task with"}},"required":["task","schedule"],"additionalProperties":false}"#,
                     ),
                     _ => ("Execute a tool operation.", "{}"),
                 };
@@ -503,6 +1031,8 @@ async fn actual_main() {
     }
 
     for tool_name in [
+        "register_external_compat_tool",
+        "register_remote_tool",
         "browser_profile_create",
         "browser_profile_list",
         "browser_profile_use",
@@ -567,9 +1097,18 @@ async fn actual_main() {
         tie_break_gap: config.router.tie_break_gap,
     };
     let router_index = router.build_index(route_cfg);
+    aria_intelligence::install_provider_transport_config(
+        aria_intelligence::ProviderTransportConfig {
+            response_start_timeout: Duration::from_millis(config.llm.first_token_timeout_ms.max(1)),
+        },
+    );
     let llm_pool = LlmBackendPool::new(
         vec!["primary".into(), "fallback".into()],
         Duration::from_secs(30),
+    )
+    .with_provider_circuit_breaker(
+        Duration::from_millis(config.llm.provider_circuit_breaker_cooldown_ms.max(1)),
+        config.llm.provider_circuit_breaker_failure_threshold.max(1),
     );
     // Initialize Credential Vault
     let master_key_raw = config.runtime.master_key.clone().unwrap_or_else(|| {
@@ -607,6 +1146,31 @@ async fn actual_main() {
 
     let registry = Arc::new(Mutex::new(ProviderRegistry::new()));
     {
+        let sessions_dir = std::path::PathBuf::from(&config.ssmu.sessions_dir);
+        let provider_egress_broker = aria_intelligence::EgressCredentialBroker::new()
+            .with_audit_sink(move |record| {
+                let outcome = match record.outcome {
+                    aria_intelligence::EgressSecretOutcome::Allowed => {
+                        aria_core::SecretUsageOutcome::Allowed
+                    }
+                    aria_intelligence::EgressSecretOutcome::Denied => {
+                        aria_core::SecretUsageOutcome::Denied
+                    }
+                };
+                let _ = RuntimeStore::for_sessions_dir(&sessions_dir).append_secret_usage_audit(
+                    &aria_core::SecretUsageAuditRecord {
+                        audit_id: uuid::Uuid::new_v4().to_string(),
+                        agent_id: "system".into(),
+                        session_id: None,
+                        tool_name: record.scope,
+                        key_name: record.key_name,
+                        target_domain: record.target_domain,
+                        outcome,
+                        detail: record.detail,
+                        created_at_us: chrono::Utc::now().timestamp_micros() as u64,
+                    },
+                );
+            });
         let mut reg = registry.lock().await;
         reg.register(Arc::new(backends::ollama::OllamaProvider {
             base_url: config.runtime.ollama_host.clone(),
@@ -673,18 +1237,22 @@ async fn actual_main() {
             api_key: openrouter_key,
             site_url: "aria-x".into(),
             site_title: "ARIA-X".into(),
+            egress_broker: Some(provider_egress_broker.clone()),
         }));
         reg.register(Arc::new(backends::openai::OpenAiProvider {
             api_key: openai_key,
             base_url: "https://api.openai.com/v1".into(),
+            egress_broker: Some(provider_egress_broker.clone()),
         }));
         reg.register(Arc::new(backends::anthropic::AnthropicProvider {
             api_key: anthropic_key,
             base_url: "https://api.anthropic.com/v1".into(),
+            egress_broker: Some(provider_egress_broker.clone()),
         }));
         reg.register(Arc::new(backends::gemini::GeminiProvider {
             api_key: gemini_key,
             base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+            egress_broker: Some(provider_egress_broker),
         }));
     }
 
@@ -829,9 +1397,9 @@ async fn actual_main() {
             let _ = session_memory.save_to_sqlite(&session_db_path);
         }
     }
-    // Build dynamic PageIndex: one node per loaded agent + bootstrap system nodes
-    let page_index = build_dynamic_page_index(&agent_store);
-    let page_index = Arc::new(page_index);
+    // Build dynamic capability index: one node per loaded agent + bootstrap system nodes
+    let capability_index = build_dynamic_capability_index(&agent_store);
+    let capability_index = Arc::new(capability_index);
     let vector_store = Arc::new(vector_store);
     let session_tool_caches: Arc<SessionToolCacheStore> = Arc::new(SessionToolCacheStore::new(
         config.runtime.session_tool_cache_max_entries,
@@ -844,19 +1412,29 @@ async fn actual_main() {
     hooks.register_message_pre(Box::new(|req, vector_store, page_index| {
         let request_text = request_text_from_content(&req.content);
         Box::pin(async move {
-            let hybrid =
-                HybridMemoryEngine::new(&vector_store, &page_index, QueryPlannerConfig::default())
-                    .retrieve(&request_text, &local_embed(&request_text, 64), 3, 3);
+            let document_index = build_document_index_from_vector_store(&vector_store);
+            let hybrid = HybridMemoryEngine::new(
+                &vector_store,
+                document_index.as_tree(),
+                QueryPlannerConfig::default(),
+            )
+            .retrieve(&request_text, &local_embed(&request_text, 64), 3, 3);
             let vector_context = hybrid.vector_context.join("\n");
-            let page_context = hybrid
-                .page_context
+            let capability_context = page_index
+                .retrieve_relevant(&request_text, 3)
+                .into_iter()
+                .map(|n| format!("- {}: {}", n.title, n.summary))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let document_context = hybrid
+                .document_context
                 .into_iter()
                 .map(|n| format!("- {}: {}", n.title, n.summary))
                 .collect::<Vec<_>>()
                 .join("\n");
             let rag_context = format!(
-                "Plan: {:?}\nVector Context:\n{}\n\nPageIndex Context:\n{}",
-                hybrid.plan, vector_context, page_context
+                "Plan: {:?}\nVector Context:\n{}\n\nCapability Index Context:\n{}\n\nDocument Index Context:\n{}",
+                hybrid.plan, vector_context, capability_context, document_context
             );
             Ok(rag_context)
         })
@@ -1061,7 +1639,7 @@ async fn actual_main() {
     let sc_agent_store = Arc::clone(&agent_store);
     let sc_tool_registry = Arc::clone(&tool_registry);
     let sc_session_memory = session_memory.clone();
-    let sc_page_index = Arc::clone(&page_index);
+    let sc_page_index = Arc::clone(&capability_index);
     let sc_vector_store = Arc::clone(&vector_store);
     let sc_keyword_index = Arc::clone(&keyword_index);
     let sc_firewall = Arc::clone(&firewall);
@@ -1128,11 +1706,18 @@ async fn actual_main() {
 
                         let session_id = execution_session_id_for_scheduled_event(&ev);
                         let session_uuid = uuid::Uuid::from_bytes(session_id);
-                        let _ = sc_session_memory.update_overrides(
+                        if let Err(err) = sc_session_memory.update_overrides(
                             session_uuid,
                             Some(ev.agent_id.clone()),
                             None,
-                        );
+                        ) {
+                            warn!(
+                                session_id = %session_uuid,
+                                agent_id = %ev.agent_id,
+                                error = %err,
+                                "failed to persist scheduled-event session override"
+                            );
+                        }
 
                         let req = aria_core::AgentRequest {
                             request_id: *uuid::Uuid::new_v4().as_bytes(),
@@ -1319,7 +1904,7 @@ async fn actual_main() {
     let ar_agent_store = Arc::clone(&agent_store);
     let ar_tool_registry = Arc::clone(&tool_registry);
     let ar_session_memory = session_memory.clone();
-    let ar_page_index = Arc::clone(&page_index);
+    let ar_page_index = Arc::clone(&capability_index);
     let ar_vector_store = Arc::clone(&vector_store);
     let ar_keyword_index = Arc::clone(&keyword_index);
     let ar_firewall = Arc::clone(&firewall);
@@ -1360,11 +1945,18 @@ async fn actual_main() {
                 async move {
                     let child_session_id = agent_run_session_id(&run.run_id);
                     let child_session_uuid = uuid::Uuid::from_bytes(child_session_id);
-                    let _ = ar_session_memory.update_overrides(
+                    if let Err(err) = ar_session_memory.update_overrides(
                         child_session_uuid,
                         Some(run.agent_id.clone()),
                         None,
-                    );
+                    ) {
+                        warn!(
+                            session_id = %child_session_uuid,
+                            agent_id = %run.agent_id,
+                            error = %err,
+                            "failed to persist child-run session override"
+                        );
+                    }
                     let req = aria_core::AgentRequest {
                         request_id: *uuid::Uuid::new_v4().as_bytes(),
                         session_id: child_session_id,
@@ -1489,6 +2081,8 @@ async fn actual_main() {
         return;
     }
 
+    let mut adapter_handles = Vec::new();
+
     if !cli_enabled {
         if telegram_enabled {
             let tg_config = Arc::clone(&shared_config);
@@ -1500,7 +2094,7 @@ async fn actual_main() {
             let tg_agent_store = (*agent_store).clone();
             let tg_tool_registry = (*tool_registry).clone();
             let tg_session_memory = session_memory.clone();
-            let tg_page_index = Arc::clone(&page_index);
+            let tg_page_index = Arc::clone(&capability_index);
             let tg_vector_store = Arc::clone(&vector_store);
             let tg_keyword_index = Arc::clone(&keyword_index);
             let tg_caches = Arc::clone(&session_tool_caches);
@@ -1508,7 +2102,8 @@ async fn actual_main() {
             let tg_vault = Arc::clone(&vault);
             let tg_tx_cron = tx_cron.clone();
             let tg_registry = Arc::clone(&registry);
-            spawn_supervised_adapter("telegram", GatewayChannel::Telegram, move || {
+            let tg_shutdown = Arc::clone(&shutdown_coordinator);
+            adapter_handles.push(spawn_supervised_adapter("telegram", GatewayChannel::Telegram, tg_shutdown, move || {
                 run_telegram_gateway(
                     Arc::clone(&tg_config),
                     tg_runtime_config_path.clone(),
@@ -1528,7 +2123,7 @@ async fn actual_main() {
                     tg_tx_cron.clone(),
                     Arc::clone(&tg_registry),
                 )
-            });
+            }));
         }
         if websocket_enabled {
             let ws_config = Arc::clone(&shared_config);
@@ -1539,7 +2134,7 @@ async fn actual_main() {
             let ws_agent_store = (*agent_store).clone();
             let ws_tool_registry = (*tool_registry).clone();
             let ws_session_memory = session_memory.clone();
-            let ws_page_index = Arc::clone(&page_index);
+            let ws_page_index = Arc::clone(&capability_index);
             let ws_vector_store = Arc::clone(&vector_store);
             let ws_keyword_index = Arc::clone(&keyword_index);
             let ws_caches = Arc::clone(&session_tool_caches);
@@ -1549,7 +2144,8 @@ async fn actual_main() {
             let ws_registry = Arc::clone(&registry);
             let ws_session_locks = Arc::clone(&session_locks);
             let ws_embed_semaphore = Arc::clone(&embed_semaphore);
-            spawn_supervised_adapter("websocket", GatewayChannel::WebSocket, move || {
+            let ws_shutdown = Arc::clone(&shutdown_coordinator);
+            adapter_handles.push(spawn_supervised_adapter("websocket", GatewayChannel::WebSocket, ws_shutdown, move || {
                 run_websocket_gateway(
                     Arc::clone(&ws_config),
                     ws_router_index.clone(),
@@ -1570,7 +2166,7 @@ async fn actual_main() {
                     Arc::clone(&ws_session_locks),
                     Arc::clone(&ws_embed_semaphore),
                 )
-            });
+            }));
         }
         if whatsapp_enabled {
             let wa_config = Arc::clone(&shared_config);
@@ -1581,7 +2177,7 @@ async fn actual_main() {
             let wa_agent_store = (*agent_store).clone();
             let wa_tool_registry = (*tool_registry).clone();
             let wa_session_memory = session_memory.clone();
-            let wa_page_index = Arc::clone(&page_index);
+            let wa_page_index = Arc::clone(&capability_index);
             let wa_vector_store = Arc::clone(&vector_store);
             let wa_keyword_index = Arc::clone(&keyword_index);
             let wa_caches = Arc::clone(&session_tool_caches);
@@ -1591,7 +2187,8 @@ async fn actual_main() {
             let wa_registry = Arc::clone(&registry);
             let wa_session_locks = Arc::clone(&session_locks);
             let wa_embed_semaphore = Arc::clone(&embed_semaphore);
-            spawn_supervised_adapter("whatsapp", GatewayChannel::WhatsApp, move || {
+            let wa_shutdown = Arc::clone(&shutdown_coordinator);
+            adapter_handles.push(spawn_supervised_adapter("whatsapp", GatewayChannel::WhatsApp, wa_shutdown, move || {
                 run_whatsapp_gateway(
                     Arc::clone(&wa_config),
                     wa_router_index.clone(),
@@ -1612,11 +2209,15 @@ async fn actual_main() {
                     Arc::clone(&wa_session_locks),
                     Arc::clone(&wa_embed_semaphore),
                 )
-            });
+            }));
         }
 
         if telegram_enabled || websocket_enabled || whatsapp_enabled {
-            core::future::pending::<()>().await;
+            wait_for_runtime_shutdown(Arc::clone(&shutdown_coordinator)).await;
+            for handle in adapter_handles {
+                let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            }
+            drop(runtime_pid_guard);
             return;
         }
     }
@@ -1631,7 +2232,7 @@ async fn actual_main() {
         let tg_agent_store = (*agent_store).clone();
         let tg_tool_registry = (*tool_registry).clone();
         let tg_session_memory = session_memory.clone();
-        let tg_page_index = Arc::clone(&page_index);
+        let tg_page_index = Arc::clone(&capability_index);
         let tg_vector_store = Arc::clone(&vector_store);
         let tg_keyword_index = Arc::clone(&keyword_index);
         let tg_caches = Arc::clone(&session_tool_caches);
@@ -1639,7 +2240,8 @@ async fn actual_main() {
         let tg_vault = Arc::clone(&vault);
         let tg_tx_cron = tx_cron.clone();
         let tg_registry = Arc::clone(&registry);
-        spawn_supervised_adapter("telegram", GatewayChannel::Telegram, move || {
+        let tg_shutdown = Arc::clone(&shutdown_coordinator);
+        adapter_handles.push(spawn_supervised_adapter("telegram", GatewayChannel::Telegram, tg_shutdown, move || {
             run_telegram_gateway(
                 Arc::clone(&tg_config),
                 tg_runtime_config_path.clone(),
@@ -1659,7 +2261,7 @@ async fn actual_main() {
                 tg_tx_cron.clone(),
                 Arc::clone(&tg_registry),
             )
-        });
+        }));
     }
 
     if websocket_enabled {
@@ -1671,7 +2273,7 @@ async fn actual_main() {
         let ws_agent_store = (*agent_store).clone();
         let ws_tool_registry = (*tool_registry).clone();
         let ws_session_memory = session_memory.clone();
-        let ws_page_index = Arc::clone(&page_index);
+        let ws_page_index = Arc::clone(&capability_index);
         let ws_vector_store = Arc::clone(&vector_store);
         let ws_keyword_index = Arc::clone(&keyword_index);
         let ws_caches = Arc::clone(&session_tool_caches);
@@ -1681,7 +2283,8 @@ async fn actual_main() {
         let ws_registry = Arc::clone(&registry);
         let ws_session_locks = Arc::clone(&session_locks);
         let ws_embed_semaphore = Arc::clone(&embed_semaphore);
-        spawn_supervised_adapter("websocket", GatewayChannel::WebSocket, move || {
+        let ws_shutdown = Arc::clone(&shutdown_coordinator);
+        adapter_handles.push(spawn_supervised_adapter("websocket", GatewayChannel::WebSocket, ws_shutdown, move || {
             run_websocket_gateway(
                 Arc::clone(&ws_config),
                 ws_router_index.clone(),
@@ -1702,7 +2305,7 @@ async fn actual_main() {
                 Arc::clone(&ws_session_locks),
                 Arc::clone(&ws_embed_semaphore),
             )
-        });
+        }));
     }
 
     if whatsapp_enabled {
@@ -1714,7 +2317,7 @@ async fn actual_main() {
         let wa_agent_store = (*agent_store).clone();
         let wa_tool_registry = (*tool_registry).clone();
         let wa_session_memory = session_memory.clone();
-        let wa_page_index = Arc::clone(&page_index);
+        let wa_page_index = Arc::clone(&capability_index);
         let wa_vector_store = Arc::clone(&vector_store);
         let wa_keyword_index = Arc::clone(&keyword_index);
         let wa_caches = Arc::clone(&session_tool_caches);
@@ -1724,7 +2327,8 @@ async fn actual_main() {
         let wa_registry = Arc::clone(&registry);
         let wa_session_locks = Arc::clone(&session_locks);
         let wa_embed_semaphore = Arc::clone(&embed_semaphore);
-        spawn_supervised_adapter("whatsapp", GatewayChannel::WhatsApp, move || {
+        let wa_shutdown = Arc::clone(&shutdown_coordinator);
+        adapter_handles.push(spawn_supervised_adapter("whatsapp", GatewayChannel::WhatsApp, wa_shutdown, move || {
             run_whatsapp_gateway(
                 Arc::clone(&wa_config),
                 wa_router_index.clone(),
@@ -1745,7 +2349,7 @@ async fn actual_main() {
                 Arc::clone(&wa_session_locks),
                 Arc::clone(&wa_embed_semaphore),
             )
-        });
+        }));
     }
 
     if !cli_enabled {
@@ -1774,7 +2378,7 @@ async fn actual_main() {
     let worker_agent_store = (*agent_store).clone();
     let worker_tool_registry = (*tool_registry).clone();
     let worker_session_memory = session_memory.clone();
-    let worker_page_index = Arc::clone(&page_index);
+    let worker_page_index = Arc::clone(&capability_index);
     let worker_vector_store = Arc::clone(&vector_store);
     let worker_keyword_index = Arc::clone(&keyword_index);
     let worker_firewall = Arc::clone(&firewall);
@@ -1868,6 +2472,7 @@ async fn actual_main() {
     loop {
         let req = tokio::select! {
             _ = &mut shutdown => {
+                shutdown_coordinator.signal_shutdown();
                 break;
             }
             req_res = gateway.receive() => {
@@ -1876,6 +2481,7 @@ async fn actual_main() {
                         let request_text = request_text_from_content(&r.content);
                         if request_text.eq_ignore_ascii_case("exit") {
                             info!("Exiting...");
+                            shutdown_coordinator.signal_shutdown();
                             break;
                         }
                         r
@@ -1948,6 +2554,10 @@ async fn actual_main() {
     for worker in cli_ingress_workers {
         let _ = worker.await;
     }
+    shutdown_coordinator.signal_shutdown();
+    for handle in adapter_handles {
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
 
     // Cleanup
     if let Ok(saved) = session_memory.save_to_sqlite(session_runtime_db_path(Path::new(
@@ -1956,9 +2566,10 @@ async fn actual_main() {
         info!(saved = saved, "Persisted sessions");
     }
     drop(session_memory);
-    drop(page_index);
+    drop(capability_index);
     drop(vector_store);
     drop(router);
+    drop(runtime_pid_guard);
     info!("Shutdown complete. Goodbye!");
 }
 
@@ -1983,6 +2594,549 @@ fn run_channel_onboarding_command(
         },
         _ => Err("Usage: channels <add|list|status|remove> [channel]".into()),
     })
+}
+
+fn runtime_pid_path() -> Result<PathBuf, String> {
+    let dirs = project_dirs().ok_or_else(|| "unable to resolve application data directory".to_string())?;
+    let run_dir = dirs.data_local_dir().join("run");
+    std::fs::create_dir_all(&run_dir)
+        .map_err(|e| format!("create runtime dir '{}' failed: {}", run_dir.display(), e))?;
+    Ok(run_dir.join("aria-x.pid"))
+}
+
+struct RuntimePidGuard {
+    path: PathBuf,
+}
+
+impl Drop for RuntimePidGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn register_runtime_pid(config_path: &Path) -> Result<RuntimePidGuard, String> {
+    let path = runtime_pid_path()?;
+    let record = RuntimePidRecord {
+        pid: std::process::id(),
+        config_path: config_path.display().to_string(),
+    };
+    let json = serde_json::to_string(&record)
+        .map_err(|e| format!("serialize runtime pid record failed: {}", e))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("write runtime pid file '{}' failed: {}", path.display(), e))?;
+    Ok(RuntimePidGuard { path })
+}
+
+fn read_runtime_pid_record() -> Result<Option<RuntimePidRecord>, String> {
+    let path = runtime_pid_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read runtime pid file '{}' failed: {}", path.display(), e))?;
+    let record = serde_json::from_str::<RuntimePidRecord>(&content)
+        .map_err(|e| format!("parse runtime pid file '{}' failed: {}", path.display(), e))?;
+    Ok(Some(record))
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+fn run_process_control_command(args: &[String]) -> Option<Result<String, String>> {
+    match args.get(1).map(String::as_str) {
+        Some("status") => Some(render_runtime_status()),
+        Some("stop") => Some(stop_runtime_process()),
+        _ => None,
+    }
+}
+
+fn render_runtime_status() -> Result<String, String> {
+    let Some(record) = read_runtime_pid_record()? else {
+        return Ok("ARIA-X is not running.".into());
+    };
+    if process_is_alive(record.pid) {
+        Ok(format!(
+            "ARIA-X is running.\npid: {}\nconfig: {}",
+            record.pid, record.config_path
+        ))
+    } else {
+        let path = runtime_pid_path()?;
+        let _ = std::fs::remove_file(&path);
+        Ok(format!(
+            "ARIA-X is not running, but a stale pid file was found and removed.\nstale_pid: {}\nconfig: {}",
+            record.pid, record.config_path
+        ))
+    }
+}
+
+fn stop_runtime_process() -> Result<String, String> {
+    let Some(record) = read_runtime_pid_record()? else {
+        return Ok("ARIA-X is not running.".into());
+    };
+    if !process_is_alive(record.pid) {
+        let path = runtime_pid_path()?;
+        let _ = std::fs::remove_file(&path);
+        return Ok(format!(
+            "ARIA-X was not running. Removed stale pid file for pid {}.",
+            record.pid
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(record.pid.to_string())
+            .status()
+            .map_err(|e| format!("failed to send SIGTERM to {}: {}", record.pid, e))?;
+        if !status.success() {
+            return Err(format!(
+                "failed to stop pid {} using SIGTERM (status: {})",
+                record.pid, status
+            ));
+        }
+        Ok(format!("Sent SIGTERM to ARIA-X process {}.", record.pid))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = record;
+        Err("`aria-x stop` is currently only implemented on Unix-like systems.".into())
+    }
+}
+
+async fn wait_for_runtime_shutdown(shutdown: Arc<ShutdownCoordinator>) {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received Ctrl+C — shutting down gracefully");
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM — shutting down gracefully");
+                }
+            }
+        } else {
+            tokio::signal::ctrl_c().await.ok();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.ok();
+    }
+    shutdown.signal_shutdown();
+}
+
+fn run_stt_management_command(
+    config: &ResolvedAppConfig,
+    args: &[String],
+) -> Option<Result<String, String>> {
+    match (args.get(1).map(String::as_str), args.get(2).map(String::as_str)) {
+        (Some("doctor"), None) => Some(Ok(render_doctor_summary(config))),
+        (Some("doctor"), Some("stt")) => Some(Ok(render_stt_doctor(config))),
+        (Some("doctor"), Some("env")) => Some(Ok(render_env_doctor(config))),
+        (Some("doctor"), Some("gateway")) => Some(Ok(render_gateway_doctor(config))),
+        (Some("doctor"), Some("browser")) => Some(Ok(render_browser_doctor(config))),
+        (Some("setup"), Some("stt")) => {
+            let wants_local = args.iter().any(|arg| arg == "--local" || arg == "local");
+            Some(if wants_local {
+                setup_local_stt_env(config)
+            } else {
+                Err("Usage: aria-x setup stt --local".into())
+            })
+        }
+        _ => None,
+    }
+}
+
+fn render_doctor_summary(config: &ResolvedAppConfig) -> String {
+    let stt = crate::stt::inspect_stt_status(config);
+    let adapters = configured_gateway_adapters(&config.gateway);
+    let pid_status = render_runtime_status().unwrap_or_else(|err| format!("unavailable ({})", err));
+    let install_bin_dir = default_install_bin_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "<unavailable>".into());
+    let install_target = default_install_bin_dir()
+        .map(|path| install_target_path(&path).display().to_string())
+        .unwrap_or_else(|_| "<unavailable>".into());
+    let current_exe = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "<unavailable>".into());
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let install_on_path = default_install_bin_dir()
+        .map(|path| path_contains_dir(&path_var, &path))
+        .unwrap_or(false);
+
+    format!(
+        "ARIA-X doctor\n\
+         runtime_status:\n{}\n\
+         config_path: {}\n\
+         llm_backend: {}\n\
+         llm_model: {}\n\
+         configured_channels: {}\n\
+         sessions_dir: {}\n\
+         install_bin_dir: {}\n\
+         install_target: {}\n\
+         install_bin_on_path: {}\n\
+         current_executable: {}\n\
+         env_file_present: {}\n\
+         stt_mode: {}\n\
+         stt_effective_mode: {}\n\
+         stt_reason: {}\n\
+         stt_local_ready: {}\n\
+         browser_automation_configured: {}\n",
+        indent_block(&pid_status, "  "),
+        config.path.display(),
+        config.llm.backend,
+        config.llm.model,
+        adapters.join(", "),
+        config.ssmu.sessions_dir,
+        install_bin_dir,
+        install_target,
+        install_on_path,
+        current_exe,
+        Path::new(".env").is_file(),
+        stt.configured_mode,
+        stt.effective_mode,
+        stt.reason,
+        stt.whisper_model_exists && stt.whisper_bin_available && stt.ffmpeg_available,
+        config
+            .runtime
+            .browser_automation_bin
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+    )
+}
+
+fn indent_block(text: &str, prefix: &str) -> String {
+    text.lines()
+        .map(|line| format!("{}{}", prefix, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_env_doctor(config: &ResolvedAppConfig) -> String {
+    let runtime = &config.runtime;
+    format!(
+        "Environment doctor\n\
+         config_path: {}\n\
+         env_file_present: {}\n\
+         rust_log_present: {}\n\
+         telegram_token_present: {}\n\
+         openrouter_api_key_present: {}\n\
+         openai_api_key_present: {}\n\
+         anthropic_api_key_present: {}\n\
+         gemini_api_key_present: {}\n\
+         whisper_model_present: {}\n\
+         whisper_bin: {}\n\
+         ffmpeg_bin: {}\n\
+         browser_automation_bin_present: {}\n\
+         browser_automation_allowlist_present: {}\n\
+         master_key_present: {}\n",
+        config.path.display(),
+        Path::new(".env").is_file(),
+        runtime
+            .rust_log
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+        runtime.telegram_bot_token.is_some(),
+        runtime.openrouter_api_key.is_some(),
+        runtime.openai_api_key.is_some(),
+        runtime.anthropic_api_key.is_some(),
+        runtime.gemini_api_key.is_some(),
+        runtime.whisper_cpp_model.is_some(),
+        runtime.whisper_cpp_bin,
+        runtime.ffmpeg_bin,
+        runtime.browser_automation_bin.is_some(),
+        !runtime.browser_automation_sha256_allowlist.is_empty(),
+        runtime.master_key.is_some(),
+    )
+}
+
+fn render_gateway_doctor(config: &ResolvedAppConfig) -> String {
+    let adapters = configured_gateway_adapters(&config.gateway);
+    format!(
+        "Gateway doctor\n\
+         configured_channels: {}\n\
+         session_scope_policy: {:?}\n\
+         telegram_mode: {}\n\
+         telegram_port: {}\n\
+         telegram_token_present: {}\n\
+         websocket_bind: {}:{}\n\
+         whatsapp_bind: {}:{}\n\
+         whatsapp_outbound_configured: {}\n\
+         fanout_rules: {}\n",
+        adapters.join(", "),
+        config.gateway.session_scope_policy,
+        config.gateway.telegram_mode,
+        config.gateway.telegram_port,
+        !config.gateway.telegram_token.trim().is_empty(),
+        config.gateway.websocket_bind_address,
+        config.gateway.websocket_port,
+        config.gateway.whatsapp_bind_address,
+        config.gateway.whatsapp_port,
+        config.gateway.whatsapp_outbound_url.is_some(),
+        config.gateway.fanout.len(),
+    )
+}
+
+fn render_browser_doctor(config: &ResolvedAppConfig) -> String {
+    let runtime = &config.runtime;
+    format!(
+        "Browser doctor\n\
+         chromium_bin: {}\n\
+         chrome_bin: {}\n\
+         edge_bin: {}\n\
+         safari_bin: {}\n\
+         automation_bin: {}\n\
+         automation_allowlist_present: {}\n\
+         automation_os_containment: {}\n\
+         artifact_scan_bin: {}\n\
+         browser_artifact_max_count: {}\n\
+         browser_artifact_max_total_bytes: {}\n",
+        runtime.browser_chromium_bin.as_deref().unwrap_or("<unset>"),
+        runtime.browser_chrome_bin.as_deref().unwrap_or("<unset>"),
+        runtime.browser_edge_bin.as_deref().unwrap_or("<unset>"),
+        runtime.browser_safari_bin.as_deref().unwrap_or("<unset>"),
+        runtime.browser_automation_bin.as_deref().unwrap_or("<unset>"),
+        !runtime.browser_automation_sha256_allowlist.is_empty(),
+        runtime.browser_automation_os_containment,
+        runtime.artifact_scan_bin.as_deref().unwrap_or("<unset>"),
+        runtime.browser_artifact_max_count,
+        runtime.browser_artifact_max_bytes,
+    )
+}
+
+fn render_stt_doctor(config: &ResolvedAppConfig) -> String {
+    let status = crate::stt::inspect_stt_status(config);
+    let model_path = status
+        .whisper_model_path
+        .as_deref()
+        .unwrap_or("<unset>");
+    format!(
+        "STT doctor\n\
+         configured_mode: {}\n\
+         effective_mode: {}\n\
+         reason: {}\n\
+         whisper_model: {}\n\
+         whisper_model_exists: {}\n\
+         whisper_bin: {}\n\
+         whisper_bin_available: {}\n\
+         ffmpeg_bin: {}\n\
+         ffmpeg_available: {}\n\
+         cloud_endpoint_configured: {}\n\
+         cloud_fallback_enabled: {}\n\
+         language_hint: {}\n",
+        status.configured_mode,
+        status.effective_mode,
+        status.reason,
+        model_path,
+        status.whisper_model_exists,
+        status.whisper_bin,
+        status.whisper_bin_available,
+        status.ffmpeg_bin,
+        status.ffmpeg_available,
+        status.cloud_endpoint_configured,
+        status.cloud_fallback_enabled,
+        status.language_hint.as_deref().unwrap_or("<auto>"),
+    )
+}
+
+fn setup_local_stt_env(config: &ResolvedAppConfig) -> Result<String, String> {
+    let mut bootstrap_steps = Vec::new();
+    let status = crate::stt::inspect_stt_status(config);
+    let default_model_path = default_local_whisper_model_path()?;
+    if !status.whisper_bin_available || !status.ffmpeg_available {
+        bootstrap_steps.extend(bootstrap_local_stt_binaries()?);
+    }
+    let model_path = status
+        .whisper_model_path
+        .clone()
+        .unwrap_or_else(|| default_model_path.to_string_lossy().to_string());
+    if !PathBuf::from(&model_path).is_file() {
+        bootstrap_steps.push(download_default_local_whisper_model(Path::new(&model_path))?);
+    }
+
+    let whisper_bin = resolve_executable_path("whisper-cli")
+        .map(|path| path.to_string_lossy().to_string())
+        .or_else(|| {
+            let configured = PathBuf::from(&status.whisper_bin);
+            configured.is_file().then(|| configured.to_string_lossy().to_string())
+        })
+        .ok_or_else(|| "Whisper binary could not be resolved after bootstrap.".to_string())?;
+    let ffmpeg_bin = resolve_executable_path("ffmpeg")
+        .map(|path| path.to_string_lossy().to_string())
+        .or_else(|| {
+            let configured = PathBuf::from(&status.ffmpeg_bin);
+            configured.is_file().then(|| configured.to_string_lossy().to_string())
+        })
+        .ok_or_else(|| "ffmpeg binary could not be resolved after bootstrap.".to_string())?;
+
+    let env_path = PathBuf::from(".env");
+    upsert_env_file_entries(
+        &env_path,
+        &[
+            ("WHISPER_CPP_MODEL", model_path.as_str()),
+            ("WHISPER_CPP_BIN", whisper_bin.as_str()),
+            ("FFMPEG_BIN", ffmpeg_bin.as_str()),
+        ],
+    )?;
+
+    let steps = if bootstrap_steps.is_empty() {
+        "bootstrap_steps: none (existing local STT runtime detected)".to_string()
+    } else {
+        format!("bootstrap_steps:\n- {}", bootstrap_steps.join("\n- "))
+    };
+    Ok(format!(
+        "Configured local STT in {}.\n\
+         mode_hint: keep gateway.stt_mode=\"auto\" for auto-detect, or set \"local\" for strict local mode.\n\
+         {}\n\
+         whisper_model: {}\n\
+         whisper_bin: {}\n\
+         ffmpeg_bin: {}",
+        env_path.display(),
+        steps,
+        model_path,
+        whisper_bin,
+        ffmpeg_bin
+    ))
+}
+
+fn default_local_whisper_model_path() -> Result<PathBuf, String> {
+    let user_dirs = directories::UserDirs::new()
+        .ok_or_else(|| "unable to resolve user home directory for local STT setup".to_string())?;
+    Ok(user_dirs
+        .home_dir()
+        .join(".aria")
+        .join("models")
+        .join("whisper")
+        .join("ggml-small.bin"))
+}
+
+fn default_local_whisper_model_url() -> &'static str {
+    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+}
+
+fn resolve_executable_path(command: &str) -> Option<PathBuf> {
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(command);
+    if path.is_absolute() || path.components().count() > 1 {
+        return path.is_file().then_some(path);
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|entry| entry.join(command))
+        .find(|candidate| candidate.is_file())
+}
+
+fn run_bootstrap_command(program: &str, args: &[&str]) -> Result<(), String> {
+    let status = std::process::Command::new(program)
+        .args(args)
+        .status()
+        .map_err(|e| format!("failed to run '{} {}': {}", program, args.join(" "), e))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "command failed: {} {} (status: {})",
+            program,
+            args.join(" "),
+            status
+        ))
+    }
+}
+
+fn bootstrap_local_stt_binaries() -> Result<Vec<String>, String> {
+    if resolve_executable_path("ffmpeg").is_some() && resolve_executable_path("whisper-cli").is_some()
+    {
+        return Ok(Vec::new());
+    }
+    if resolve_executable_path("brew").is_some() {
+        run_bootstrap_command("brew", &["install", "ffmpeg", "whisper-cpp"])?;
+        return Ok(vec!["installed ffmpeg and whisper-cpp via Homebrew".to_string()]);
+    }
+    Err(
+        "automatic local STT bootstrap currently supports Homebrew-based environments only. Install ffmpeg and whisper.cpp, then rerun `aria-x setup stt --local`."
+            .to_string(),
+    )
+}
+
+fn download_default_local_whisper_model(model_path: &Path) -> Result<String, String> {
+    let parent = model_path
+        .parent()
+        .ok_or_else(|| format!("model path '{}' has no parent directory", model_path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("create model directory '{}' failed: {}", parent.display(), e))?;
+    if resolve_executable_path("curl").is_some() {
+        run_bootstrap_command(
+            "curl",
+            &[
+                "-L",
+                default_local_whisper_model_url(),
+                "-o",
+                model_path
+                    .to_str()
+                    .ok_or_else(|| format!("invalid model path '{}'", model_path.display()))?,
+            ],
+        )?;
+        return Ok(format!(
+            "downloaded default whisper model from {}",
+            default_local_whisper_model_url()
+        ));
+    }
+    Err(
+        "curl is required to download the default whisper model automatically. Install curl or download the model manually, then rerun `aria-x setup stt --local`."
+            .to_string(),
+    )
+}
+
+fn upsert_env_file_entries(path: &Path, entries: &[(&str, &str)]) -> Result<(), String> {
+    let mut lines = if path.exists() {
+        std::fs::read_to_string(path)
+            .map_err(|e| format!("read {} failed: {}", path.display(), e))?
+            .lines()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    for (key, value) in entries {
+        let prefix = format!("{}=", key);
+        if let Some(index) = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with(&prefix))
+        {
+            lines[index] = format!("{}={}", key, value);
+        } else {
+            lines.push(format!("{}={}", key, value));
+        }
+    }
+
+    let mut content = lines.join("\n");
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    std::fs::write(path, content).map_err(|e| format!("write {} failed: {}", path.display(), e))
 }
 
 fn list_configured_channels(config_path: &Path) -> Result<String, String> {
@@ -2104,7 +3258,7 @@ async fn process_cli_ingress_request(
     agent_store: &AgentConfigStore,
     tool_registry: &ToolManifestStore,
     session_memory: &aria_ssmu::SessionMemory,
-    page_index: &Arc<PageIndexTree>,
+    capability_index: &Arc<aria_ssmu::CapabilityIndex>,
     vector_store: &Arc<VectorStore>,
     keyword_index: &Arc<KeywordIndex>,
     firewall: &Arc<aria_safety::DfaFirewall>,
@@ -2150,7 +3304,7 @@ async fn process_cli_ingress_request(
         agent_store,
         tool_registry,
         session_memory,
-        page_index,
+        capability_index,
         vector_store,
         keyword_index,
         firewall,
@@ -2232,6 +3386,14 @@ fn register_discoverable_tool(
     owner_tag: &str,
 ) {
     let (desc, schema) = match tool_name {
+        "register_external_compat_tool" => (
+            "Register a local external compatibility tool that speaks the typed stdin/stdout JSON sidecar contract.",
+            r#"{"tool_name":{"type":"string"},"command":{"type":"array","items":{"type":"string"}},"description":{"type":"string"},"parameters_schema":{"type":"string"}}"#,
+        ),
+        "register_remote_tool" => (
+            "Register a remote HTTP tool endpoint that accepts a typed JSON envelope and returns a tool result envelope.",
+            r#"{"tool_name":{"type":"string"},"endpoint":{"type":"string"},"description":{"type":"string"},"parameters_schema":{"type":"string"}}"#,
+        ),
         "browser_profile_create" => (
             "Create a managed browser profile for later authenticated or read-only browsing.",
             r#"{"profile_id": {"type":"string","description":"Stable profile id"}, "display_name": {"type":"string","description":"Optional human-friendly name"}, "mode": {"type":"string","enum":["ephemeral","managed_persistent","attached_external","extension_bound"],"description":"Browser profile mode"}, "engine": {"type":"string","enum":["chromium","chrome","edge","safari_bridge"],"description":"Browser engine"}, "allowed_domains": {"type":"array","items":{"type":"string"}}, "auth_enabled": {"type":"boolean"}, "write_enabled": {"type":"boolean"}, "persistent": {"type":"boolean"}, "attached_source": {"type":"string"}, "extension_binding_id": {"type":"string"}}"#,
@@ -2607,13 +3769,15 @@ fn render_session_summary_for_channel(
     current_agent: Option<&str>,
     current_model: Option<&str>,
 ) -> ControlCommandOutput {
+    let agent_label = current_agent.unwrap_or("default");
+    let model_label = current_model.unwrap_or("default");
     match channel {
         GatewayChannel::Telegram => ControlCommandOutput {
             text: format!(
                 "<b>Session</b> <code>{}</code>\nagent_override={}\nmodel_override={}",
                 session_uuid,
-                current_agent.unwrap_or("<default>"),
-                current_model.unwrap_or("<default>"),
+                agent_label,
+                model_label,
             ),
             parse_mode: Some("HTML"),
             reply_markup: None,
@@ -2621,9 +3785,7 @@ fn render_session_summary_for_channel(
         _ => ControlCommandOutput {
             text: format!(
                 "Session {}\nagent_override={}\nmodel_override={}",
-                session_uuid,
-                current_agent.unwrap_or("<default>"),
-                current_model.unwrap_or("<default>"),
+                session_uuid, agent_label, model_label,
             ),
             parse_mode: None,
             reply_markup: None,
@@ -2747,6 +3909,32 @@ fn handle_shared_control_command(
                 current_model.as_deref(),
             ));
         }
+        aria_core::ControlIntent::ClearSession => {
+            let _ = session_memory.clear_history(&session_uuid);
+            let _ = persist_session_overrides(
+                session_memory,
+                req.session_id,
+                req.channel,
+                &req.user_id,
+                Some(String::new()),
+                Some(String::new()),
+            );
+            record_learning_reward(
+                &config.learning,
+                Path::new(&config.ssmu.sessions_dir),
+                req.request_id,
+                req.session_id,
+                RewardKind::OverrideApplied,
+                Some("session cleared".to_string()),
+                req.timestamp_us,
+            );
+            return Some(ControlCommandOutput {
+                text: "Session history cleared. Agent/model overrides were reset to default routing."
+                    .to_string(),
+                parse_mode: None,
+                reply_markup: None,
+            });
+        }
         aria_core::ControlIntent::ListApprovals => {
             let pending = list_cli_pending_approvals(
                 Path::new(&config.ssmu.sessions_dir),
@@ -2777,16 +3965,8 @@ fn handle_shared_control_command(
                     req.timestamp_us,
                 );
                 return Some(ControlCommandOutput {
-                    text: match req.channel {
-                        GatewayChannel::Telegram => {
-                            "Override cleared. Session is now using the default omni routing."
-                                .to_string()
-                        }
-                        _ => {
-                            "Override cleared. Session is now using the default omni routing."
-                                .to_string()
-                        }
-                    },
+                    text: "Agent/model override cleared. Session history was not cleared; use /session clear to reset the session."
+                        .to_string(),
                     parse_mode: None,
                     reply_markup: None,
                 });

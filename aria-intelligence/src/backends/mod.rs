@@ -1,15 +1,123 @@
 use super::{
-    append_tool_results_to_prompt, normalize_tool_schema, reduce_tool_schema_for_compat,
-    tool_is_compatible_with_model, CachedTool, ExecutedToolCall, LLMResponse, OrchestratorError,
+    append_tool_results_to_prompt, normalize_tool_schema, provider_transport_config,
+    reduce_tool_schema_for_compat, tool_is_compatible_with_model, CachedTool, ExecutedToolCall,
+    LLMResponse, OrchestratorError, ProviderHealthIdentity,
 };
 use aria_core::{
-    AdapterFamily, CapabilitySourceKind, CapabilitySupport, ModelCapabilityProbeRecord,
-    ModelCapabilityProfile, ModelRef, ProviderCapabilityProfile, ToolCallingMode, ToolChoicePolicy,
-    ToolResultMode, ToolRuntimePolicy, ToolSchemaMode,
+    AdapterFamily, CapabilitySourceKind, CapabilitySupport, ContextBlockKind, ExecutionContextPack,
+    ModelCapabilityProbeRecord, ModelCapabilityProfile, ModelRef, ProviderCapabilityProfile,
+    ToolCallingMode, ToolChoicePolicy, ToolResultMode, ToolRuntimePolicy, ToolSchemaMode,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EgressSecretOutcome {
+    Allowed,
+    Denied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressSecretAuditRecord {
+    pub scope: String,
+    pub key_name: String,
+    pub target_domain: String,
+    pub outcome: EgressSecretOutcome,
+    pub detail: String,
+}
+
+#[derive(Clone, Default)]
+pub struct EgressCredentialBroker {
+    audit_sink: Option<Arc<dyn Fn(EgressSecretAuditRecord) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for EgressCredentialBroker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EgressCredentialBroker")
+            .field("has_audit_sink", &self.audit_sink.is_some())
+            .finish()
+    }
+}
+
+impl EgressCredentialBroker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_audit_sink<F>(mut self, sink: F) -> Self
+    where
+        F: Fn(EgressSecretAuditRecord) + Send + Sync + 'static,
+    {
+        self.audit_sink = Some(Arc::new(sink));
+        self
+    }
+
+    pub fn resolve_secret_ref(
+        &self,
+        secret_ref: &SecretRef,
+        scope: &str,
+        domain: &str,
+    ) -> Result<String, OrchestratorError> {
+        match secret_ref {
+            SecretRef::Literal(value) => {
+                self.emit(EgressSecretAuditRecord {
+                    scope: scope.to_string(),
+                    key_name: "literal".into(),
+                    target_domain: domain.to_string(),
+                    outcome: EgressSecretOutcome::Allowed,
+                    detail: "literal secret resolved for egress".into(),
+                });
+                Ok(value.clone())
+            }
+            SecretRef::Vault { key_name, vault } => {
+                self.resolve_vault_secret(vault, "system", key_name, domain, scope)
+            }
+        }
+    }
+
+    pub fn resolve_vault_secret(
+        &self,
+        vault: &aria_vault::CredentialVault,
+        agent_id: &str,
+        key_name: &str,
+        domain: &str,
+        scope: &str,
+    ) -> Result<String, OrchestratorError> {
+        match vault.retrieve_for_egress(agent_id, key_name, domain) {
+            Ok(secret) => {
+                self.emit(EgressSecretAuditRecord {
+                    scope: scope.to_string(),
+                    key_name: key_name.to_string(),
+                    target_domain: domain.to_string(),
+                    outcome: EgressSecretOutcome::Allowed,
+                    detail: "vault secret resolved for egress".into(),
+                });
+                Ok(secret)
+            }
+            Err(err) => {
+                self.emit(EgressSecretAuditRecord {
+                    scope: scope.to_string(),
+                    key_name: key_name.to_string(),
+                    target_domain: domain.to_string(),
+                    outcome: EgressSecretOutcome::Denied,
+                    detail: format!("{}", err),
+                });
+                Err(OrchestratorError::LLMError(format!(
+                    "Vault resolution failed: {}",
+                    err
+                )))
+            }
+        }
+    }
+
+    fn emit(&self, record: EgressSecretAuditRecord) {
+        if let Some(sink) = &self.audit_sink {
+            sink(record);
+        }
+    }
+}
 
 /// Reference to a secret that can be a literal string or a vault lookup.
 #[derive(Debug, Clone)]
@@ -23,14 +131,16 @@ pub enum SecretRef {
 
 impl SecretRef {
     pub fn resolve(&self, domain: &str) -> Result<String, OrchestratorError> {
-        match self {
-            Self::Literal(s) => Ok(s.clone()),
-            Self::Vault { key_name, vault } => {
-                vault.retrieve_global_secret(key_name, domain).map_err(|e| {
-                    OrchestratorError::LLMError(format!("Vault resolution failed: {}", e))
-                })
-            }
-        }
+        EgressCredentialBroker::new().resolve_secret_ref(self, "llm_provider", domain)
+    }
+
+    pub fn resolve_with_broker(
+        &self,
+        domain: &str,
+        scope: &str,
+        broker: &EgressCredentialBroker,
+    ) -> Result<String, OrchestratorError> {
+        broker.resolve_secret_ref(self, scope, domain)
     }
 }
 
@@ -50,6 +160,26 @@ pub trait LLMBackend: Send + Sync + dyn_clone::DynClone {
         _policy: &ToolRuntimePolicy,
     ) -> Result<LLMResponse, OrchestratorError> {
         self.query(prompt, tools).await
+    }
+
+    async fn query_context_with_policy(
+        &self,
+        context: &ExecutionContextPack,
+        tools: &[CachedTool],
+        policy: &ToolRuntimePolicy,
+    ) -> Result<LLMResponse, OrchestratorError> {
+        let fallback_prompt = crate::PromptManager::render_execution_context_pack(context);
+        self.query_with_policy(&fallback_prompt, tools, policy)
+            .await
+    }
+
+    fn inspect_context_payload(
+        &self,
+        _context: &ExecutionContextPack,
+        _tools: &[CachedTool],
+        _policy: &ToolRuntimePolicy,
+    ) -> Option<serde_json::Value> {
+        None
     }
 
     async fn query_with_tool_results(
@@ -93,6 +223,18 @@ pub trait LLMBackend: Send + Sync + dyn_clone::DynClone {
             .await
     }
 
+    async fn query_context_with_tool_results_and_policy(
+        &self,
+        context: &ExecutionContextPack,
+        tools: &[CachedTool],
+        executed_tools: &[ExecutedToolCall],
+        policy: &ToolRuntimePolicy,
+    ) -> Result<LLMResponse, OrchestratorError> {
+        let follow_up_pack = crate::append_tool_results_to_context_pack(context, executed_tools);
+        self.query_context_with_policy(&follow_up_pack, tools, policy)
+            .await
+    }
+
     fn model_ref(&self) -> Option<ModelRef> {
         None
     }
@@ -100,9 +242,58 @@ pub trait LLMBackend: Send + Sync + dyn_clone::DynClone {
     fn capability_profile(&self) -> Option<ModelCapabilityProfile> {
         None
     }
+
+    fn provider_health_identity(&self) -> ProviderHealthIdentity {
+        let profile = self.capability_profile();
+        let provider_family = profile
+            .as_ref()
+            .map(|profile| profile.model_ref.provider_id.clone())
+            .or_else(|| self.model_ref().map(|model_ref| model_ref.provider_id))
+            .unwrap_or_else(|| "unknown".to_string());
+        ProviderHealthIdentity {
+            upstream_identity: provider_family.clone(),
+            provider_family,
+        }
+    }
 }
 
 dyn_clone::clone_trait_object!(LLMBackend);
+
+pub(crate) fn backend_overloaded_error(
+    provider: &str,
+    detail: impl Into<String>,
+) -> OrchestratorError {
+    OrchestratorError::BackendOverloaded(format!("{}: {}", provider, detail.into()))
+}
+
+pub(crate) fn map_send_error(provider: &str, error: reqwest::Error) -> OrchestratorError {
+    if error.is_timeout() || error.is_connect() || error.is_request() || error.is_body() {
+        backend_overloaded_error(provider, error.to_string())
+    } else {
+        OrchestratorError::LLMError(format!("{} request failed: {}", provider, error))
+    }
+}
+
+pub(crate) async fn send_with_response_start_timeout<F>(
+    provider: &str,
+    send_op: F,
+) -> Result<reqwest::Response, OrchestratorError>
+where
+    F: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+{
+    let timeout = provider_transport_config().response_start_timeout;
+    match tokio::time::timeout(timeout, send_op).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(map_send_error(provider, error)),
+        Err(_) => Err(backend_overloaded_error(
+            provider,
+            format!(
+                "timed out waiting for first response after {} ms",
+                timeout.as_millis()
+            ),
+        )),
+    }
+}
 
 /// Metadata for a model available from a provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,8 +384,182 @@ pub mod ollama;
 pub mod openai;
 pub mod openrouter;
 
+pub(crate) fn render_context_blocks_for_message(context: &ExecutionContextPack) -> Option<String> {
+    let mut rendered = String::new();
+    for block in &context.context_blocks {
+        let label = match block.kind {
+            ContextBlockKind::Retrieval => "Retrieved Context",
+            ContextBlockKind::ControlDocument => "Control Documents",
+            ContextBlockKind::DurableConstraint => "Durable Constraints",
+            ContextBlockKind::SubAgentResult => "Sub-Agent Results",
+            ContextBlockKind::ToolInstructions => "Tool Instructions",
+            ContextBlockKind::PromptAsset => "Prompt Assets",
+            ContextBlockKind::ResourceContext => "Resource Context",
+            ContextBlockKind::CapabilityIndex => "Capability Index",
+            ContextBlockKind::DocumentIndex => "Document Index",
+            ContextBlockKind::ContractRequirements => "Execution Contract",
+        };
+        if !rendered.is_empty() {
+            rendered.push_str("\n\n");
+        }
+        rendered.push_str(&format!("{} [{}]:\n{}", label, block.label, block.content));
+    }
+    if rendered.is_empty() {
+        None
+    } else {
+        Some(rendered)
+    }
+}
+
+pub(crate) fn build_openai_compatible_initial_messages(
+    context: &ExecutionContextPack,
+) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+    if !context.system_prompt.trim().is_empty() {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": context.system_prompt
+        }));
+    }
+    for message in &context.history_messages {
+        let role = match message.role.trim().to_ascii_lowercase().as_str() {
+            "assistant" | "system" | "tool" => message.role.to_ascii_lowercase(),
+            _ => String::from("user"),
+        };
+        messages.push(serde_json::json!({
+            "role": role,
+            "content": message.content
+        }));
+    }
+    if let Some(extra_context) = render_context_blocks_for_message(context) {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": format!("Context for this request:\n{}", extra_context)
+        }));
+    }
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": context.user_request
+    }));
+    messages
+}
+
+pub(crate) fn build_openai_compatible_context_body(
+    model: &str,
+    context: &ExecutionContextPack,
+    tool_defs: Vec<serde_json::Value>,
+    policy: &ToolRuntimePolicy,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": build_openai_compatible_initial_messages(context),
+        "stream": false
+    });
+    if !tool_defs.is_empty() {
+        apply_openai_compatible_tool_policy(&mut body, &tool_defs, policy);
+    }
+    body
+}
+
+pub(crate) fn build_anthropic_context_body(
+    model: &str,
+    context: &ExecutionContextPack,
+    tool_defs: Vec<serde_json::Value>,
+    policy: &ToolRuntimePolicy,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "max_tokens": 2048,
+        "messages": build_anthropic_initial_messages(context),
+    });
+    if !context.system_prompt.trim().is_empty() {
+        body["system"] = serde_json::json!(context.system_prompt);
+    }
+    if !tool_defs.is_empty() {
+        apply_anthropic_tool_policy(&mut body, &tool_defs, policy);
+    }
+    body
+}
+
+pub(crate) fn build_gemini_context_body(
+    context: &ExecutionContextPack,
+    function_declarations: &[serde_json::Value],
+    policy: &ToolRuntimePolicy,
+) -> serde_json::Value {
+    let (system_instruction, contents) = build_gemini_initial_contents(context);
+    let mut body = serde_json::json!({ "contents": contents });
+    if let Some(system) = system_instruction {
+        body["systemInstruction"] = system;
+    }
+    if !function_declarations.is_empty() {
+        apply_gemini_tool_policy(&mut body, function_declarations, policy);
+    }
+    body
+}
+
+pub(crate) fn build_anthropic_initial_messages(
+    context: &ExecutionContextPack,
+) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+    for message in &context.history_messages {
+        let role = match message.role.trim().to_ascii_lowercase().as_str() {
+            "assistant" => "assistant",
+            _ => "user",
+        };
+        messages.push(serde_json::json!({
+            "role": role,
+            "content": message.content
+        }));
+    }
+    if let Some(extra_context) = render_context_blocks_for_message(context) {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": format!("Context for this request:\n{}", extra_context)
+        }));
+    }
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": context.user_request
+    }));
+    messages
+}
+
+#[allow(dead_code)]
+pub(crate) fn build_gemini_initial_contents(
+    context: &ExecutionContextPack,
+) -> (Option<serde_json::Value>, Vec<serde_json::Value>) {
+    let system = if context.system_prompt.trim().is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({
+            "parts": [{ "text": context.system_prompt }]
+        }))
+    };
+    let mut contents = Vec::new();
+    for message in &context.history_messages {
+        let role = match message.role.trim().to_ascii_lowercase().as_str() {
+            "assistant" => "model",
+            _ => "user",
+        };
+        contents.push(serde_json::json!({
+            "role": role,
+            "parts": [{ "text": message.content }]
+        }));
+    }
+    if let Some(extra_context) = render_context_blocks_for_message(context) {
+        contents.push(serde_json::json!({
+            "role": "user",
+            "parts": [{ "text": format!("Context for this request:\n{}", extra_context) }]
+        }));
+    }
+    contents.push(serde_json::json!({
+        "role": "user",
+        "parts": [{ "text": context.user_request }]
+    }));
+    (system, contents)
+}
+
 use std::collections::HashMap;
-use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderDescriptor {
@@ -359,12 +724,13 @@ pub trait ProviderAdapter: Send + Sync {
         profile: &ModelCapabilityProfile,
         tool: &CachedTool,
     ) -> Result<serde_json::Value, String> {
+        let canonical = tool.canonical_spec();
         let parameters = self.translate_tool_schema(profile, tool)?;
         Ok(serde_json::json!({
             "type": "function",
             "function": {
-                "name": tool.name,
-                "description": tool.description,
+                "name": canonical.name,
+                "description": canonical.description_long,
                 "parameters": parameters
             }
         }))
@@ -462,7 +828,29 @@ pub async fn collect_sse_like_stream(
     let mut accumulator = ProviderStreamAccumulator::default();
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
-    while let Some(chunk) = stream.next().await {
+    let first_chunk_timeout = provider_transport_config().response_start_timeout;
+    let mut first_chunk_pending = true;
+    loop {
+        let next_chunk = if first_chunk_pending {
+            match tokio::time::timeout(first_chunk_timeout, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    return Err(backend_overloaded_error(
+                        "stream",
+                        format!(
+                            "timed out waiting for first stream event after {} ms",
+                            first_chunk_timeout.as_millis()
+                        ),
+                    ));
+                }
+            }
+        } else {
+            stream.next().await
+        };
+        let Some(chunk) = next_chunk else {
+            break;
+        };
+        first_chunk_pending = false;
         let chunk =
             chunk.map_err(|e| OrchestratorError::LLMError(format!("stream read failed: {}", e)))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -511,12 +899,13 @@ pub(crate) fn build_openai_compatible_followup_body(
     let assistant_tool_calls = executed_tools
         .iter()
         .map(|entry| {
+            let invocation = entry.call.invocation_envelope();
             serde_json::json!({
-                "id": entry.call.invocation_id.clone().unwrap_or_else(|| format!("call_{}", entry.call.name)),
+                "id": invocation.invocation_id.clone().unwrap_or_else(|| format!("call_{}", invocation.tool_name)),
                 "type": "function",
                 "function": {
-                    "name": entry.call.name,
-                    "arguments": entry.call.arguments
+                    "name": invocation.tool_name,
+                    "arguments": invocation.arguments_json
                 }
             })
         })
@@ -524,10 +913,12 @@ pub(crate) fn build_openai_compatible_followup_body(
     let tool_messages = executed_tools
         .iter()
         .map(|entry| {
+            let invocation = entry.call.invocation_envelope();
+            let result = entry.result_envelope();
             serde_json::json!({
                 "role": "tool",
-                "tool_call_id": entry.call.invocation_id.clone().unwrap_or_else(|| format!("call_{}", entry.call.name)),
-                "content": entry.result.as_model_provider_payload(&entry.call.name).to_string()
+                "tool_call_id": invocation.invocation_id.clone().unwrap_or_else(|| format!("call_{}", invocation.tool_name)),
+                "content": result.as_provider_payload().to_string()
             })
         })
         .collect::<Vec<_>>();
@@ -783,6 +1174,23 @@ impl ProviderAdapter for GoogleGeminiAdapter {
         AdapterFamily::GoogleGemini
     }
 
+    fn translate_tool_schema(
+        &self,
+        profile: &ModelCapabilityProfile,
+        tool: &CachedTool,
+    ) -> Result<serde_json::Value, String> {
+        if !tool_is_compatible_with_model(tool, Some(profile)) {
+            return Err(format!(
+                "tool '{}' is not compatible with model '{}'",
+                tool.name,
+                profile.model_ref.as_slash_ref()
+            ));
+        }
+        let schema = reduce_tool_schema_for_compat(&tool.parameters_schema)?;
+        serde_json::from_str(&schema)
+            .map_err(|e| format!("translated gemini tool schema parse failed: {}", e))
+    }
+
     fn parse_stream_event(&self, chunk: &str) -> Result<Option<ProviderStreamEvent>, String> {
         let payload = chunk.trim();
         if payload.is_empty() {
@@ -797,7 +1205,10 @@ impl ProviderAdapter for GoogleGeminiAdapter {
                 }
                 if let Some(function_call) = part.get("functionCall") {
                     return Ok(Some(ProviderStreamEvent::ToolCallDelta {
-                        invocation_id: None,
+                        invocation_id:
+                            crate::backends::gemini::GeminiBackend::encode_function_call_part_metadata(
+                                part,
+                            ),
                         name: function_call["name"].as_str().map(|v| v.to_string()),
                         arguments_delta: function_call["args"].to_string(),
                     }));
@@ -850,12 +1261,13 @@ impl ProviderAdapter for OllamaNativeAdapter {
         profile: &ModelCapabilityProfile,
         tool: &CachedTool,
     ) -> Result<serde_json::Value, String> {
+        let canonical = tool.canonical_spec();
         let parameters = self.translate_tool_schema(profile, tool)?;
         Ok(serde_json::json!({
             "type": "function",
             "function": {
-                "name": tool.name,
-                "description": tool.description,
+                "name": canonical.name,
+                "description": canonical.description_long,
                 "parameters": parameters
             }
         }))
@@ -905,12 +1317,20 @@ pub fn default_model_capability_profile(
             ToolSchemaMode::ReducedJsonSchema,
             ToolResultMode::NativeStructured,
         ),
-        AdapterFamily::Anthropic | AdapterFamily::GoogleGemini => (
+        AdapterFamily::Anthropic => (
             CapabilitySupport::Unknown,
             CapabilitySupport::Unknown,
             CapabilitySupport::Supported,
             CapabilitySupport::Supported,
             ToolSchemaMode::StrictJsonSchema,
+            ToolResultMode::NativeStructured,
+        ),
+        AdapterFamily::GoogleGemini => (
+            CapabilitySupport::Unknown,
+            CapabilitySupport::Unknown,
+            CapabilitySupport::Supported,
+            CapabilitySupport::Supported,
+            ToolSchemaMode::ReducedJsonSchema,
             ToolResultMode::NativeStructured,
         ),
         AdapterFamily::TextOnlyCli => (
@@ -1131,6 +1551,33 @@ mod tests {
             .expect("parse")
             .expect("event");
         assert_eq!(event, ProviderStreamEvent::TextDelta("hello".into()));
+    }
+
+    #[test]
+    fn gemini_stream_parser_preserves_function_call_part_metadata() {
+        let adapter = GoogleGeminiAdapter;
+        let event = adapter
+            .parse_stream_event(
+                r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"search_web","args":{"query":"rust"}},"thought_signature":"sig_123"}]}}]}"#,
+            )
+            .expect("parse")
+            .expect("event");
+        let ProviderStreamEvent::ToolCallDelta {
+            invocation_id,
+            name,
+            arguments_delta,
+        } = event
+        else {
+            panic!("expected tool call delta");
+        };
+        assert_eq!(name.as_deref(), Some("search_web"));
+        assert_eq!(arguments_delta, r#"{"query":"rust"}"#);
+        let metadata = crate::backends::gemini::GeminiBackend::decode_function_call_part_metadata(
+            invocation_id.as_deref().expect("invocation id"),
+        )
+        .expect("metadata");
+        assert_eq!(metadata["thought_signature"], "sig_123");
+        assert_eq!(metadata["functionCall"]["name"], "search_web");
     }
 
     #[test]
@@ -1370,7 +1817,7 @@ mod tests {
     async fn provider_conformance_matrix_gemini_family() {
         run_provider_conformance_case(ProviderConformanceExpectation {
             family: AdapterFamily::GoogleGemini,
-            expected_default_schema_mode: ToolSchemaMode::StrictJsonSchema,
+            expected_default_schema_mode: ToolSchemaMode::ReducedJsonSchema,
             expected_default_tool_mode: ToolCallingMode::TextFallbackNoTools,
             expected_probe_tool_calling: CapabilitySupport::Supported,
         })

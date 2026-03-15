@@ -9,8 +9,9 @@
 use aria_core::{
     ConstraintViolation, HardwareIntent, SkillActivationPolicy, SkillBinding, SkillPackageManifest,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -25,6 +26,22 @@ pub enum RuntimeError {
     ExecutionError(String),
     /// A capability violation occurred (e.g. unauthorized host call).
     CapabilityViolation(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WasmExecutionMode {
+    DevJitAllowed,
+    NodePreferAot,
+    EdgeAotOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WasmAotArtifactMetadata {
+    pub module_hash_hex: String,
+    pub runtime_profile: String,
+    pub target_triple: String,
+    pub artifact_version: u32,
+    pub signature_verified: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -287,8 +304,6 @@ impl TierCapabilities {
 // ---------------------------------------------------------------------------
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-
-use serde::{Deserialize, Serialize};
 
 /// A Wasm module bundled with its Ed25519 signature and the signer's public key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -872,6 +887,160 @@ impl Default for WasmAotCache {
     }
 }
 
+pub struct PersistentWasmAotCache {
+    root: PathBuf,
+    execution_mode: WasmExecutionMode,
+    runtime_profile: String,
+    target_triple: String,
+    require_signature: bool,
+}
+
+impl PersistentWasmAotCache {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        execution_mode: WasmExecutionMode,
+        runtime_profile: impl Into<String>,
+        target_triple: impl Into<String>,
+        require_signature: bool,
+    ) -> Self {
+        Self {
+            root: root.into(),
+            execution_mode,
+            runtime_profile: runtime_profile.into(),
+            target_triple: target_triple.into(),
+            require_signature,
+        }
+    }
+
+    fn artifact_dir(&self, hash: &WasmModuleHash) -> PathBuf {
+        self.root.join(hex_module_hash(hash))
+    }
+
+    fn artifact_bytes_path(&self, hash: &WasmModuleHash) -> PathBuf {
+        self.artifact_dir(hash).join("module.bin")
+    }
+
+    fn artifact_metadata_path(&self, hash: &WasmModuleHash) -> PathBuf {
+        self.artifact_dir(hash).join("metadata.json")
+    }
+
+    pub fn metadata_for_module(
+        &self,
+        hash: &WasmModuleHash,
+    ) -> Result<Option<WasmAotArtifactMetadata>, RuntimeError> {
+        let path = self.artifact_metadata_path(hash);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            RuntimeError::LoadError(format!(
+                "read AOT metadata '{}' failed: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        let meta = serde_json::from_str::<WasmAotArtifactMetadata>(&raw).map_err(|e| {
+            RuntimeError::LoadError(format!(
+                "parse AOT metadata '{}' failed: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        Ok(Some(meta))
+    }
+
+    pub fn load_precompiled_bytes(
+        &self,
+        hash: &WasmModuleHash,
+    ) -> Result<Option<Vec<u8>>, RuntimeError> {
+        let Some(meta) = self.metadata_for_module(hash)? else {
+            return Ok(None);
+        };
+        self.validate_metadata(&meta)?;
+        let path = self.artifact_bytes_path(hash);
+        let bytes = std::fs::read(&path).map_err(|e| {
+            RuntimeError::LoadError(format!(
+                "read AOT artifact '{}' failed: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        Ok(Some(bytes))
+    }
+
+    fn validate_metadata(&self, meta: &WasmAotArtifactMetadata) -> Result<(), RuntimeError> {
+        if meta.runtime_profile != self.runtime_profile {
+            return Err(RuntimeError::CapabilityViolation(format!(
+                "AOT artifact runtime profile mismatch: expected '{}' got '{}'",
+                self.runtime_profile, meta.runtime_profile
+            )));
+        }
+        if meta.target_triple != self.target_triple {
+            return Err(RuntimeError::CapabilityViolation(format!(
+                "AOT artifact target mismatch: expected '{}' got '{}'",
+                self.target_triple, meta.target_triple
+            )));
+        }
+        if self.require_signature && !meta.signature_verified {
+            return Err(RuntimeError::CapabilityViolation(
+                "AOT artifact is unsigned in signature-required mode".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn precompile_and_persist(
+        &self,
+        bytes: Vec<u8>,
+        signature_verified: bool,
+    ) -> Result<WasmModuleHash, RuntimeError> {
+        if self.require_signature && !signature_verified {
+            return Err(RuntimeError::CapabilityViolation(
+                "unsigned Wasm module cannot be precompiled in signature-required mode".into(),
+            ));
+        }
+        if bytes.len() < 4 || &bytes[..4] != b"\0asm" {
+            return Err(RuntimeError::LoadError(
+                "AOT precompile: not a valid Wasm module (missing magic header)".into(),
+            ));
+        }
+        let hash = wasm_module_hash(&bytes);
+        let dir = self.artifact_dir(&hash);
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            RuntimeError::LoadError(format!(
+                "create AOT artifact dir '{}' failed: {}",
+                dir.display(),
+                e
+            ))
+        })?;
+        let metadata = WasmAotArtifactMetadata {
+            module_hash_hex: hex_module_hash(&hash),
+            runtime_profile: self.runtime_profile.clone(),
+            target_triple: self.target_triple.clone(),
+            artifact_version: 1,
+            signature_verified,
+        };
+        std::fs::write(self.artifact_bytes_path(&hash), &bytes).map_err(|e| {
+            RuntimeError::LoadError(format!("write AOT artifact failed: {}", e))
+        })?;
+        let meta_json = serde_json::to_vec_pretty(&metadata).map_err(|e| {
+            RuntimeError::LoadError(format!("serialize AOT artifact metadata failed: {}", e))
+        })?;
+        std::fs::write(self.artifact_metadata_path(&hash), meta_json).map_err(|e| {
+            RuntimeError::LoadError(format!("write AOT metadata failed: {}", e))
+        })?;
+        Ok(hash)
+    }
+
+    pub fn execution_mode(&self) -> WasmExecutionMode {
+        self.execution_mode
+    }
+}
+
+fn hex_module_hash(hash: &WasmModuleHash) -> String {
+    hash.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 impl WasmAotCache {
     /// Create a new, empty cache.
     pub fn new() -> Self {
@@ -933,11 +1102,28 @@ impl WasmAotCache {
 pub struct AotCachedExecutor<E: WasmExecutor> {
     inner: E,
     cache: std::sync::Arc<WasmAotCache>,
+    persistent: Option<std::sync::Arc<PersistentWasmAotCache>>,
 }
 
 impl<E: WasmExecutor> AotCachedExecutor<E> {
     pub fn new(inner: E, cache: std::sync::Arc<WasmAotCache>) -> Self {
-        Self { inner, cache }
+        Self {
+            inner,
+            cache,
+            persistent: None,
+        }
+    }
+
+    pub fn with_persistent_cache(
+        inner: E,
+        cache: std::sync::Arc<WasmAotCache>,
+        persistent: std::sync::Arc<PersistentWasmAotCache>,
+    ) -> Self {
+        Self {
+            inner,
+            cache,
+            persistent: Some(persistent),
+        }
     }
 }
 
@@ -955,6 +1141,19 @@ impl<E: WasmExecutor> WasmExecutor for AotCachedExecutor<E> {
                 cached
             }
             None => {
+                if let Some(persistent) = &self.persistent {
+                    if let Some(bytes) = persistent.load_precompiled_bytes(&hash)? {
+                        self.cache.insert(hash, bytes.clone());
+                        return self.inner.execute(&bytes, function_name, input);
+                    }
+                    if persistent.execution_mode() == WasmExecutionMode::EdgeAotOnly {
+                        return Err(RuntimeError::CapabilityViolation(format!(
+                            "Wasm module '{}' is not precompiled for edge AOT-only execution",
+                            function_name
+                        )));
+                    }
+                    persistent.precompile_and_persist(module.to_vec(), false)?;
+                }
                 // Cache miss — populate then execute
                 if module.len() >= 4 && &module[..4] == b"\0asm" {
                     self.cache.insert(hash, module.to_vec());
@@ -1450,6 +1649,93 @@ mod tests {
         let hash = cache.precompile(bytes.clone()).unwrap();
         assert!(cache.contains(&hash));
         assert_eq!(cache.get(&hash).unwrap(), bytes);
+    }
+
+    #[test]
+    fn persistent_aot_cache_survives_restart_and_restores_metadata() {
+        let temp = tempfile::tempdir().expect("aot tempdir");
+        let cache = PersistentWasmAotCache::new(
+            temp.path(),
+            WasmExecutionMode::NodePreferAot,
+            "node",
+            "x86_64-unknown-linux-gnu",
+            false,
+        );
+        let bytes = b"\0asm\x01\x00\x00\x00".to_vec();
+        let hash = cache
+            .precompile_and_persist(bytes.clone(), true)
+            .expect("persist aot");
+
+        let restored = PersistentWasmAotCache::new(
+            temp.path(),
+            WasmExecutionMode::NodePreferAot,
+            "node",
+            "x86_64-unknown-linux-gnu",
+            false,
+        );
+        let loaded = restored
+            .load_precompiled_bytes(&hash)
+            .expect("load persisted aot")
+            .expect("artifact exists");
+        assert_eq!(loaded, bytes);
+        let meta = restored
+            .metadata_for_module(&hash)
+            .expect("load metadata")
+            .expect("metadata exists");
+        assert!(meta.signature_verified);
+        assert_eq!(meta.runtime_profile, "node");
+    }
+
+    #[test]
+    fn persistent_aot_cache_rejects_unsigned_artifact_in_edge_mode() {
+        let temp = tempfile::tempdir().expect("aot tempdir");
+        let cache = PersistentWasmAotCache::new(
+            temp.path(),
+            WasmExecutionMode::NodePreferAot,
+            "edge",
+            "aarch64-unknown-linux-gnu",
+            false,
+        );
+        let bytes = b"\0asm\x01\x00\x00\x00".to_vec();
+        let hash = cache
+            .precompile_and_persist(bytes, false)
+            .expect("persist unsigned artifact");
+
+        let edge_cache = PersistentWasmAotCache::new(
+            temp.path(),
+            WasmExecutionMode::EdgeAotOnly,
+            "edge",
+            "aarch64-unknown-linux-gnu",
+            true,
+        );
+        let err = edge_cache
+            .load_precompiled_bytes(&hash)
+            .expect_err("unsigned artifact must be rejected");
+        assert!(format!("{}", err).contains("unsigned"));
+    }
+
+    #[test]
+    fn aot_cached_executor_edge_mode_requires_precompiled_artifact() {
+        let temp = tempfile::tempdir().expect("aot tempdir");
+        let cache = std::sync::Arc::new(WasmAotCache::new());
+        let persistent = std::sync::Arc::new(PersistentWasmAotCache::new(
+            temp.path(),
+            WasmExecutionMode::EdgeAotOnly,
+            "edge",
+            "aarch64-unknown-linux-gnu",
+            false,
+        ));
+        let executor = AotCachedExecutor::with_persistent_cache(
+            CountingExecutor {
+                calls: std::sync::Mutex::new(0),
+            },
+            cache,
+            persistent,
+        );
+        let err = executor
+            .execute(b"\0asm\x01\x00\x00\x00", "hello", "{}")
+            .expect_err("edge mode should reject non-precompiled module");
+        assert!(format!("{}", err).contains("not precompiled"));
     }
 
     #[test]

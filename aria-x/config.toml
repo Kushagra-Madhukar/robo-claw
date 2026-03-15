@@ -4,10 +4,10 @@
 storage_path = "./vault.json"
 
 [llm]
-# Backend type: "mock", "ollama", "claude", "openrouter"
-backend = "openrouter"
-# Model name (for ollama/claude/openrouter)
-model = "arcee-ai/trinity-large-preview:free"
+# Backend type: "mock", "ollama", "openai", "anthropic", "gemini", "openrouter"
+backend = "gemini"
+# Model name (provider-specific). Default is Gemini 3 Flash.
+model = "gemini-3-flash-preview"
 # Max tool rounds per request
 max_tool_rounds = 5
 
@@ -34,6 +34,13 @@ adapter = "telegram"
 # main | peer | channel_peer | account_channel_peer
 session_scope_policy = "main"
 # Use TELEGRAM_BOT_TOKEN env or gateway.telegram_token_file for secrets.
+# STT mode: auto | local | cloud | off
+stt_mode = "auto"
+# For local Whisper STT, set:
+# WHISPER_CPP_MODEL=/absolute/path/to/model.bin
+# WHISPER_CPP_BIN=whisper-cli
+# FFMPEG_BIN=ffmpeg
+# Optional: WHISPER_CPP_LANGUAGE=en
 telegram_port = 8080
 # "polling" mode works anywhere without ngrok/public IP
 telegram_mode = "polling"

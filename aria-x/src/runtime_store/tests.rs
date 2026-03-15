@@ -6,11 +6,12 @@ mod tests {
     use aria_core::{
         AdapterFamily, AgentMailboxMessage, AgentRunEvent, AgentRunEventKind, AgentRunRecord,
         AgentRunStatus, CapabilitySourceKind, CapabilitySupport, CompactionMetadata,
-        CompactionState, CompactionStatus, ControlDocumentEntry, ControlDocumentKind,
-        GatewayChannel, McpImportedTool, McpServerProfile, MessageContent,
-        ModelCapabilityProbeRecord, ModelCapabilityProfile, ModelRef, ProviderCapabilityProfile,
-        RetrievalTraceRecord, SecretUsageAuditRecord, SecretUsageOutcome, SkillActivationPolicy, SkillActivationRecord,
-        SkillBinding, SkillPackageManifest, ToolResultMode, ToolSchemaMode,
+        CompactionState, CompactionStatus, ContextBlock, ContextBlockKind, ContextInspectionRecord,
+        ControlDocumentEntry, ControlDocumentKind, ExecutionContextPack, GatewayChannel,
+        McpImportedTool, McpServerProfile, MessageContent, ModelCapabilityProbeRecord,
+        ModelCapabilityProfile, ModelRef, PromptContextMessage, ProviderCapabilityProfile,
+        RetrievalTraceRecord, SecretUsageAuditRecord, SecretUsageOutcome, SkillActivationPolicy,
+        SkillActivationRecord, SkillBinding, SkillPackageManifest, ToolResultMode, ToolSchemaMode,
     };
     use aria_intelligence::{
         CachedTool, ScheduleSpec, ScheduledJobKind, ScheduledJobStatus, ScheduledPromptJob,
@@ -162,7 +163,7 @@ mod tests {
             display_name: "Work".into(),
             mode: aria_core::BrowserProfileMode::ManagedPersistent,
             engine: aria_core::BrowserEngine::Chromium,
-                    is_default: false,
+            is_default: false,
             persistent: true,
             managed_by_aria: true,
             attached_source: None,
@@ -2570,6 +2571,71 @@ mod tests {
     }
 
     #[test]
+    fn runtime_store_deferred_learning_derivative_event_eventually_persists() {
+        let (_dir, store) = temp_store();
+        let event = LearningDerivativeEvent {
+            event_id: "event-deferred".into(),
+            task_fingerprint: "fp-edge".into(),
+            kind: aria_learning::LearningDerivativeKind::PromptCompile,
+            artifact_id: "artifact-1".into(),
+            notes: "queued".into(),
+            created_at_us: 100,
+        };
+        store
+            .append_learning_derivative_event_with_durability(
+                &event,
+                crate::runtime_store::learning::RuntimeWriteDurability::Deferred,
+            )
+            .expect("queue deferred event");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let rows = store
+            .list_learning_derivative_events("fp-edge")
+            .expect("list deferred events");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event_id, "event-deferred");
+    }
+
+    #[test]
+    fn runtime_store_deferred_execution_trace_eventually_persists() {
+        let (_dir, store) = temp_store();
+        let fingerprint = aria_learning::TaskFingerprint::from_parts(
+            "omni",
+            "execution",
+            "trace",
+            &["read_file".into()],
+        );
+        let trace = ExecutionTrace {
+            request_id: "req-edge".into(),
+            session_id: "session-edge".into(),
+            user_id: "user-1".into(),
+            agent_id: "omni".into(),
+            channel: GatewayChannel::Cli,
+            prompt_mode: "execution".into(),
+            task_fingerprint: fingerprint.clone(),
+            user_input_summary: "trace".into(),
+            tool_names: vec!["read_file".into()],
+            retrieved_corpora: vec!["workspace".into()],
+            outcome: aria_learning::TraceOutcome::Succeeded,
+            latency_ms: 10,
+            response_summary: "ok".into(),
+            tool_runtime_policy: None,
+            recorded_at_us: 20,
+        };
+        store
+            .record_execution_trace_with_durability(
+                &trace,
+                crate::runtime_store::learning::RuntimeWriteDurability::Deferred,
+            )
+            .expect("queue deferred trace");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let rows = store
+            .list_execution_traces_by_fingerprint(&fingerprint.key)
+            .expect("list traces");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_id, "req-edge");
+    }
+
+    #[test]
     fn runtime_store_records_promotion_in_derivative_audit() {
         let (_dir, store) = temp_store();
         let candidate = CandidateArtifactRecord {
@@ -2658,7 +2724,7 @@ mod tests {
             policy_hits: 1,
             external_hits: 0,
             social_hits: 0,
-            page_context_hits: 1,
+            document_context_hits: 1,
             history_tokens: 120,
             rag_tokens: 240,
             control_tokens: 60,
@@ -2675,6 +2741,89 @@ mod tests {
                 Some("developer"),
             )
             .expect("list retrieval traces");
+        assert_eq!(listed, vec![record]);
+    }
+
+    #[test]
+    fn runtime_store_round_trips_context_inspections() {
+        let (_dir, store) = temp_store();
+        let session_id = *uuid::Uuid::new_v4().as_bytes();
+        let record = ContextInspectionRecord {
+            context_id: "ctx-1".into(),
+            request_id: *uuid::Uuid::new_v4().as_bytes(),
+            session_id,
+            agent_id: "omni".into(),
+            channel: aria_core::GatewayChannel::Cli,
+            provider_model: Some("openrouter/openai/gpt-4o-mini".into()),
+            prompt_mode: "execution".into(),
+            history_tokens: 12,
+            context_tokens: 22,
+            system_tokens: 33,
+            user_tokens: 4,
+            tool_count: 2,
+            active_tool_names: vec!["search_web".into(), "web_fetch".into()],
+            tool_runtime_policy: Some(aria_core::ToolRuntimePolicy {
+                tool_choice: aria_core::ToolChoicePolicy::Required,
+                allow_parallel_tool_calls: false,
+            }),
+            tool_selection: Some(aria_core::ToolSelectionDecision {
+                tool_choice: aria_core::ToolChoicePolicy::Required,
+                tool_calling_mode: aria_core::ToolCallingMode::TextFallbackWithRepair,
+                text_fallback_mode: true,
+                relevance_threshold_millis: Some(80),
+                available_tool_names: vec!["search_web".into(), "web_fetch".into()],
+                selected_tool_names: vec!["search_web".into()],
+                candidate_scores: vec![
+                    aria_core::ToolSelectionScore {
+                        tool_name: "search_web".into(),
+                        score: 412,
+                        source: "active".into(),
+                    },
+                    aria_core::ToolSelectionScore {
+                        tool_name: "web_fetch".into(),
+                        score: 221,
+                        source: "registry".into(),
+                    },
+                ],
+            }),
+            selected_tool_catalog: Vec::new(),
+            hidden_tool_messages: Vec::new(),
+            emitted_artifacts: Vec::new(),
+            tool_provider_readiness: Vec::new(),
+            provider_request_payload: Some(serde_json::json!({
+                "model": "gemini-3-flash-preview",
+                "contents": [{"role":"user","parts":[{"text":"who am i"}]}]
+            })),
+            pack: ExecutionContextPack {
+                system_prompt: "system".into(),
+                history_messages: vec![PromptContextMessage {
+                    role: "user".into(),
+                    content: "hello".into(),
+                    timestamp_us: 1,
+                }],
+                context_blocks: vec![ContextBlock {
+                    kind: ContextBlockKind::Retrieval,
+                    label: "retrieval".into(),
+                    content: "evidence".into(),
+                    token_estimate: 2,
+                }],
+                user_request: "who am i".into(),
+                channel: aria_core::GatewayChannel::Cli,
+                execution_contract: None,
+                retrieved_context: None,
+            },
+            rendered_prompt: "rendered".into(),
+            created_at_us: 99,
+        };
+        store
+            .append_context_inspection(&record)
+            .expect("append context inspection");
+        let listed = store
+            .list_context_inspections(
+                Some(&uuid::Uuid::from_bytes(session_id).to_string()),
+                Some("omni"),
+            )
+            .expect("list context inspections");
         assert_eq!(listed, vec![record]);
     }
 
@@ -2717,11 +2866,7 @@ mod tests {
             .ack_durable_message("msg-1", now_us + 1)
             .expect("ack durable message");
         let listed = store
-            .list_durable_messages(
-                DurableQueueKind::Outbox,
-                "tenant-a",
-                "workspace-a",
-            )
+            .list_durable_messages(DurableQueueKind::Outbox, "tenant-a", "workspace-a")
             .expect("list durable messages");
         assert_eq!(listed[0].status, DurableQueueStatus::Acked);
 
@@ -2750,11 +2895,7 @@ mod tests {
             .expect("dead letter second message");
         assert_eq!(status, DurableQueueStatus::DeadLetter);
         let dlq = store
-            .list_durable_dlq(
-                DurableQueueKind::Outbox,
-                "tenant-a",
-                "workspace-a",
-            )
+            .list_durable_dlq(DurableQueueKind::Outbox, "tenant-a", "workspace-a")
             .expect("list durable dlq");
         assert_eq!(dlq.len(), 1);
         assert_eq!(dlq[0].message_id, "msg-2");
@@ -2797,11 +2938,7 @@ mod tests {
             .fail_durable_message("msg-1", "retry exhausted", now_us + 1, now_us + 2, 1)
             .expect("dead letter");
         let dlq = store
-            .list_durable_dlq(
-                DurableQueueKind::Outbox,
-                "tenant-a",
-                "workspace-a",
-            )
+            .list_durable_dlq(DurableQueueKind::Outbox, "tenant-a", "workspace-a")
             .expect("list dlq");
         let replayed = store
             .replay_durable_dlq(&dlq[0].dlq_id, now_us + 5)
@@ -2809,11 +2946,7 @@ mod tests {
             .expect("replayed message");
         assert_eq!(replayed.status, DurableQueueStatus::Pending);
         let dlq_after = store
-            .list_durable_dlq(
-                DurableQueueKind::Outbox,
-                "tenant-a",
-                "workspace-a",
-            )
+            .list_durable_dlq(DurableQueueKind::Outbox, "tenant-a", "workspace-a")
             .expect("list dlq after");
         assert!(dlq_after.is_empty());
     }

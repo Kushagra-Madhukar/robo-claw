@@ -1,4 +1,4 @@
-fn run_admin_inspect_command(
+pub(crate) fn run_admin_inspect_command(
     config: &Config,
     args: &[String],
 ) -> Result<Option<serde_json::Value>, String> {
@@ -26,6 +26,20 @@ fn run_admin_inspect_command(
         let session_id = args.get(pos + 1).map(String::as_str);
         let agent_id = args.get(pos + 2).map(String::as_str);
         return inspect_retrieval_traces_json(sessions_dir, session_id, agent_id)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
+    if let Some(pos) = command("--inspect-context") {
+        let session_id = args.get(pos + 1).map(String::as_str);
+        let agent_id = args.get(pos + 2).map(String::as_str);
+        return inspect_context_inspections_json(sessions_dir, session_id, agent_id)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
+    if let Some(pos) = command("--inspect-provider-payloads") {
+        let session_id = args.get(pos + 1).map(String::as_str);
+        let agent_id = args.get(pos + 2).map(String::as_str);
+        return inspect_provider_payloads_json(sessions_dir, session_id, agent_id)
             .map(Some)
             .map_err(|(_, e)| e);
     }
@@ -330,6 +344,93 @@ fn run_admin_inspect_command(
     Ok(None)
 }
 
+pub(crate) fn run_admin_explain_command(
+    config: &Config,
+    args: &[String],
+) -> Result<Option<String>, String> {
+    let sessions_dir = Path::new(&config.ssmu.sessions_dir);
+    let command = |flag: &str| args.iter().position(|a| a == flag);
+
+    if let Some(pos) = command("--explain-context") {
+        let session_id = args.get(pos + 1).map(String::as_str);
+        let agent_id = args.get(pos + 2).map(String::as_str);
+        return explain_context_inspections(sessions_dir, session_id, agent_id).map(Some);
+    }
+    if let Some(pos) = command("--explain-provider-payloads") {
+        let session_id = args.get(pos + 1).map(String::as_str);
+        let agent_id = args.get(pos + 2).map(String::as_str);
+        return explain_provider_payloads(sessions_dir, session_id, agent_id).map(Some);
+    }
+    Ok(None)
+}
+
+pub(crate) fn run_operator_cli_command(
+    config: &Config,
+    args: &[String],
+) -> Option<Result<String, String>> {
+    match (args.get(1).map(String::as_str), args.get(2).map(String::as_str)) {
+        (Some("inspect"), Some("context")) => {
+            let mut forwarded = vec![args[0].clone(), "--inspect-context".into()];
+            if let Some(session_id) = args.get(3) {
+                forwarded.push(session_id.clone());
+            }
+            if let Some(agent_id) = args.get(4) {
+                forwarded.push(agent_id.clone());
+            }
+            Some(run_admin_inspect_command(config, &forwarded)
+            .and_then(|json| {
+                json.ok_or_else(|| "no context inspections found".to_string())
+                    .and_then(|value| {
+                        serde_json::to_string_pretty(&value)
+                            .map_err(|e| format!("serialize failed: {}", e))
+                    })
+            }))
+        }
+        (Some("inspect"), Some("provider-payloads" | "provider-payload")) => {
+            let mut forwarded = vec![args[0].clone(), "--inspect-provider-payloads".into()];
+            if let Some(session_id) = args.get(3) {
+                forwarded.push(session_id.clone());
+            }
+            if let Some(agent_id) = args.get(4) {
+                forwarded.push(agent_id.clone());
+            }
+            Some(run_admin_inspect_command(config, &forwarded)
+            .and_then(|json| {
+                json.ok_or_else(|| "no provider payload inspections found".to_string())
+                    .and_then(|value| {
+                        serde_json::to_string_pretty(&value)
+                            .map_err(|e| format!("serialize failed: {}", e))
+                    })
+            }))
+        }
+        (Some("explain"), Some("context")) => {
+            let mut forwarded = vec![args[0].clone(), "--explain-context".into()];
+            if let Some(session_id) = args.get(3) {
+                forwarded.push(session_id.clone());
+            }
+            if let Some(agent_id) = args.get(4) {
+                forwarded.push(agent_id.clone());
+            }
+            Some(run_admin_explain_command(config, &forwarded)
+            .and_then(|text| text.ok_or_else(|| "no context inspections found".to_string())))
+        }
+        (Some("explain"), Some("provider-payloads" | "provider-payload")) => {
+            let mut forwarded = vec![args[0].clone(), "--explain-provider-payloads".into()];
+            if let Some(session_id) = args.get(3) {
+                forwarded.push(session_id.clone());
+            }
+            if let Some(agent_id) = args.get(4) {
+                forwarded.push(agent_id.clone());
+            }
+            Some(run_admin_explain_command(config, &forwarded)
+            .and_then(|text| {
+                text.ok_or_else(|| "no provider payload inspections found".to_string())
+            }))
+        }
+        _ => None,
+    }
+}
+
 async fn run_live_admin_inspect_command(
     _config: &Config,
     args: &[String],
@@ -383,6 +484,26 @@ fn inspect_control_documents_json(
     }))
 }
 
+fn inspect_provider_health_json(
+    llm_pool: &Arc<LlmBackendPool>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    serde_json::to_value(llm_pool.provider_circuit_state()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize failed: {}", e),
+        )
+    })
+}
+
+fn inspect_workspace_locks_json() -> Result<serde_json::Value, (StatusCode, String)> {
+    serde_json::to_value(workspace_lock_manager().snapshot()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize failed: {}", e),
+        )
+    })
+}
+
 fn inspect_retrieval_traces_json(
     sessions_dir: &Path,
     session_id: Option<&str>,
@@ -397,6 +518,212 @@ fn inspect_retrieval_traces_json(
             format!("serialize failed: {}", e),
         )
     })
+}
+
+fn inspect_context_inspections_json(
+    sessions_dir: &Path,
+    session_id: Option<&str>,
+    agent_id: Option<&str>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let records = RuntimeStore::for_sessions_dir(sessions_dir)
+        .list_context_inspections(session_id, agent_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    serde_json::to_value(records).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize failed: {}", e),
+        )
+    })
+}
+
+fn inspect_provider_payloads_json(
+    sessions_dir: &Path,
+    session_id: Option<&str>,
+    agent_id: Option<&str>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let records = RuntimeStore::for_sessions_dir(sessions_dir)
+        .list_context_inspections(session_id, agent_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let payloads = records
+        .into_iter()
+        .map(|record| {
+            serde_json::json!({
+                "context_id": record.context_id,
+                "request_id": record.request_id,
+                "session_id": record.session_id,
+                "agent_id": record.agent_id,
+                "provider_model": record.provider_model,
+                "created_at_us": record.created_at_us,
+                "tool_selection": record.tool_selection,
+                "tool_runtime_policy": record.tool_runtime_policy,
+                "selected_tool_catalog": record.selected_tool_catalog,
+                "hidden_tool_messages": record.hidden_tool_messages,
+                "emitted_artifacts": record.emitted_artifacts,
+                "tool_provider_readiness": record.tool_provider_readiness,
+                "provider_request_payload": record.provider_request_payload,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_value(payloads).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize failed: {}", e),
+        )
+    })
+}
+
+fn explain_context_inspections(
+    sessions_dir: &Path,
+    session_id: Option<&str>,
+    agent_id: Option<&str>,
+) -> Result<String, String> {
+    let records = RuntimeStore::for_sessions_dir(sessions_dir)
+        .list_context_inspections(session_id, agent_id)?;
+    if records.is_empty() {
+        return Ok("No context inspections found.".into());
+    }
+    let mut lines = Vec::new();
+    for record in records {
+        lines.push(format!(
+            "Context {} | agent={} | model={} | created_at_us={}",
+            record.context_id,
+            record.agent_id,
+            record.provider_model.unwrap_or_else(|| "<unknown>".into()),
+            record.created_at_us
+        ));
+        lines.push(format!(
+            "  tokens: system={} history={} context={} user={} tools={}",
+            record.system_tokens,
+            record.history_tokens,
+            record.context_tokens,
+            record.user_tokens,
+            record.tool_count
+        ));
+        if let Some(selection) = record.tool_selection {
+            lines.push(format!(
+                "  tool mode: {:?} | choice={:?} | text_fallback={}",
+                selection.tool_calling_mode,
+                selection.tool_choice,
+                selection.text_fallback_mode
+            ));
+            lines.push(format!(
+                "  selected tools: {}",
+                if selection.selected_tool_names.is_empty() {
+                    "<none>".into()
+                } else {
+                    selection.selected_tool_names.join(", ")
+                }
+            ));
+            let mut candidate_scores = selection.candidate_scores;
+            candidate_scores.sort_by(|left, right| right.score.cmp(&left.score));
+            for score in candidate_scores.into_iter().take(5) {
+                lines.push(format!(
+                    "    candidate {} score={} source={}",
+                    score.tool_name, score.score, score.source
+                ));
+            }
+        }
+        if !record.selected_tool_catalog.is_empty() {
+            lines.push("  selected provider/runner bindings:".into());
+            for entry in &record.selected_tool_catalog {
+                lines.push(format!(
+                    "    {} => {:?} / {:?}",
+                    entry.public_name, entry.provider_kind, entry.runner_class
+                ));
+            }
+        }
+        if !record.hidden_tool_messages.is_empty() {
+            lines.push(format!(
+                "  hidden tools: {}",
+                record.hidden_tool_messages.join("; ")
+            ));
+        }
+        if !record.emitted_artifacts.is_empty() {
+            lines.push(format!(
+                "  emitted artifacts: {}",
+                record
+                    .emitted_artifacts
+                    .iter()
+                    .map(|artifact| format!("{:?}:{}", artifact.kind, artifact.label))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !record.tool_provider_readiness.is_empty() {
+            lines.push("  tool provider readiness:".into());
+            for readiness in &record.tool_provider_readiness {
+                lines.push(format!(
+                    "    {:?}/{} => {:?} installed={} bound={} auth_ready={}",
+                    readiness.provider_kind,
+                    readiness.provider_id,
+                    readiness.status,
+                    readiness.installed,
+                    readiness.bound,
+                    readiness.auth_ready
+                ));
+            }
+        }
+        lines.push(String::new());
+    }
+    Ok(lines.join("\n"))
+}
+
+fn explain_provider_payloads(
+    sessions_dir: &Path,
+    session_id: Option<&str>,
+    agent_id: Option<&str>,
+) -> Result<String, String> {
+    let records = RuntimeStore::for_sessions_dir(sessions_dir)
+        .list_context_inspections(session_id, agent_id)?;
+    if records.is_empty() {
+        return Ok("No provider payload inspections found.".into());
+    }
+    let mut sections = Vec::new();
+    for record in records {
+        let payload = record
+            .provider_request_payload
+            .map(|value| serde_json::to_string_pretty(&value).unwrap_or_else(|_| "<serialize failed>".into()))
+            .unwrap_or_else(|| "<none>".into());
+        sections.push(format!(
+            "Context {} | agent={} | model={}\nSelected tools: {}\nProvider bindings: {}\nEmitted artifacts: {}\nPayload:\n{}",
+            record.context_id,
+            record.agent_id,
+            record.provider_model.unwrap_or_else(|| "<unknown>".into()),
+            record
+                .tool_selection
+                .as_ref()
+                .map(|selection| {
+                    if selection.selected_tool_names.is_empty() {
+                        "<none>".into()
+                    } else {
+                        selection.selected_tool_names.join(", ")
+                    }
+                })
+                .unwrap_or_else(|| "<unknown>".into()),
+            if record.selected_tool_catalog.is_empty() {
+                "<none>".into()
+            } else {
+                record
+                    .selected_tool_catalog
+                    .iter()
+                    .map(|entry| format!("{}({:?}/{:?})", entry.public_name, entry.provider_kind, entry.runner_class))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            if record.emitted_artifacts.is_empty() {
+                "<none>".into()
+            } else {
+                record
+                    .emitted_artifacts
+                    .iter()
+                    .map(|artifact| format!("{:?}:{}", artifact.kind, artifact.label))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            payload
+        ));
+    }
+    Ok(sections.join("\n\n---\n\n"))
 }
 
 fn inspect_agent_runs_json(

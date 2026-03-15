@@ -275,6 +275,14 @@ CREATE TABLE IF NOT EXISTS retrieval_traces (
     payload_json TEXT NOT NULL,
     created_at_us INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS context_inspections (
+    context_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS repair_fallback_audits (
     audit_id TEXT PRIMARY KEY,
     request_id TEXT NOT NULL,

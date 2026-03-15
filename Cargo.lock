@@ -198,6 +198,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "tracing",
@@ -259,6 +260,7 @@ dependencies = [
  "ed25519-dalek",
  "extism",
  "serde",
+ "serde_json",
  "tempfile",
  "toml 0.8.23",
 ]

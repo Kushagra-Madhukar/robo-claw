@@ -113,7 +113,9 @@ impl RuntimeStore {
     pub fn list_agent_presence(&self) -> Result<Vec<aria_core::AgentPresenceRecord>, String> {
         let conn = self.connect()?;
         let mut stmt = conn
-            .prepare("SELECT payload_json FROM agent_presence ORDER BY updated_at_us DESC, agent_id ASC")
+            .prepare(
+                "SELECT payload_json FROM agent_presence ORDER BY updated_at_us DESC, agent_id ASC",
+            )
             .map_err(|e| format!("prepare list agent presence failed: {}", e))?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))

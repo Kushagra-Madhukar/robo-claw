@@ -1,11 +1,13 @@
 use super::{
-    adapter_for_family, collect_sse_like_stream, default_model_capability_profile, LLMBackend,
-    ModelMetadata, ModelProvider, SecretRef,
+    adapter_for_family, build_gemini_context_body, collect_sse_like_stream,
+    default_model_capability_profile, send_with_response_start_timeout, EgressCredentialBroker,
+    LLMBackend, ModelMetadata, ModelProvider, ProviderHealthIdentity, SecretRef,
 };
 use crate::{CachedTool, ExecutedToolCall, LLMResponse, OrchestratorError, ToolCall};
 use aria_core::{
-    AdapterFamily, CapabilitySourceKind, CapabilitySupport, ModelCapabilityProbeRecord,
-    ModelCapabilityProfile, ModelRef, ToolCallingMode, ToolRuntimePolicy,
+    AdapterFamily, CapabilitySourceKind, CapabilitySupport, ExecutionContextPack,
+    ModelCapabilityProbeRecord, ModelCapabilityProfile, ModelRef, ToolCallingMode,
+    ToolRuntimePolicy,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -18,9 +20,13 @@ pub struct GeminiBackend {
     pub base_url: String,
     capability_profile: ModelCapabilityProfile,
     client: reqwest::Client,
+    egress_broker: EgressCredentialBroker,
 }
 
 impl GeminiBackend {
+    pub(crate) const FUNCTION_CALL_PART_METADATA_PREFIX: &'static str =
+        "gemini_function_call_part:";
+
     pub fn new(api_key: SecretRef, model: impl Into<String>, base_url: impl Into<String>) -> Self {
         let model = model.into();
         Self {
@@ -37,6 +43,7 @@ impl GeminiBackend {
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_default(),
+            egress_broker: EgressCredentialBroker::new(),
         }
     }
 
@@ -54,7 +61,13 @@ impl GeminiBackend {
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_default(),
+            egress_broker: EgressCredentialBroker::new(),
         }
+    }
+
+    pub fn with_egress_broker(mut self, broker: EgressCredentialBroker) -> Self {
+        self.egress_broker = broker;
+        self
     }
 
     fn api_model_path(&self) -> String {
@@ -89,23 +102,39 @@ impl GeminiBackend {
         function_declarations: &[Value],
         executed_tools: &[ExecutedToolCall],
     ) -> Value {
-        let model_parts = executed_tools.iter().map(|entry| {
-            json!({
-                "functionCall": {
-                    "name": entry.call.name,
-                    "args": serde_json::from_str::<Value>(&entry.call.arguments).unwrap_or_else(|_| json!({}))
+        let model_parts = executed_tools
+            .iter()
+            .map(|entry| {
+                let invocation = entry.call.invocation_envelope();
+                let mut part = invocation
+                    .invocation_id
+                    .as_deref()
+                    .and_then(Self::decode_function_call_part_metadata)
+                    .unwrap_or_else(|| json!({}));
+                if !part.is_object() {
+                    part = json!({});
                 }
+                if !part.get("functionCall").is_some_and(Value::is_object) {
+                    part["functionCall"] = json!({});
+                }
+                part["functionCall"]["name"] = Value::String(invocation.tool_name.clone());
+                part["functionCall"]["args"] =
+                    serde_json::from_str::<Value>(&invocation.arguments_json)
+                        .unwrap_or_else(|_| json!({}));
+                part
             })
-        }).collect::<Vec<_>>();
+            .collect::<Vec<_>>();
         let tool_parts = executed_tools
             .iter()
             .map(|entry| {
+                let invocation = entry.call.invocation_envelope();
+                let result = entry.result_envelope();
                 json!({
                     "functionResponse": {
-                        "name": entry.call.name,
+                        "name": invocation.tool_name,
                         "response": {
-                            "name": entry.call.name,
-                            "content": entry.result.as_model_provider_payload(&entry.call.name)
+                            "name": invocation.tool_name,
+                            "content": result.as_provider_payload()
                         }
                     }
                 })
@@ -123,6 +152,20 @@ impl GeminiBackend {
             body["toolConfig"] = json!({ "functionCallingConfig": { "mode": "AUTO" } });
         }
         body
+    }
+
+    pub(crate) fn encode_function_call_part_metadata(function_call_part: &Value) -> Option<String> {
+        if !function_call_part.is_object() {
+            return None;
+        }
+        serde_json::to_string(function_call_part)
+            .ok()
+            .map(|raw| format!("{}{}", Self::FUNCTION_CALL_PART_METADATA_PREFIX, raw))
+    }
+
+    pub(crate) fn decode_function_call_part_metadata(encoded: &str) -> Option<Value> {
+        let raw = encoded.strip_prefix(Self::FUNCTION_CALL_PART_METADATA_PREFIX)?;
+        serde_json::from_str(raw).ok()
     }
 }
 
@@ -143,7 +186,11 @@ impl LLMBackend for GeminiBackend {
         tools: &[CachedTool],
         policy: &ToolRuntimePolicy,
     ) -> Result<LLMResponse, OrchestratorError> {
-        let api_key = self.api_key.resolve("generativelanguage.googleapis.com")?;
+        let api_key = self.api_key.resolve_with_broker(
+            "generativelanguage.googleapis.com",
+            "gemini_provider",
+            &self.egress_broker,
+        )?;
         let url = format!(
             "{}/{}:generateContent?key={}",
             self.base_url,
@@ -181,13 +228,9 @@ impl LLMBackend for GeminiBackend {
             super::apply_gemini_tool_policy(&mut body, &function_declarations, policy);
         }
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::LLMError(format!("Gemini request failed: {}", e)))?;
+        let resp =
+            send_with_response_start_timeout("Gemini", self.client.post(&url).json(&body).send())
+                .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -207,7 +250,84 @@ impl LLMBackend for GeminiBackend {
                 if let Some(function_call) = part.get("functionCall") {
                     if let Some(name) = function_call["name"].as_str() {
                         tool_calls.push(ToolCall {
-                            invocation_id: None,
+                            invocation_id: Self::encode_function_call_part_metadata(part),
+                            name: name.to_string(),
+                            arguments: function_call["args"].to_string(),
+                        });
+                    }
+                } else if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
+                    text_parts.push(text.to_string());
+                }
+            }
+            if !tool_calls.is_empty() {
+                return Ok(LLMResponse::ToolCalls(tool_calls));
+            }
+            if !text_parts.is_empty() {
+                return Ok(LLMResponse::TextAnswer(text_parts.join("\n")));
+            }
+        }
+        Err(OrchestratorError::LLMError(
+            "Gemini returned no content".into(),
+        ))
+    }
+
+    async fn query_context_with_policy(
+        &self,
+        context: &aria_core::ExecutionContextPack,
+        tools: &[CachedTool],
+        policy: &ToolRuntimePolicy,
+    ) -> Result<LLMResponse, OrchestratorError> {
+        let api_key = self.api_key.resolve_with_broker(
+            "generativelanguage.googleapis.com",
+            "gemini_provider",
+            &self.egress_broker,
+        )?;
+        let url = format!(
+            "{}/{}:generateContent?key={}",
+            self.base_url,
+            self.api_model_path(),
+            api_key
+        );
+        let adapter = adapter_for_family(self.capability_profile.adapter_family);
+        let filtered_tools = adapter.filter_tools(&self.capability_profile, tools);
+        let tool_mode = adapter.tool_calling_mode(&self.capability_profile);
+        let function_declarations = self.translated_function_declarations(&filtered_tools);
+        let body = super::build_gemini_context_body(
+            context,
+            if matches!(
+                tool_mode,
+                ToolCallingMode::NativeTools | ToolCallingMode::CompatTools
+            ) {
+                &function_declarations
+            } else {
+                &[]
+            },
+            policy,
+        );
+
+        let resp =
+            send_with_response_start_timeout("Gemini", self.client.post(&url).json(&body).send())
+                .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(OrchestratorError::LLMError(format!(
+                "Gemini returned {}: {}",
+                status, text
+            )));
+        }
+        let res_json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| OrchestratorError::LLMError(format!("Gemini JSON parse failed: {}", e)))?;
+        if let Some(parts) = res_json["candidates"][0]["content"]["parts"].as_array() {
+            let mut tool_calls = Vec::new();
+            let mut text_parts = Vec::new();
+            for part in parts {
+                if let Some(function_call) = part.get("functionCall") {
+                    if let Some(name) = function_call["name"].as_str() {
+                        tool_calls.push(ToolCall {
+                            invocation_id: Self::encode_function_call_part_metadata(part),
                             name: name.to_string(),
                             arguments: function_call["args"].to_string(),
                         });
@@ -234,7 +354,11 @@ impl LLMBackend for GeminiBackend {
         tools: &[CachedTool],
         policy: &ToolRuntimePolicy,
     ) -> Result<LLMResponse, OrchestratorError> {
-        let api_key = self.api_key.resolve("generativelanguage.googleapis.com")?;
+        let api_key = self.api_key.resolve_with_broker(
+            "generativelanguage.googleapis.com",
+            "gemini_provider",
+            &self.egress_broker,
+        )?;
         let url = format!(
             "{}/{}:streamGenerateContent?key={}",
             self.base_url,
@@ -270,15 +394,11 @@ impl LLMBackend for GeminiBackend {
         {
             super::apply_gemini_tool_policy(&mut body, &function_declarations, policy);
         }
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                OrchestratorError::LLMError(format!("Gemini streaming request failed: {}", e))
-            })?;
+        let resp = send_with_response_start_timeout(
+            "Gemini streaming",
+            self.client.post(&url).json(&body).send(),
+        )
+        .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -312,7 +432,11 @@ impl LLMBackend for GeminiBackend {
         executed_tools: &[ExecutedToolCall],
         policy: &ToolRuntimePolicy,
     ) -> Result<LLMResponse, OrchestratorError> {
-        let api_key = self.api_key.resolve("generativelanguage.googleapis.com")?;
+        let api_key = self.api_key.resolve_with_broker(
+            "generativelanguage.googleapis.com",
+            "gemini_provider",
+            &self.egress_broker,
+        )?;
         let url = format!(
             "{}/{}:generateContent?key={}",
             self.base_url,
@@ -323,13 +447,9 @@ impl LLMBackend for GeminiBackend {
         let mut body =
             self.build_tool_follow_up_body(prompt, &function_declarations, executed_tools);
         super::apply_gemini_tool_policy(&mut body, &function_declarations, policy);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::LLMError(format!("Gemini request failed: {}", e)))?;
+        let resp =
+            send_with_response_start_timeout("Gemini", self.client.post(&url).json(&body).send())
+                .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -349,7 +469,7 @@ impl LLMBackend for GeminiBackend {
                 if let Some(function_call) = part.get("functionCall") {
                     if let Some(name) = function_call["name"].as_str() {
                         tool_calls.push(ToolCall {
-                            invocation_id: None,
+                            invocation_id: Self::encode_function_call_part_metadata(part),
                             name: name.to_string(),
                             arguments: function_call["args"].to_string(),
                         });
@@ -377,7 +497,11 @@ impl LLMBackend for GeminiBackend {
         executed_tools: &[ExecutedToolCall],
         policy: &ToolRuntimePolicy,
     ) -> Result<LLMResponse, OrchestratorError> {
-        let api_key = self.api_key.resolve("generativelanguage.googleapis.com")?;
+        let api_key = self.api_key.resolve_with_broker(
+            "generativelanguage.googleapis.com",
+            "gemini_provider",
+            &self.egress_broker,
+        )?;
         let url = format!(
             "{}/{}:streamGenerateContent?key={}",
             self.base_url,
@@ -388,15 +512,11 @@ impl LLMBackend for GeminiBackend {
         let mut body =
             self.build_tool_follow_up_body(prompt, &function_declarations, executed_tools);
         super::apply_gemini_tool_policy(&mut body, &function_declarations, policy);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                OrchestratorError::LLMError(format!("Gemini streaming request failed: {}", e))
-            })?;
+        let resp = send_with_response_start_timeout(
+            "Gemini streaming",
+            self.client.post(&url).json(&body).send(),
+        )
+        .await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -409,12 +529,33 @@ impl LLMBackend for GeminiBackend {
         collect_sse_like_stream(resp, adapter).await
     }
 
+    fn inspect_context_payload(
+        &self,
+        context: &ExecutionContextPack,
+        tools: &[CachedTool],
+        policy: &ToolRuntimePolicy,
+    ) -> Option<serde_json::Value> {
+        let function_declarations = self.translated_function_declarations(tools);
+        Some(build_gemini_context_body(
+            context,
+            &function_declarations,
+            policy,
+        ))
+    }
+
     fn model_ref(&self) -> Option<ModelRef> {
         Some(self.capability_profile.model_ref.clone())
     }
 
     fn capability_profile(&self) -> Option<ModelCapabilityProfile> {
         Some(self.capability_profile.clone())
+    }
+
+    fn provider_health_identity(&self) -> ProviderHealthIdentity {
+        ProviderHealthIdentity {
+            provider_family: self.capability_profile.model_ref.provider_id.clone(),
+            upstream_identity: self.base_url.clone(),
+        }
     }
 }
 
@@ -465,7 +606,6 @@ mod tests {
             modalities: vec![aria_core::ToolModality::Text],
         }
     }
-
     fn executed_tool() -> ExecutedToolCall {
         ExecutedToolCall {
             call: ToolCall {
@@ -478,6 +618,27 @@ mod tests {
                 "write_file",
                 json!({"ok": true, "bytes": 5}),
             ),
+        }
+    }
+
+    fn context_pack() -> ExecutionContextPack {
+        ExecutionContextPack {
+            system_prompt: String::from("system guidance"),
+            history_messages: vec![aria_core::PromptContextMessage {
+                role: String::from("user"),
+                content: String::from("hello"),
+                timestamp_us: 1,
+            }],
+            context_blocks: vec![aria_core::ContextBlock {
+                kind: aria_core::ContextBlockKind::Retrieval,
+                label: String::from("retrieval"),
+                content: String::from("source text"),
+                token_estimate: 3,
+            }],
+            user_request: String::from("save this"),
+            channel: aria_core::GatewayChannel::Cli,
+            execution_contract: None,
+            retrieved_context: None,
         }
     }
 
@@ -513,6 +674,56 @@ mod tests {
     }
 
     #[test]
+    fn gemini_follow_up_body_preserves_provider_function_call_part_metadata() {
+        let backend = backend();
+        let function_declarations = backend.translated_function_declarations(&[tool()]);
+        let executed = ExecutedToolCall {
+            call: ToolCall {
+                invocation_id: GeminiBackend::encode_function_call_part_metadata(&json!({
+                    "functionCall": {
+                        "name": "write_file",
+                        "args": { "path": "stale.txt" }
+                    },
+                    "thought_signature": "sig_123"
+                })),
+                name: String::from("write_file"),
+                arguments: String::from(r#"{"path":"notes.txt","content":"hello"}"#),
+            },
+            result: ToolExecutionResult::structured(
+                "write succeeded",
+                "write_file",
+                json!({"ok": true, "bytes": 5}),
+            ),
+        };
+        let body =
+            backend.build_tool_follow_up_body("save this", &function_declarations, &[executed]);
+
+        assert_eq!(
+            body["contents"][1]["parts"][0]["thought_signature"],
+            json!("sig_123")
+        );
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionCall"]["name"],
+            json!("write_file")
+        );
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionCall"]["args"]["path"],
+            json!("notes.txt")
+        );
+    }
+
+    #[test]
+    fn gemini_function_declarations_strip_additional_properties() {
+        let backend = backend();
+        let function_declarations = backend.translated_function_declarations(&[tool()]);
+        let parameters = &function_declarations[0]["parameters"];
+
+        assert!(parameters["additionalProperties"].is_null());
+        assert_eq!(parameters["type"], json!("object"));
+        assert_eq!(parameters["required"], json!(["content", "path"]));
+    }
+
+    #[test]
     fn gemini_tool_policy_can_force_single_function() {
         let backend = backend();
         let function_declarations = backend.translated_function_declarations(&[tool()]);
@@ -539,11 +750,30 @@ mod tests {
             json!("write_file")
         );
     }
+
+    #[test]
+    fn gemini_inspect_context_payload_includes_contents_and_tools() {
+        let backend = backend();
+        let payload = backend
+            .inspect_context_payload(&context_pack(), &[tool()], &ToolRuntimePolicy::default())
+            .expect("payload");
+
+        assert!(payload["contents"].is_array());
+        assert_eq!(
+            payload["tools"][0]["functionDeclarations"][0]["name"],
+            json!("write_file")
+        );
+        assert_eq!(
+            payload["systemInstruction"]["parts"][0]["text"],
+            json!("system guidance")
+        );
+    }
 }
 
 pub struct GeminiProvider {
     pub api_key: SecretRef,
     pub base_url: String,
+    pub egress_broker: Option<EgressCredentialBroker>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -592,7 +822,15 @@ impl ModelProvider for GeminiProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelMetadata>, OrchestratorError> {
-        let api_key = self.api_key.resolve("generativelanguage.googleapis.com")?;
+        let broker = self
+            .egress_broker
+            .clone()
+            .unwrap_or_else(EgressCredentialBroker::new);
+        let api_key = self.api_key.resolve_with_broker(
+            "generativelanguage.googleapis.com",
+            "gemini_provider",
+            &broker,
+        )?;
         let url = format!(
             "{}/models?key={}",
             self.base_url.trim_end_matches('/'),
@@ -625,22 +863,32 @@ impl ModelProvider for GeminiProvider {
     }
 
     fn create_backend(&self, model_id: &str) -> Result<Box<dyn LLMBackend>, OrchestratorError> {
-        Ok(Box::new(GeminiBackend::new(
-            self.api_key.clone(),
-            model_id,
-            self.base_url.clone(),
-        )))
+        Ok(Box::new(
+            GeminiBackend::new(self.api_key.clone(), model_id, self.base_url.clone())
+                .with_egress_broker(
+                    self.egress_broker
+                        .clone()
+                        .unwrap_or_else(EgressCredentialBroker::new),
+                ),
+        ))
     }
 
     fn create_backend_with_profile(
         &self,
         profile: &ModelCapabilityProfile,
     ) -> Result<Box<dyn LLMBackend>, OrchestratorError> {
-        Ok(Box::new(GeminiBackend::with_capability_profile(
-            self.api_key.clone(),
-            profile.clone(),
-            self.base_url.clone(),
-        )))
+        Ok(Box::new(
+            GeminiBackend::with_capability_profile(
+                self.api_key.clone(),
+                profile.clone(),
+                self.base_url.clone(),
+            )
+            .with_egress_broker(
+                self.egress_broker
+                    .clone()
+                    .unwrap_or_else(EgressCredentialBroker::new),
+            ),
+        ))
     }
 
     async fn probe_model_capabilities(
@@ -648,7 +896,15 @@ impl ModelProvider for GeminiProvider {
         model_id: &str,
         observed_at_us: u64,
     ) -> Result<ModelCapabilityProbeRecord, OrchestratorError> {
-        let api_key = self.api_key.resolve("generativelanguage.googleapis.com")?;
+        let broker = self
+            .egress_broker
+            .clone()
+            .unwrap_or_else(EgressCredentialBroker::new);
+        let api_key = self.api_key.resolve_with_broker(
+            "generativelanguage.googleapis.com",
+            "gemini_provider",
+            &broker,
+        )?;
         let model_path = if model_id.starts_with("models/") {
             model_id.to_string()
         } else {

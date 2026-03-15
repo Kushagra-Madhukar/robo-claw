@@ -1,6 +1,7 @@
 use super::{
-    adapter_for_family, collect_sse_like_stream, default_model_capability_profile, LLMBackend,
-    ModelMetadata, ModelProvider,
+    adapter_for_family, collect_sse_like_stream, default_model_capability_profile,
+    send_with_response_start_timeout, LLMBackend, ModelMetadata, ModelProvider,
+    ProviderHealthIdentity,
 };
 use crate::{CachedTool, LLMResponse, OrchestratorError, ToolCall};
 use aria_core::{
@@ -65,15 +66,11 @@ impl OllamaBackend {
             "stream": true
         });
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                OrchestratorError::LLMError(format!("Ollama streaming request failed: {}", e))
-            })?;
+        let resp = send_with_response_start_timeout(
+            "Ollama streaming",
+            self.client.post(&url).json(&body).send(),
+        )
+        .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -148,15 +145,11 @@ impl LLMBackend for OllamaBackend {
                     .collect::<Vec<_>>()
             });
 
-            let resp = self
-                .client
-                .post(&url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::LLMError(format!("Ollama chat request failed: {}", e))
-                })?;
+            let resp = send_with_response_start_timeout(
+                "Ollama chat",
+                self.client.post(&url).json(&body).send(),
+            )
+            .await?;
 
             if resp.status().is_success() {
                 let res_json: serde_json::Value = resp.json().await.map_err(|e| {
@@ -196,13 +189,9 @@ impl LLMBackend for OllamaBackend {
             "stream": false
         });
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::LLMError(format!("Ollama request failed: {}", e)))?;
+        let resp =
+            send_with_response_start_timeout("Ollama", self.client.post(&url).json(&body).send())
+                .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -227,6 +216,118 @@ impl LLMBackend for OllamaBackend {
         }
 
         Ok(LLMResponse::TextAnswer(text.trim().to_string()))
+    }
+
+    async fn query_context_with_policy(
+        &self,
+        context: &aria_core::ExecutionContextPack,
+        tools: &[CachedTool],
+        _policy: &ToolRuntimePolicy,
+    ) -> Result<LLMResponse, OrchestratorError> {
+        let adapter = adapter_for_family(self.capability_profile.adapter_family);
+        let filtered_tools = adapter.filter_tools(&self.capability_profile, tools);
+        let tool_mode = adapter.tool_calling_mode(&self.capability_profile);
+        let messages = super::build_openai_compatible_initial_messages(context);
+
+        let url = format!("{}/api/chat", self.base_url);
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": false,
+        });
+        if matches!(
+            tool_mode,
+            ToolCallingMode::NativeTools | ToolCallingMode::CompatTools
+        ) && !filtered_tools.is_empty()
+        {
+            body["tools"] = serde_json::Value::Array(
+                filtered_tools
+                    .iter()
+                    .filter_map(|tool| {
+                        adapter
+                            .translate_tool_definition(&self.capability_profile, tool)
+                            .ok()
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let resp = send_with_response_start_timeout(
+            "Ollama chat",
+            self.client.post(&url).json(&body).send(),
+        )
+        .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(OrchestratorError::LLMError(format!(
+                "Ollama chat returned {}: {}",
+                status, text
+            )));
+        }
+        let res_json: serde_json::Value = resp.json().await.map_err(|e| {
+            OrchestratorError::LLMError(format!("Ollama chat JSON parse failed: {}", e))
+        })?;
+        if let Some(tool_calls) = res_json["message"]["tool_calls"].as_array() {
+            let normalized = tool_calls
+                .iter()
+                .filter_map(|call| {
+                    let name = call["function"]["name"].as_str()?.to_string();
+                    let arguments = if call["function"]["arguments"].is_string() {
+                        call["function"]["arguments"].as_str()?.to_string()
+                    } else {
+                        call["function"]["arguments"].to_string()
+                    };
+                    Some(ToolCall {
+                        invocation_id: None,
+                        name,
+                        arguments,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !normalized.is_empty() {
+                return Ok(LLMResponse::ToolCalls(normalized));
+            }
+        }
+        if let Some(content) = res_json["message"]["content"].as_str() {
+            return Ok(LLMResponse::TextAnswer(content.trim().to_string()));
+        }
+        Err(OrchestratorError::LLMError(
+            "Ollama chat returned no content".into(),
+        ))
+    }
+
+    fn inspect_context_payload(
+        &self,
+        context: &aria_core::ExecutionContextPack,
+        tools: &[CachedTool],
+        _policy: &ToolRuntimePolicy,
+    ) -> Option<serde_json::Value> {
+        let adapter = adapter_for_family(self.capability_profile.adapter_family);
+        let filtered_tools = adapter.filter_tools(&self.capability_profile, tools);
+        let tool_mode = adapter.tool_calling_mode(&self.capability_profile);
+        let messages = super::build_openai_compatible_initial_messages(context);
+        if matches!(
+            tool_mode,
+            ToolCallingMode::NativeTools | ToolCallingMode::CompatTools
+        ) && !filtered_tools.is_empty()
+        {
+            Some(json!({
+                "model": self.model,
+                "messages": messages,
+                "stream": false,
+                "tools": filtered_tools
+                    .iter()
+                    .filter_map(|tool| adapter.translate_tool_definition(&self.capability_profile, tool).ok())
+                    .collect::<Vec<_>>()
+            }))
+        } else {
+            Some(json!({
+                "model": self.model,
+                "messages": messages,
+                "stream": false
+            }))
+        }
     }
 
     async fn query_stream_with_policy(
@@ -254,18 +355,11 @@ impl LLMBackend for OllamaBackend {
                     .filter_map(|tool| adapter.translate_tool_definition(&self.capability_profile, tool).ok())
                     .collect::<Vec<_>>()
             });
-            let resp = self
-                .client
-                .post(&url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::LLMError(format!(
-                        "Ollama chat streaming request failed: {}",
-                        e
-                    ))
-                })?;
+            let resp = send_with_response_start_timeout(
+                "Ollama chat streaming",
+                self.client.post(&url).json(&body).send(),
+            )
+            .await?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
@@ -301,12 +395,13 @@ impl LLMBackend for OllamaBackend {
             let model_calls = executed_tools
                 .iter()
                 .map(|entry| {
+                    let invocation = entry.call.invocation_envelope();
                     json!({
                         "role": "assistant",
                         "tool_calls": [{
                             "function": {
-                                "name": entry.call.name,
-                                "arguments": serde_json::from_str::<serde_json::Value>(&entry.call.arguments)
+                                "name": invocation.tool_name,
+                                "arguments": serde_json::from_str::<serde_json::Value>(&invocation.arguments_json)
                                     .unwrap_or_else(|_| json!({}))
                             }
                         }]
@@ -316,9 +411,10 @@ impl LLMBackend for OllamaBackend {
             let tool_messages = executed_tools
                 .iter()
                 .map(|entry| {
+                    let result = entry.result_envelope();
                     json!({
                         "role": "tool",
-                        "content": entry.result.as_model_provider_payload(&entry.call.name)
+                        "content": result.as_provider_payload()
                     })
                 })
                 .collect::<Vec<_>>();
@@ -334,18 +430,11 @@ impl LLMBackend for OllamaBackend {
                     .filter_map(|tool| adapter.translate_tool_definition(&self.capability_profile, tool).ok())
                     .collect::<Vec<_>>()
             });
-            let resp = self
-                .client
-                .post(&url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| {
-                    OrchestratorError::LLMError(format!(
-                        "Ollama chat streaming request failed: {}",
-                        e
-                    ))
-                })?;
+            let resp = send_with_response_start_timeout(
+                "Ollama chat streaming",
+                self.client.post(&url).json(&body).send(),
+            )
+            .await?;
             if !resp.status().is_success() {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
@@ -366,6 +455,13 @@ impl LLMBackend for OllamaBackend {
 
     fn capability_profile(&self) -> Option<ModelCapabilityProfile> {
         Some(self.capability_profile.clone())
+    }
+
+    fn provider_health_identity(&self) -> ProviderHealthIdentity {
+        ProviderHealthIdentity {
+            provider_family: self.capability_profile.model_ref.provider_id.clone(),
+            upstream_identity: self.base_url.clone(),
+        }
     }
 }
 

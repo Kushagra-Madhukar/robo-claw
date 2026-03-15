@@ -123,9 +123,10 @@ struct RunShellRequest {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ScheduleMessageRequest {
+    #[serde(alias = "message")]
     task: String,
     #[serde(default)]
-    schedule: Option<ToolSchedule>,
+    schedule: Option<serde_json::Value>,
     #[serde(default)]
     delay: Option<serde_json::Value>,
     #[serde(default)]
@@ -220,6 +221,24 @@ struct ExecuteSkillRequest {
     input: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RegisterExternalCompatToolRequest {
+    tool_name: String,
+    command: Vec<String>,
+    description: String,
+    #[serde(default)]
+    parameters_schema: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RegisterRemoteToolRequest {
+    tool_name: String,
+    endpoint: String,
+    description: String,
+    #[serde(default)]
+    parameters_schema: Option<String>,
+}
+
 #[cfg(feature = "mcp-runtime")]
 #[derive(Debug, Clone, serde::Deserialize)]
 struct BindMcpImportRequest {
@@ -275,7 +294,7 @@ struct ManageCronRequest {
     #[serde(default)]
     prompt: Option<String>,
     #[serde(default)]
-    schedule: Option<ToolSchedule>,
+    schedule: Option<serde_json::Value>,
     #[serde(default)]
     agent_id: Option<String>,
     #[serde(default)]
@@ -510,9 +529,33 @@ struct WebFetchResponse {
     body: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct SearchWebResult {
+    title: String,
+    url: String,
+    #[serde(default)]
+    snippet: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SearchWebResponse {
+    query: String,
+    search_url: String,
+    results: Vec<SearchWebResult>,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 struct UrlRequest {
     url: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct SearchWebRequest {
+    query: String,
+    #[serde(default)]
+    site: Option<String>,
+    #[serde(default)]
+    max_results: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1063,25 +1106,25 @@ impl ToolExecutor for NativeToolExecutor {
                 if task.is_empty() {
                     return Err(OrchestratorError::ToolError("Missing 'task'".into()));
                 }
-                if request.delay.is_some() {
-                    return Err(OrchestratorError::ToolError(
-                        "Legacy 'delay' is not supported. Use a structured 'schedule' object."
-                            .into(),
-                    ));
-                }
 
                 let classified_schedule = self
                     .scheduling_intent
                     .as_ref()
                     .and_then(|intent| intent.normalized_schedule.clone());
-                let schedule_input = if let Some(schedule_value) = request.schedule.clone() {
+                let parsed_schedule =
+                    parse_tool_schedule_value(request.schedule.as_ref(), self.user_timezone, "schedule")?;
+                let parsed_delay =
+                    parse_tool_schedule_value(request.delay.as_ref(), self.user_timezone, "delay")?;
+                let schedule_input = if let Some(schedule_value) = parsed_schedule {
+                    schedule_value
+                } else if let Some(schedule_value) = classified_schedule.clone() {
+                    schedule_value
+                } else if let Some(schedule_value) = parsed_delay {
                     schedule_value
                 } else {
-                    classified_schedule.clone().ok_or_else(|| {
-                        OrchestratorError::ToolError(
-                            "Missing 'schedule'. Provide a structured schedule object.".into(),
-                        )
-                    })?
+                    return Err(OrchestratorError::ToolError(
+                        "Missing 'schedule'. Provide a structured schedule object.".into(),
+                    ));
                 };
                 let (normalized_delay, spec) = schedule_input
                     .to_schedule_parts(self.user_timezone)
@@ -1115,16 +1158,11 @@ impl ToolExecutor for NativeToolExecutor {
                             .as_ref()
                             .and_then(|intent| intent.deferred_task.clone())
                     });
-                let mut mode = mode;
-                if deferred_prompt.is_some() && mode == "notify" {
-                    // If a deferred prompt is present but mode is notify, prefer executing deferred work.
-                    // This avoids losing deferred actions due to model inconsistency.
-                    mode = self
-                        .scheduling_intent
-                        .as_ref()
-                        .map(|intent| intent.mode.as_tool_mode().to_string())
-                        .unwrap_or_else(|| "defer".to_string());
-                }
+                let mode = if deferred_prompt.is_some() && mode == "notify" {
+                    "both".to_string()
+                } else {
+                    mode
+                };
                 let deferred_task = deferred_prompt.unwrap_or_else(|| task.clone());
                 if !matches!(
                     mode.as_str(),
@@ -2160,6 +2198,99 @@ impl ToolExecutor for NativeToolExecutor {
                     }),
                 ))
             }
+            "register_external_compat_tool" => {
+                let request: RegisterExternalCompatToolRequest = decode_tool_args(call)?;
+                let tool_name = required_trimmed(&request.tool_name, "tool_name")?;
+                if tool_name.starts_with("mcp__") {
+                    return Err(OrchestratorError::ToolError(
+                        "external compat tool names may not use reserved 'mcp__' prefix".into(),
+                    ));
+                }
+                if request.command.is_empty() {
+                    return Err(OrchestratorError::ToolError(
+                        "register_external_compat_tool requires a non-empty command".into(),
+                    ));
+                }
+                let description = required_trimmed(&request.description, "description")?;
+                let parameters_schema = request
+                    .parameters_schema
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("{}")
+                    .to_string();
+                serde_json::from_str::<serde_json::Value>(&parameters_schema).map_err(|e| {
+                    OrchestratorError::ToolError(format!(
+                        "register_external_compat_tool invalid parameters_schema: {}",
+                        e
+                    ))
+                })?;
+                register_external_compat_tool(ExternalCompatToolRegistration {
+                    tool_name: tool_name.clone(),
+                    command: request.command,
+                    description: description.clone(),
+                    parameters_schema,
+                })
+                .map_err(OrchestratorError::ToolError)?;
+                Ok(ToolExecutionResult::structured(
+                    format!("Registered external compat tool '{}'.", tool_name),
+                    "external_compat_tool",
+                    serde_json::json!({
+                        "tool_name": tool_name,
+                        "description": description,
+                    }),
+                ))
+            }
+            "register_remote_tool" => {
+                let request: RegisterRemoteToolRequest = decode_tool_args(call)?;
+                let tool_name = required_trimmed(&request.tool_name, "tool_name")?;
+                let endpoint = required_trimmed(&request.endpoint, "endpoint")?;
+                if tool_name.starts_with("mcp__") {
+                    return Err(OrchestratorError::ToolError(
+                        "remote tool names may not use reserved 'mcp__' prefix".into(),
+                    ));
+                }
+                let parsed = reqwest::Url::parse(&endpoint).map_err(|e| {
+                    OrchestratorError::ToolError(format!(
+                        "register_remote_tool invalid endpoint: {}",
+                        e
+                    ))
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    return Err(OrchestratorError::ToolError(
+                        "register_remote_tool endpoint must use http or https".into(),
+                    ));
+                }
+                let description = required_trimmed(&request.description, "description")?;
+                let parameters_schema = request
+                    .parameters_schema
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("{}")
+                    .to_string();
+                serde_json::from_str::<serde_json::Value>(&parameters_schema).map_err(|e| {
+                    OrchestratorError::ToolError(format!(
+                        "register_remote_tool invalid parameters_schema: {}",
+                        e
+                    ))
+                })?;
+                register_remote_tool(RemoteToolRegistration {
+                    tool_name: tool_name.clone(),
+                    endpoint,
+                    description: description.clone(),
+                    parameters_schema,
+                })
+                .map_err(OrchestratorError::ToolError)?;
+                Ok(ToolExecutionResult::structured(
+                    format!("Registered remote tool '{}'.", tool_name),
+                    "remote_tool",
+                    serde_json::json!({
+                        "tool_name": tool_name,
+                        "description": description,
+                    }),
+                ))
+            }
             #[cfg(feature = "mcp-runtime")]
             "register_mcp_server" => {
                 let sessions_dir = self.sessions_dir.as_ref().ok_or_else(|| {
@@ -2607,9 +2738,12 @@ impl ToolExecutor for NativeToolExecutor {
                         self.invoking_agent_id.as_deref(),
                         "this cron job",
                     )?;
-                    let schedule_input = request.schedule.clone().ok_or_else(|| {
-                            OrchestratorError::ToolError("Missing 'schedule' object".into())
-                        })?;
+                    let schedule_input = parse_tool_schedule_value(
+                        request.schedule.as_ref(),
+                        self.user_timezone,
+                        "schedule",
+                    )?
+                    .ok_or_else(|| OrchestratorError::ToolError("Missing 'schedule' object".into()))?;
 
                     if prompt.is_empty() {
                         return Err(OrchestratorError::ToolError("Missing 'prompt'".into()));
@@ -4602,6 +4736,22 @@ impl ToolExecutor for NativeToolExecutor {
                     },
                 ))
             }
+            "search_web" => {
+                let request: SearchWebRequest = decode_tool_args(call)?;
+                let query = required_trimmed(&request.query, "query")?;
+                let search_url = build_search_web_url(&query, request.site.as_deref())?;
+                let (body, _content_type) = fetch_web_document(&search_url).await?;
+                let results = parse_search_web_results(&body, request.max_results.unwrap_or(5));
+                Ok(structured_payload(
+                    format!("Found {} search results for '{}'.", results.len(), query),
+                    "search_web",
+                    &SearchWebResponse {
+                        query,
+                        search_url,
+                        results,
+                    },
+                ))
+            }
             "web_fetch" => {
                 let request: UrlRequest = decode_tool_args(call)?;
                 let url = &request.url;
@@ -4936,6 +5086,224 @@ impl ToolExecutor for NativeToolExecutor {
 pub struct MultiplexToolExecutor {
     wasm: WasmToolExecutor,
     native: NativeToolExecutor,
+    external: ExternalCompatToolExecutor,
+    remote: RemoteToolExecutor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ExternalCompatToolRegistration {
+    tool_name: String,
+    command: Vec<String>,
+    description: String,
+    parameters_schema: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RemoteToolRegistration {
+    tool_name: String,
+    endpoint: String,
+    description: String,
+    parameters_schema: String,
+}
+
+fn external_compat_registry(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, ExternalCompatToolRegistration>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ExternalCompatToolRegistration>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn remote_tool_registry(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, RemoteToolRegistration>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, RemoteToolRegistration>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn register_external_compat_tool(registration: ExternalCompatToolRegistration) -> Result<(), String> {
+    let mut guard = external_compat_registry()
+        .lock()
+        .map_err(|_| "external compat registry poisoned".to_string())?;
+    guard.insert(registration.tool_name.clone(), registration);
+    Ok(())
+}
+
+fn get_external_compat_tool(tool_name: &str) -> Option<ExternalCompatToolRegistration> {
+    external_compat_registry()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(tool_name).cloned())
+}
+
+fn register_remote_tool(registration: RemoteToolRegistration) -> Result<(), String> {
+    let mut guard = remote_tool_registry()
+        .lock()
+        .map_err(|_| "remote tool registry poisoned".to_string())?;
+    guard.insert(registration.tool_name.clone(), registration);
+    Ok(())
+}
+
+fn get_remote_tool(tool_name: &str) -> Option<RemoteToolRegistration> {
+    remote_tool_registry()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(tool_name).cloned())
+}
+
+fn list_remote_tools() -> Vec<RemoteToolRegistration> {
+    remote_tool_registry()
+        .lock()
+        .map(|guard| guard.values().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn list_external_compat_tools() -> Vec<ExternalCompatToolRegistration> {
+    external_compat_registry()
+        .lock()
+        .map(|guard| guard.values().cloned().collect())
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Default)]
+struct ExternalCompatToolExecutor;
+
+#[async_trait::async_trait]
+impl ToolExecutor for ExternalCompatToolExecutor {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolExecutionResult, OrchestratorError> {
+        let Some(registration) = get_external_compat_tool(&call.name) else {
+            return Err(OrchestratorError::ToolError(format!(
+                "external compat tool '{}' is not registered",
+                call.name
+            )));
+        };
+        if registration.command.is_empty() {
+            return Err(OrchestratorError::ToolError(format!(
+                "external compat tool '{}' has no command configured",
+                call.name
+            )));
+        }
+        let mut command = std::process::Command::new(&registration.command[0]);
+        if registration.command.len() > 1 {
+            command.args(&registration.command[1..]);
+        }
+        command.stdin(std::process::Stdio::piped());
+        command.stdout(std::process::Stdio::piped());
+        let mut child = command.spawn().map_err(|e| {
+            OrchestratorError::ToolError(format!(
+                "failed to spawn external compat tool '{}': {}",
+                call.name, e
+            ))
+        })?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let envelope = serde_json::json!({
+                "tool_name": call.name,
+                "arguments_json": call.arguments,
+            })
+            .to_string();
+            use std::io::Write;
+            stdin
+                .write_all(envelope.as_bytes())
+                .map_err(|e| OrchestratorError::ToolError(format!("external compat stdin write failed: {}", e)))?;
+        }
+        let output = child.wait_with_output().map_err(|e| {
+            OrchestratorError::ToolError(format!(
+                "external compat tool '{}' failed: {}",
+                call.name, e
+            ))
+        })?;
+        if !output.status.success() {
+            return Err(OrchestratorError::ToolError(format!(
+                "external compat tool '{}' exited with status {}",
+                call.name, output.status
+            )));
+        }
+        let stdout = String::from_utf8(output.stdout).map_err(|e| {
+            OrchestratorError::ToolError(format!(
+                "external compat tool '{}' emitted non-utf8 output: {}",
+                call.name, e
+            ))
+        })?;
+        let parsed = serde_json::from_str::<aria_core::ToolResultEnvelope>(&stdout).map_err(|e| {
+            OrchestratorError::ToolError(format!(
+                "external compat tool '{}' emitted invalid envelope: {}",
+                call.name, e
+            ))
+        })?;
+        if parsed.ok {
+            Ok(ToolExecutionResult::structured(
+                parsed.summary,
+                parsed.kind.unwrap_or_else(|| "external_compat".into()),
+                parsed.data.unwrap_or_else(|| serde_json::json!({})),
+            ))
+        } else {
+            Err(OrchestratorError::ToolError(
+                parsed
+                    .error
+                    .unwrap_or_else(|| "external compat tool failed".into()),
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct RemoteToolExecutor;
+
+#[async_trait::async_trait]
+impl ToolExecutor for RemoteToolExecutor {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolExecutionResult, OrchestratorError> {
+        let Some(registration) = get_remote_tool(&call.name) else {
+            return Err(OrchestratorError::ToolError(format!(
+                "remote tool '{}' is not registered",
+                call.name
+            )));
+        };
+        let client = reqwest::Client::new();
+        let response = client
+            .post(&registration.endpoint)
+            .json(&serde_json::json!({
+                "tool_name": call.name,
+                "arguments_json": call.arguments,
+            }))
+            .send()
+            .await
+            .map_err(|e| {
+                OrchestratorError::ToolError(format!(
+                    "remote tool '{}' request failed: {}",
+                    call.name, e
+                ))
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(OrchestratorError::ToolError(format!(
+                "remote tool '{}' returned {}: {}",
+                call.name, status, text
+            )));
+        }
+        let parsed = response
+            .json::<aria_core::ToolResultEnvelope>()
+            .await
+            .map_err(|e| {
+                OrchestratorError::ToolError(format!(
+                    "remote tool '{}' emitted invalid envelope: {}",
+                    call.name, e
+                ))
+            })?;
+        if parsed.ok {
+            Ok(ToolExecutionResult::structured(
+                parsed.summary,
+                parsed.kind.unwrap_or_else(|| "remote_tool".into()),
+                parsed.data.unwrap_or_else(|| serde_json::json!({})),
+            ))
+        } else {
+            Err(OrchestratorError::ToolError(
+                parsed.error.unwrap_or_else(|| "remote tool failed".into()),
+            ))
+        }
+    }
 }
 
 impl MultiplexToolExecutor {
@@ -4960,6 +5328,7 @@ impl MultiplexToolExecutor {
                 agent_id.clone(),
                 uuid::Uuid::from_bytes(session_id),
                 capability_profile.clone(),
+                sessions_dir.clone(),
             ),
             native: NativeToolExecutor {
                 tx_cron,
@@ -4973,6 +5342,8 @@ impl MultiplexToolExecutor {
                 scheduling_intent,
                 user_timezone,
             },
+            external: ExternalCompatToolExecutor,
+            remote: RemoteToolExecutor,
         }
     }
 }
@@ -4980,10 +5351,17 @@ impl MultiplexToolExecutor {
 #[async_trait::async_trait]
 impl ToolExecutor for MultiplexToolExecutor {
     async fn execute(&self, call: &ToolCall) -> Result<ToolExecutionResult, OrchestratorError> {
+        if get_external_compat_tool(&call.name).is_some() {
+            return self.external.execute(call).await;
+        }
+        if get_remote_tool(&call.name).is_some() {
+            return self.remote.execute(call).await;
+        }
         match call.name.as_str() {
             "read_file"
             | "write_file"
             | "run_shell"
+            | "search_web"
             | "search_codebase"
             | "run_tests"
             | "manage_cron"
@@ -5037,6 +5415,8 @@ impl ToolExecutor for MultiplexToolExecutor {
             | "bind_skill"
             | "activate_skill"
             | "execute_skill"
+            | "register_external_compat_tool"
+            | "register_remote_tool"
             | "register_mcp_server"
             | "import_mcp_tool"
             | "import_mcp_prompt"
@@ -5189,6 +5569,29 @@ fn validate_execution_profile(
     sessions_dir: Option<&Path>,
     session_id: Option<aria_core::Uuid>,
 ) -> Result<(), OrchestratorError> {
+    let resource_budget = runtime_resource_budget();
+    if !resource_budget.browser_automation_enabled
+        && matches!(
+            call.name.as_str(),
+            "browser_download"
+                | "browser_login_begin_manual"
+                | "browser_login_complete_manual"
+                | "browser_login_fill_credentials"
+                | "browser_open"
+                | "browser_click"
+                | "browser_fill"
+                | "browser_screenshot"
+                | "web_search"
+                | "web_fetch"
+                | "crawl_website"
+                | "watch_website"
+        )
+    {
+        return Err(OrchestratorError::ToolError(format!(
+            "tool '{}' is disabled by the active resource budget",
+            call.name
+        )));
+    }
     let Some(profile) = capability_profile else {
         return Ok(());
     };
@@ -6231,14 +6634,71 @@ fn url_host_key(url: &reqwest::Url) -> Result<String, OrchestratorError> {
         )))
 }
 
+fn build_search_web_url(query: &str, site: Option<&str>) -> Result<String, OrchestratorError> {
+    let mut effective_query = query.trim().to_string();
+    if effective_query.is_empty() {
+        return Err(OrchestratorError::ToolError("Missing 'query'".into()));
+    }
+    if let Some(site) = site.map(str::trim).filter(|value| !value.is_empty()) {
+        effective_query.push_str(" site:");
+        effective_query.push_str(site);
+    }
+    let mut url = reqwest::Url::parse("https://duckduckgo.com/html/")
+        .map_err(|e| OrchestratorError::ToolError(format!("Failed to build search URL: {}", e)))?;
+    url.query_pairs_mut().append_pair("q", &effective_query);
+    Ok(url.to_string())
+}
+
+fn parse_search_web_results(html: &str, max_results: usize) -> Vec<SearchWebResult> {
+    let document = scraper::Html::parse_document(html);
+    let result_selector = scraper::Selector::parse(".result")
+        .expect("valid duckduckgo result selector");
+    let title_selector = scraper::Selector::parse(".result__title a, a.result__a")
+        .expect("valid duckduckgo title selector");
+    let snippet_selector = scraper::Selector::parse(".result__snippet, .result__body")
+        .expect("valid duckduckgo snippet selector");
+
+    document
+        .select(&result_selector)
+        .filter_map(|result| {
+            let title_node = result.select(&title_selector).next()?;
+            let title = title_node
+                .text()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim()
+                .to_string();
+            let url = title_node.value().attr("href")?.trim().to_string();
+            if title.is_empty() || url.is_empty() {
+                return None;
+            }
+            let snippet = result
+                .select(&snippet_selector)
+                .next()
+                .map(|node| node.text().collect::<Vec<_>>().join(" ").trim().to_string())
+                .filter(|value| !value.is_empty());
+            Some(SearchWebResult {
+                title,
+                url,
+                snippet,
+            })
+        })
+        .take(max_results.max(1))
+        .collect()
+}
+
 fn extract_web_target(
     call: &ToolCall,
 ) -> Result<Option<(String, aria_core::WebActionFamily)>, OrchestratorError> {
     match call.name.as_str() {
-        "fetch_url" | "web_fetch" | "web_extract" | "browser_open" | "browser_snapshot"
+        "search_web" | "fetch_url" | "web_fetch" | "web_extract" | "browser_open" | "browser_snapshot"
         | "browser_screenshot" | "browser_extract" | "browser_download" | "crawl_page"
         | "crawl_site" => {
             let url = match call.name.as_str() {
+                "search_web" => {
+                    let request = decode_tool_args::<SearchWebRequest>(call)?;
+                    build_search_web_url(&request.query, request.site.as_deref())?
+                }
                 "fetch_url" | "web_fetch" | "web_extract" => decode_tool_args::<UrlRequest>(call)?.url,
                 "browser_open" => decode_tool_args::<BrowserOpenRequest>(call)?.url,
                 "browser_snapshot" | "browser_screenshot" | "browser_extract" => {
@@ -6406,6 +6866,10 @@ fn validate_web_request(
     };
     let allow_private = profile_allows_private_network_targets(capability_profile);
     if let Some((url, _)) = match call.name.as_str() {
+        "search_web" => {
+            let request = decode_tool_args::<SearchWebRequest>(call)?;
+            Some((build_search_web_url(&request.query, request.site.as_deref())?, true))
+        }
         "fetch_url" | "web_fetch" | "web_extract" => Some((decode_tool_args::<UrlRequest>(call)?.url, true)),
         "browser_open" => Some((decode_tool_args::<BrowserOpenRequest>(call)?.url, true)),
         "browser_snapshot" | "browser_screenshot" | "browser_extract" => {
@@ -6620,7 +7084,7 @@ fn validate_cedar_web_platform_request(
 fn tool_returns_web_content(call: &ToolCall) -> bool {
     matches!(
         call.name.as_str(),
-        "fetch_url" | "web_fetch" | "web_extract" | "browser_extract"
+        "search_web" | "fetch_url" | "web_fetch" | "web_extract" | "browser_extract"
     )
         || call.name.starts_with("browser_")
         || call.name.starts_with("crawl_")
@@ -7034,7 +7498,7 @@ const SENSITIVE_TOOL_ACTIONS: &[&str] = &[
 ];
 
 pub(crate) fn runtime_exposes_base_tool(tool_name: &str) -> bool {
-    !matches!(tool_name, "search_web" | "summarise_doc" | "query_rag")
+    !matches!(tool_name, "summarise_doc" | "query_rag")
 }
 
 fn idempotency_lookup(key: &str) -> Option<ToolExecutionResult> {
@@ -7155,25 +7619,34 @@ fn build_scenario_prompt_context(
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        blocks.push(PromptManager::build_planning_prompt(
-            request_text,
-            "Ask the user to clarify ambiguous side effects instead of assuming.",
-            &tools_summary,
+        blocks.push(format!(
+            "--- Planning Guidance ---\n\
+             Goal:\n{}\n\n\
+             Risk posture:\nAsk the user to clarify ambiguous side effects instead of assuming.\n\n\
+             Available tools:\n{}",
+            request_text, tools_summary
         ));
     }
 
     if let Some(media_type) = request_media_type_label(&req.content) {
-        blocks.push(PromptManager::build_media_prompt(media_type, request_text));
+        blocks.push(format!(
+            "--- Media Guidance ---\n\
+             Media type: {}\n\
+             Extracted request context:\n{}",
+            media_type, request_text
+        ));
     }
 
     if matches!(
         trust_profile,
         Some(aria_core::TrustProfile::RoboticsControl)
     ) {
-        blocks.push(PromptManager::build_robotics_prompt(
-            request_text,
-            "state=unknown; require explicit robot state snapshot before actuation",
-            "max_abs_velocity=0.2; degraded_local_mode blocks motion; never emit direct actuator commands from the LLM",
+        blocks.push(format!(
+            "--- Robotics Guidance ---\n\
+             Task:\n{}\n\n\
+             Current robot state:\nstate=unknown; require explicit robot state snapshot before actuation\n\n\
+             Safety envelope:\nmax_abs_velocity=0.2; degraded_local_mode blocks motion; never emit direct actuator commands from the LLM",
+            request_text
         ));
     }
 
@@ -7230,7 +7703,8 @@ fn infer_rag_corpora_labels(rag_context: &str) -> Vec<String> {
         ("Policy/Runtime Context:", "policy_runtime"),
         ("External Context:", "external"),
         ("Social Context:", "social"),
-        ("PageIndex Context:", "page_index"),
+        ("Capability Index Context:", "capability_index"),
+        ("Document Index Context:", "document_index"),
     ] {
         if rag_context.contains(needle) {
             corpora.push(label.to_string());
@@ -7298,7 +7772,52 @@ struct RetrievalBuildMetrics {
     policy_hits: u32,
     external_hits: u32,
     social_hits: u32,
-    page_context_hits: u32,
+    document_context_hits: u32,
+    dropped_duplicate_hits: u32,
+}
+
+struct RetrievalPlanner<'a> {
+    vector_store: &'a VectorStore,
+    capability_index: &'a aria_ssmu::CapabilityIndex,
+    keyword_index: &'a KeywordIndex,
+}
+
+impl<'a> RetrievalPlanner<'a> {
+    fn new(
+        vector_store: &'a VectorStore,
+        capability_index: &'a aria_ssmu::CapabilityIndex,
+        keyword_index: &'a KeywordIndex,
+    ) -> Self {
+        Self {
+            vector_store,
+            capability_index,
+            keyword_index,
+        }
+    }
+
+    fn build_context(
+        &self,
+        request_text: &str,
+        query_embedding: &[f32],
+        session_history: &[aria_ssmu::Message],
+        capability_profile: Option<&AgentCapabilityProfile>,
+        trust_profile: Option<aria_core::TrustProfile>,
+    ) -> (
+        String,
+        aria_core::RetrievedContextBundle,
+        RetrievalBuildMetrics,
+    ) {
+        build_split_rag_context_inner(
+            request_text,
+            query_embedding,
+            session_history,
+            self.vector_store,
+            self.capability_index,
+            self.keyword_index,
+            capability_profile,
+            trust_profile,
+        )
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -7740,6 +8259,8 @@ fn maybe_record_retry_reward(
 #[async_trait::async_trait]
 impl<T: ToolExecutor> ToolExecutor for PolicyCheckedExecutor<T> {
     async fn execute(&self, call: &ToolCall) -> Result<ToolExecutionResult, OrchestratorError> {
+        let effective_call = normalize_tool_alias_call(call);
+        let call = &effective_call;
         if let Some(profile) = &self.capability_profile {
             if profile.requires_elevation {
                 append_scope_denial_record(
@@ -8395,9 +8916,26 @@ fn capability_allows_vault_egress(profile: Option<&AgentCapabilityProfile>) -> b
     }
 }
 
-fn build_dynamic_page_index(agent_store: &AgentConfigStore) -> PageIndexTree {
-    let mut tree = PageIndexTree::new(32);
+fn build_capability_index(agent_store: &AgentConfigStore) -> aria_ssmu::CapabilityIndex {
+    let mut tree = aria_ssmu::CapabilityIndex::new(32);
     let mut idx = 100u32;
+
+    let _ = tree.insert(PageNode {
+        node_id: "platform.memory".into(),
+        title: "Session Memory".into(),
+        summary: "Conversation history, durable constraints, and compaction-backed memory retrieval.".into(),
+        start_index: 1,
+        end_index: 2,
+        children: vec![],
+    });
+    let _ = tree.insert(PageNode {
+        node_id: "platform.control".into(),
+        title: "Control Documents".into(),
+        summary: "Workspace instructions, skills, tools, and memory control documents retrieved by precedence.".into(),
+        start_index: 3,
+        end_index: 4,
+        children: vec![],
+    });
 
     if agent_store.is_empty() {
         let _ = tree.insert(PageNode {
@@ -8415,12 +8953,86 @@ fn build_dynamic_page_index(agent_store: &AgentConfigStore) -> PageIndexTree {
         let node = PageNode {
             node_id: format!("agent.{}", cfg.id),
             title: format!("{} Agent", cfg.id),
-            summary: cfg.description.clone(),
+            summary: format!(
+                "{} Tools: {} Skills: {}",
+                cfg.description,
+                if cfg.base_tool_names.is_empty() {
+                    "<none>".into()
+                } else {
+                    cfg.base_tool_names.join(", ")
+                },
+                if cfg.skill_allowlist.is_empty() {
+                    "<none>".into()
+                } else {
+                    cfg.skill_allowlist.join(", ")
+                }
+            ),
             start_index: idx,
             end_index: idx + 1,
             children: vec![],
         };
         let _ = tree.insert(node);
+        idx += 1;
+        if !cfg.base_tool_names.is_empty() {
+            let _ = tree.insert(PageNode {
+                node_id: format!("agent.{}.tools", cfg.id),
+                title: format!("{} Tool Bundle", cfg.id),
+                summary: format!("Tool bundle for {}: {}", cfg.id, cfg.base_tool_names.join(", ")),
+                start_index: idx,
+                end_index: idx + 1,
+                children: vec![],
+            });
+            idx += 1;
+        }
+        if !cfg.skill_allowlist.is_empty() {
+            let _ = tree.insert(PageNode {
+                node_id: format!("agent.{}.skills", cfg.id),
+                title: format!("{} Skill Bundle", cfg.id),
+                summary: format!("Skill bundle for {}: {}", cfg.id, cfg.skill_allowlist.join(", ")),
+                start_index: idx,
+                end_index: idx + 1,
+                children: vec![],
+            });
+            idx += 1;
+        }
+    }
+    tree
+}
+
+fn build_dynamic_capability_index(agent_store: &AgentConfigStore) -> aria_ssmu::CapabilityIndex {
+    build_capability_index(agent_store)
+}
+
+fn build_document_index_from_vector_store(vector_store: &VectorStore) -> aria_ssmu::DocumentIndex {
+    let mut tree = aria_ssmu::DocumentIndex::new(64);
+    let mut idx = 1u32;
+    let mut seen = std::collections::HashSet::new();
+    for doc in vector_store.docs() {
+        if !matches!(doc.metadata.kind, aria_ssmu::vector::ChunkKind::Document) {
+            continue;
+        }
+        let node_id = doc
+            .metadata
+            .parent_id
+            .clone()
+            .unwrap_or_else(|| doc.id.clone());
+        if !seen.insert(node_id.clone()) {
+            continue;
+        }
+        let title = if doc.metadata.source_id.trim().is_empty() {
+            node_id.clone()
+        } else {
+            doc.metadata.source_id.clone()
+        };
+        let summary = doc.content.chars().take(240).collect::<String>();
+        let _ = tree.insert(PageNode {
+            node_id,
+            title,
+            summary,
+            start_index: idx,
+            end_index: idx + 1,
+            children: vec![],
+        });
         idx += 1;
     }
     tree
@@ -8459,7 +9071,7 @@ pub type AsyncHookFn = Box<
     dyn Fn(
             &AgentRequest,
             Arc<VectorStore>,
-            Arc<PageIndexTree>,
+            Arc<aria_ssmu::CapabilityIndex>,
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
         + Send
         + Sync,
@@ -8484,11 +9096,11 @@ impl HookRegistry {
         &self,
         req: &AgentRequest,
         vector_store: &Arc<VectorStore>,
-        page_index: &Arc<PageIndexTree>,
+        capability_index: &Arc<aria_ssmu::CapabilityIndex>,
     ) -> String {
         let mut contexts = Vec::new();
         for hook in &self.message_pre {
-            if let Ok(ctx) = hook(req, vector_store.clone(), page_index.clone()).await {
+            if let Ok(ctx) = hook(req, vector_store.clone(), capability_index.clone()).await {
                 if !ctx.is_empty() {
                     contexts.push(ctx);
                 }
@@ -8719,6 +9331,81 @@ impl ToolSchedule {
 
     fn to_json_string(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| "{\"kind\":\"invalid\"}".into())
+    }
+}
+
+fn schedule_kind_from_object(map: &serde_json::Map<String, serde_json::Value>) -> Option<&'static str> {
+    if map.contains_key("kind") {
+        return None;
+    }
+    if map.contains_key("seconds") {
+        Some("every")
+    } else if map.contains_key("at") {
+        Some("at")
+    } else if map.contains_key("expr") {
+        Some("cron")
+    } else if map.contains_key("weekday") {
+        Some("weekly")
+    } else if map.contains_key("hour") && map.contains_key("minute") {
+        Some("daily")
+    } else {
+        None
+    }
+}
+
+fn parse_tool_schedule_value(
+    raw: Option<&serde_json::Value>,
+    default_timezone: chrono_tz::Tz,
+    field_name: &str,
+) -> Result<Option<ToolSchedule>, OrchestratorError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty()
+                || trimmed == "{}"
+                || trimmed.eq_ignore_ascii_case("null")
+                || trimmed.eq_ignore_ascii_case("none")
+                || trimmed.eq_ignore_ascii_case("unspecified")
+            {
+                return Ok(None);
+            }
+            if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                if let Ok(parsed_json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    return parse_tool_schedule_value(Some(&parsed_json), default_timezone, field_name);
+                }
+            }
+            ToolSchedule::from_normalized_hint(value, default_timezone)
+                .ok_or_else(|| {
+                    OrchestratorError::ToolError(format!(
+                        "Invalid '{}' string '{}'",
+                        field_name, value
+                    ))
+                })
+                .map(Some)
+        }
+        serde_json::Value::Object(map) if map.is_empty() => Ok(None),
+        serde_json::Value::Object(map) => {
+            let mut candidate = raw.clone();
+            if let Some(kind) = schedule_kind_from_object(map) {
+                candidate["kind"] = serde_json::Value::String(kind.to_string());
+            }
+            serde_json::from_value::<ToolSchedule>(candidate)
+                .map(Some)
+                .map_err(|err| {
+                    OrchestratorError::ToolError(format!(
+                        "Invalid '{}' object: {}",
+                        field_name, err
+                    ))
+                })
+        }
+        _ => Err(OrchestratorError::ToolError(format!(
+            "Invalid '{}'. Expected a structured schedule object or schedule string.",
+            field_name
+        ))),
     }
 }
 
@@ -9909,31 +10596,90 @@ fn detect_control_document_conflicts(
 fn build_split_rag_context(
     request_text: &str,
     query_embedding: &[f32],
+    session_history: &[aria_ssmu::Message],
     vector_store: &VectorStore,
-    page_index: &PageIndexTree,
+    capability_index: &aria_ssmu::CapabilityIndex,
     keyword_index: &KeywordIndex,
     capability_profile: Option<&AgentCapabilityProfile>,
     trust_profile: Option<aria_core::TrustProfile>,
-) -> (String, RetrievalBuildMetrics) {
-    let hybrid = HybridMemoryEngine::new(vector_store, page_index, QueryPlannerConfig::default())
+) -> (
+    String,
+    aria_core::RetrievedContextBundle,
+    RetrievalBuildMetrics,
+) {
+    RetrievalPlanner::new(vector_store, capability_index, keyword_index).build_context(
+        request_text,
+        query_embedding,
+        session_history,
+        capability_profile,
+        trust_profile,
+    )
+}
+
+fn build_split_rag_context_inner(
+    request_text: &str,
+    query_embedding: &[f32],
+    session_history: &[aria_ssmu::Message],
+    vector_store: &VectorStore,
+    capability_index: &aria_ssmu::CapabilityIndex,
+    keyword_index: &KeywordIndex,
+    capability_profile: Option<&AgentCapabilityProfile>,
+    trust_profile: Option<aria_core::TrustProfile>,
+) -> (
+    String,
+    aria_core::RetrievedContextBundle,
+    RetrievalBuildMetrics,
+) {
+    let document_index = build_document_index_from_vector_store(vector_store);
+    let hybrid = HybridMemoryEngine::new(
+        vector_store,
+        document_index.as_tree(),
+        QueryPlannerConfig::default(),
+    )
         .with_keyword_index(keyword_index)
         .retrieve_hybrid(request_text, query_embedding, 5, 3, 0.005);
     let mut metrics = RetrievalBuildMetrics::default();
+    let mut bundle = aria_core::RetrievedContextBundle {
+        plan_summary: Some(format!("{:?}", hybrid.plan)),
+        blocks: Vec::new(),
+        dropped_blocks: Vec::new(),
+    };
 
-    let mut session_chunks = Vec::new();
+    let session_history_blocks = build_session_context_blocks(request_text, session_history, 3);
+    let mut session_chunks = session_history_blocks
+        .iter()
+        .map(|block| block.content.clone())
+        .collect::<Vec<_>>();
+    bundle.blocks.extend(session_history_blocks);
+    let allow_persisted_session_retrieval = !session_history.is_empty();
     let mut workspace_chunks = Vec::new();
     let mut policy_chunks = Vec::new();
     let mut external_chunks = Vec::new();
     let mut social_chunks = Vec::new();
+    let mut seen_dedupe_keys = std::collections::HashSet::new();
 
-    for result in vector_store.hybrid_search(
-        query_embedding,
-        Some(keyword_index),
-        request_text,
-        5,
-        0.005,
-        60.0,
-    ) {
+    for result in hybrid.hybrid_results {
+        let dedupe_key = result
+            .metadata
+            .parent_id
+            .clone()
+            .unwrap_or_else(|| result.id.clone());
+        if !seen_dedupe_keys.insert(dedupe_key.clone()) {
+            metrics.dropped_duplicate_hits += 1;
+            bundle.dropped_blocks.push(aria_core::RetrievedContextBlock {
+                source_kind: aria_core::RetrievalSourceKind::Workspace,
+                source_id: result.id.clone(),
+                label: "duplicate".into(),
+                content: result.content.clone(),
+                trust_class: Some("deduped".into()),
+                score: Some(result.rrf_score),
+                rank: None,
+                dedupe_key: Some(dedupe_key),
+                recency_us: None,
+                token_estimate: estimate_token_count(&result.content) as u32,
+            });
+            continue;
+        }
         let rendered = format!(
             "- {:.3} {}: {}",
             result.rrf_score, result.id, result.content
@@ -9944,39 +10690,176 @@ fn build_split_rag_context(
         }
         match corpus {
             RagCorpus::Session => {
+                if !allow_persisted_session_retrieval {
+                    continue;
+                }
                 metrics.session_hits += 1;
-                session_chunks.push(rendered)
+                session_chunks.push(rendered.clone());
+                bundle.blocks.push(aria_core::RetrievedContextBlock {
+                    source_kind: aria_core::RetrievalSourceKind::SessionMemory,
+                    source_id: result.id.clone(),
+                    label: "session_memory".into(),
+                    content: rendered,
+                    trust_class: Some("trusted".into()),
+                    score: Some(result.rrf_score),
+                    rank: None,
+                    dedupe_key: Some(
+                        result
+                            .metadata
+                            .parent_id
+                            .clone()
+                            .unwrap_or_else(|| result.id.clone()),
+                    ),
+                    recency_us: None,
+                    token_estimate: estimate_token_count(&result.content) as u32,
+                });
             }
             RagCorpus::Workspace => {
                 metrics.workspace_hits += 1;
-                workspace_chunks.push(rendered)
+                workspace_chunks.push(rendered.clone());
+                bundle.blocks.push(aria_core::RetrievedContextBlock {
+                    source_kind: aria_core::RetrievalSourceKind::Workspace,
+                    source_id: result.id.clone(),
+                    label: "workspace".into(),
+                    content: rendered,
+                    trust_class: Some("workspace".into()),
+                    score: Some(result.rrf_score),
+                    rank: None,
+                    dedupe_key: Some(
+                        result
+                            .metadata
+                            .parent_id
+                            .clone()
+                            .unwrap_or_else(|| result.id.clone()),
+                    ),
+                    recency_us: None,
+                    token_estimate: estimate_token_count(&result.content) as u32,
+                });
             }
             RagCorpus::PolicyRuntime => {
                 metrics.policy_hits += 1;
-                policy_chunks.push(rendered)
+                policy_chunks.push(rendered.clone());
+                bundle.blocks.push(aria_core::RetrievedContextBlock {
+                    source_kind: aria_core::RetrievalSourceKind::PolicyRuntime,
+                    source_id: result.id.clone(),
+                    label: "policy_runtime".into(),
+                    content: rendered,
+                    trust_class: Some("runtime".into()),
+                    score: Some(result.rrf_score),
+                    rank: None,
+                    dedupe_key: Some(
+                        result
+                            .metadata
+                            .parent_id
+                            .clone()
+                            .unwrap_or_else(|| result.id.clone()),
+                    ),
+                    recency_us: None,
+                    token_estimate: estimate_token_count(&result.content) as u32,
+                });
             }
             RagCorpus::External => {
                 if corpus_allowed_for_trust_profile(RagCorpus::External, trust_profile) {
                     metrics.external_hits += 1;
-                    external_chunks.push(rendered);
+                    external_chunks.push(rendered.clone());
+                    bundle.blocks.push(aria_core::RetrievedContextBlock {
+                        source_kind: aria_core::RetrievalSourceKind::External,
+                        source_id: result.id.clone(),
+                        label: "external".into(),
+                        content: rendered,
+                        trust_class: Some("external".into()),
+                        score: Some(result.rrf_score),
+                        rank: None,
+                        dedupe_key: Some(
+                            result
+                                .metadata
+                                .parent_id
+                                .clone()
+                                .unwrap_or_else(|| result.id.clone()),
+                        ),
+                        recency_us: None,
+                        token_estimate: estimate_token_count(&result.content) as u32,
+                    });
                 }
             }
             RagCorpus::Social => {
                 if corpus_allowed_for_trust_profile(RagCorpus::Social, trust_profile) {
                     metrics.social_hits += 1;
-                    social_chunks.push(rendered);
+                    social_chunks.push(rendered.clone());
+                    bundle.blocks.push(aria_core::RetrievedContextBlock {
+                        source_kind: aria_core::RetrievalSourceKind::Social,
+                        source_id: result.id.clone(),
+                        label: "social".into(),
+                        content: rendered,
+                        trust_class: Some("social".into()),
+                        score: Some(result.rrf_score),
+                        rank: None,
+                        dedupe_key: Some(
+                            result
+                                .metadata
+                                .parent_id
+                                .clone()
+                                .unwrap_or_else(|| result.id.clone()),
+                        ),
+                        recency_us: None,
+                        token_estimate: estimate_token_count(&result.content) as u32,
+                    });
                 }
             }
         }
     }
+    if !session_chunks.is_empty() {
+        metrics.session_hits = metrics.session_hits.max(session_chunks.len() as u32);
+    }
 
-    let page_context = hybrid
-        .page_context
+    let capability_context_entries = capability_index
+        .retrieve_relevant(request_text, 3)
         .into_iter()
-        .map(|n| format!("- {}: {}", n.title, n.summary))
-        .collect::<Vec<_>>()
-        .join("\n");
-    metrics.page_context_hits = if page_context.is_empty() { 0 } else { page_context.lines().count() as u32 };
+        .map(|n| {
+            let rendered = format!("- {}: {}", n.title, n.summary);
+            bundle.blocks.push(aria_core::RetrievedContextBlock {
+                source_kind: aria_core::RetrievalSourceKind::CapabilityIndex,
+                source_id: n.node_id.clone(),
+                label: n.title.clone(),
+                content: rendered.clone(),
+                trust_class: Some("capability_index".into()),
+                score: None,
+                rank: None,
+                dedupe_key: Some(n.node_id.clone()),
+                recency_us: None,
+                token_estimate: estimate_token_count(&n.summary) as u32,
+            });
+            rendered
+        })
+        .collect::<Vec<_>>();
+    let capability_context = capability_context_entries.join("\n");
+
+    let document_context_entries = hybrid
+        .document_context
+        .into_iter()
+        .map(|n| {
+            let rendered = format!("- {}: {}", n.title, n.summary);
+            bundle.blocks.push(aria_core::RetrievedContextBlock {
+                source_kind: aria_core::RetrievalSourceKind::DocumentIndex,
+                source_id: n.node_id.clone(),
+                label: n.title.clone(),
+                content: rendered.clone(),
+                trust_class: Some("document_index".into()),
+                score: None,
+                rank: None,
+                dedupe_key: Some(n.node_id.clone()),
+                recency_us: None,
+                token_estimate: estimate_token_count(&n.summary) as u32,
+            });
+            rendered
+        })
+        .collect::<Vec<_>>();
+    let document_context = document_context_entries.join("\n");
+    metrics.document_context_hits = if document_context.is_empty() {
+        0
+    } else {
+        document_context.lines().count() as u32
+    };
 
     let mut sections = vec![format!("Plan: {:?}", hybrid.plan)];
     if !session_chunks.is_empty() {
@@ -10000,11 +10883,83 @@ fn build_split_rag_context(
     if !social_chunks.is_empty() {
         sections.push(format!("Social Context:\n{}", social_chunks.join("\n")));
     }
-    if !page_context.is_empty() {
-        sections.push(format!("PageIndex Context:\n{}", page_context));
+    if !capability_context.is_empty() {
+        sections.push(format!("Capability Index Context:\n{}", capability_context));
+    }
+    if !document_context.is_empty() {
+        sections.push(format!("Document Index Context:\n{}", document_context));
     }
 
-    (sections.join("\n\n"), metrics)
+    (sections.join("\n\n"), bundle, metrics)
+}
+
+fn build_session_context_blocks(
+    request_text: &str,
+    history: &[aria_ssmu::Message],
+    top_k: usize,
+) -> Vec<aria_core::RetrievedContextBlock> {
+    if request_text.trim().is_empty() || history.is_empty() || top_k == 0 {
+        return Vec::new();
+    }
+    let query_terms = normalized_terms(request_text);
+    let query_embedding = local_embed(request_text, 64);
+    let mut scored = history
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, message)| {
+            let message_terms = normalized_terms(&message.content);
+            let lexical_overlap = query_terms
+                .iter()
+                .filter(|term| message_terms.contains(*term))
+                .count() as f32;
+            let semantic = cosine_similarity(&query_embedding, &local_embed(&message.content, 64));
+            let recency = (idx + 1) as f32 / history.len() as f32;
+            let score = (lexical_overlap * 2.0) + semantic + (recency * 0.25);
+            if score > 0.05 {
+                Some((idx, score, message))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.0.cmp(&a.0))
+    });
+    scored
+        .into_iter()
+        .take(top_k)
+        .map(|(idx, score, message)| aria_core::RetrievedContextBlock {
+            source_kind: aria_core::RetrievalSourceKind::SessionHistory,
+            source_id: format!("session-history-{}-{}", message.timestamp_us, idx),
+            label: format!("{} @ {}", message.role, message.timestamp_us),
+            content: format!(
+                "- {:.3} {} @ {}: {}",
+                score, message.role, message.timestamp_us, message.content
+            ),
+            trust_class: Some("session_history".into()),
+            score: Some(score),
+            rank: None,
+            dedupe_key: Some(format!("session-history-{}", message.timestamp_us)),
+            recency_us: Some(message.timestamp_us),
+            token_estimate: estimate_token_count(&message.content) as u32,
+        })
+        .collect()
+}
+
+fn normalized_terms(text: &str) -> std::collections::HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.trim().is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn cosine_similarity(lhs: &[f32], rhs: &[f32]) -> f32 {
+    if lhs.is_empty() || rhs.is_empty() || lhs.len() != rhs.len() {
+        return 0.0;
+    }
+    lhs.iter().zip(rhs.iter()).map(|(a, b)| a * b).sum()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10280,46 +11235,168 @@ fn shared_user_quota_limit(global_limit: usize) -> usize {
     global_limit.max(1).min(2)
 }
 
+const LOW_INFORMATION_PROMPT_TOOL_THRESHOLD: f32 = 0.25;
+const LOW_INFORMATION_PROMPT_MARGIN: f32 = 0.12;
+
+fn prompt_tool_score<E: EmbeddingModel>(
+    request_text: &str,
+    tool: &CachedTool,
+    embedder: &E,
+    capability_profile: Option<&aria_core::ModelCapabilityProfile>,
+) -> f32 {
+    let query_embedding = embedder.embed(request_text);
+    let tool_embedding = if tool.embedding.is_empty() {
+        embedder.embed(&format!("{} {}", tool.name, tool.description))
+    } else {
+        tool.embedding.clone()
+    };
+    aria_intelligence::cosine_similarity(&query_embedding, &tool_embedding)
+        + aria_intelligence::tool_schema_fidelity_bonus(tool, capability_profile)
+}
+
+fn prompt_is_low_information(request_text: &str) -> bool {
+    let mut tokens = request_text
+        .split_whitespace()
+        .filter(|token| !token.trim().is_empty());
+    let first = tokens.next();
+    let second = tokens.next();
+    first.is_some() && second.is_none() && request_text.trim().chars().count() <= 4
+}
+
 fn select_prompt_tool_window<E: EmbeddingModel>(
     request_text: &str,
     active_tools: &[CachedTool],
     tool_registry: &ToolManifestStore,
     embedder: &E,
     capability_profile: Option<&aria_core::ModelCapabilityProfile>,
+    policy: Option<&aria_core::ToolRuntimePolicy>,
+    allow_repair_fallback: bool,
     budget: PromptBudget,
-) -> Vec<CachedTool> {
+) -> (Vec<CachedTool>, aria_core::ToolSelectionDecision) {
+    let tool_calling_mode =
+        aria_intelligence::tool_calling_mode_for_model_with_repair(capability_profile, allow_repair_fallback);
     let compatible_active = active_tools
         .iter()
         .filter(|tool| aria_intelligence::tool_is_compatible_with_model(tool, capability_profile))
         .cloned()
         .collect::<Vec<_>>();
+    let text_fallback_mode = matches!(
+        tool_calling_mode,
+        aria_core::ToolCallingMode::TextFallbackNoTools
+            | aria_core::ToolCallingMode::TextFallbackWithRepair
+    );
+    let low_information_prompt =
+        matches!(policy.map(|policy| &policy.tool_choice), None | Some(aria_core::ToolChoicePolicy::Auto))
+            && prompt_is_low_information(request_text);
+    let prompt_candidates = if text_fallback_mode && compatible_active.is_empty() {
+        active_tools
+    } else {
+        &compatible_active
+    };
+    let mut candidate_scores = Vec::new();
+    let mut ranked_candidates = Vec::new();
     let mut selected = Vec::new();
     let mut seen = BTreeSet::new();
-    for tool in compatible_active.iter().rev().take(budget.tool_count / 2 + 1) {
-        if seen.insert(tool.name.clone()) {
-            selected.push(tool.clone());
-        }
+
+    for (index, tool) in prompt_candidates.iter().enumerate() {
+        let recency_bonus = if prompt_candidates.len() <= 1 {
+            0.0
+        } else {
+            ((index + 1) as f32 / prompt_candidates.len() as f32) * 0.05
+        };
+        let score =
+            prompt_tool_score(request_text, tool, embedder, capability_profile) + recency_bonus;
+        candidate_scores.push(aria_core::ToolSelectionScore {
+            tool_name: tool.name.clone(),
+            score: (score * 1000.0).round() as i32,
+            source: "active".into(),
+        });
+        ranked_candidates.push((tool.clone(), score));
     }
+
     if let Ok(ranked) = tool_registry.search_with_explanations(
         request_text,
         embedder,
-        budget.tool_count,
+        budget.tool_count.saturating_mul(2).max(1),
         capability_profile,
     ) {
         for entry in ranked {
             if !entry.visibility.available {
                 continue;
             }
-            if selected.len() >= budget.tool_count {
-                break;
-            }
-            if seen.insert(entry.tool.name.clone()) {
-                selected.push(entry.tool);
+            let score = entry.score.unwrap_or(f32::NEG_INFINITY);
+            candidate_scores.push(aria_core::ToolSelectionScore {
+                tool_name: entry.tool.name.clone(),
+                score: (score * 1000.0).round() as i32,
+                source: "registry".into(),
+            });
+            if !seen.contains(&entry.tool.name) {
+                ranked_candidates.push((entry.tool, score));
             }
         }
     }
+
+    ranked_candidates.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let low_information_confident = if low_information_prompt {
+        let top_score = ranked_candidates.first().map(|(_, score)| *score);
+        let second_score = ranked_candidates.get(1).map(|(_, score)| *score);
+        match (top_score, second_score) {
+            (Some(top), Some(second)) => {
+                top >= LOW_INFORMATION_PROMPT_TOOL_THRESHOLD
+                    && (top - second) >= LOW_INFORMATION_PROMPT_MARGIN
+            }
+            (Some(top), None) => top >= LOW_INFORMATION_PROMPT_TOOL_THRESHOLD,
+            _ => false,
+        }
+    } else {
+        true
+    };
+
+    if let Some(aria_core::ToolRuntimePolicy {
+        tool_choice: aria_core::ToolChoicePolicy::Specific(tool_name),
+        ..
+    }) = policy
+    {
+        if let Some((tool, _)) = ranked_candidates.iter().find(|(tool, _)| tool.name == *tool_name) {
+            seen.insert(tool.name.clone());
+            selected.push(tool.clone());
+        }
+    }
+
+    for (tool, score) in ranked_candidates {
+        if selected.len() >= budget.tool_count {
+            break;
+        }
+        if !seen.insert(tool.name.clone()) {
+            continue;
+        }
+        if low_information_prompt && (!low_information_confident || score < LOW_INFORMATION_PROMPT_TOOL_THRESHOLD) {
+            continue;
+        }
+        selected.push(tool);
+    }
+
     selected.truncate(budget.tool_count);
-    selected
+    let decision = aria_core::ToolSelectionDecision {
+        tool_choice: policy
+            .map(|policy| policy.tool_choice.clone())
+            .unwrap_or(aria_core::ToolChoicePolicy::Auto),
+        tool_calling_mode,
+        text_fallback_mode,
+        relevance_threshold_millis: low_information_prompt.then_some(
+            (LOW_INFORMATION_PROMPT_TOOL_THRESHOLD * 1000.0).round() as i32,
+        ),
+        available_tool_names: active_tools.iter().map(|tool| tool.name.clone()).collect(),
+        selected_tool_names: selected.iter().map(|tool| tool.name.clone()).collect(),
+        candidate_scores,
+    };
+    (selected, decision)
 }
 
 fn spawn_history_compaction(
@@ -10788,6 +11865,22 @@ fn contextual_runtime_tool_names_for_request(
         ]);
     }
 
+    let web_search_request = [
+        "search the web",
+        "latest news",
+        "look up online",
+        "lookup online",
+        "search online",
+        "twitter",
+        "x.com",
+        "news on",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if web_search_request && matches!(agent_id, "researcher" | "omni" | "developer") {
+        tools.extend(["search_web", "web_fetch", "web_extract"]);
+    }
+
     let crawl_request = [
         "crawl ",
         "crawl_page",
@@ -10844,12 +11937,32 @@ fn contextual_runtime_tool_names_for_request(
         ]);
     }
 
-    tools
-}
+    let external_compat_request = [
+        "external compat",
+        "compat tool",
+        "sidecar tool",
+        "register external tool",
+        "register compat tool",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if external_compat_request && matches!(agent_id, "omni" | "developer") {
+        tools.push("register_external_compat_tool");
+    }
 
-fn request_is_reminder_like(request_text: &str) -> bool {
-    let lower = request_text.to_ascii_lowercase();
-    lower.contains("remind") || lower.contains("reminder") || lower.contains("notify me")
+    let remote_tool_request = [
+        "remote tool",
+        "register remote tool",
+        "remote provider tool",
+        "http tool",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if remote_tool_request && matches!(agent_id, "omni" | "developer") {
+        tools.push("register_remote_tool");
+    }
+
+    tools
 }
 
 fn request_is_browser_read_like(request_text: &str) -> bool {
@@ -10934,6 +12047,7 @@ fn browser_read_retry_policy(request_text: &str) -> aria_core::ToolRuntimePolicy
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_first_http_url_from_text(request_text: &str) -> Option<String> {
     request_text
         .split_whitespace()
@@ -10942,6 +12056,7 @@ fn extract_first_http_url_from_text(request_text: &str) -> Option<String> {
         .map(|token| token.to_string())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_named_value(request_text: &str, field: &str) -> Option<String> {
     let lower = request_text.to_ascii_lowercase();
     let field_lower = field.to_ascii_lowercase();
@@ -10979,6 +12094,7 @@ fn extract_named_value(request_text: &str, field: &str) -> Option<String> {
     None
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_after_phrase(request_text: &str, phrase: &str) -> Option<String> {
     let lower = request_text.to_ascii_lowercase();
     let phrase_lower = phrase.to_ascii_lowercase();
@@ -11003,6 +12119,7 @@ fn extract_after_phrase(request_text: &str, phrase: &str) -> Option<String> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn trim_balanced_wrapping_quotes(value: &str) -> &str {
     let trimmed = value.trim();
     if trimmed.len() >= 2 {
@@ -11018,6 +12135,7 @@ fn trim_balanced_wrapping_quotes(value: &str) -> &str {
     trimmed
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_first_path_from_text(request_text: &str) -> Option<String> {
     request_text
         .split_whitespace()
@@ -11031,6 +12149,7 @@ fn extract_first_path_from_text(request_text: &str) -> Option<String> {
         .filter(|segment| segment.len() > 1)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_shell_command_from_text(request_text: &str) -> Option<String> {
     for phrase in ["execute ", "command ", "run_shell "] {
         if let Some(raw) = extract_after_phrase(request_text, phrase) {
@@ -11043,6 +12162,7 @@ fn extract_shell_command_from_text(request_text: &str) -> Option<String> {
     None
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn extract_reminder_task_text(request_text: &str) -> Option<String> {
     let lower = request_text.to_ascii_lowercase();
     for phrase in ["to say ", "to remind me ", "to "] {
@@ -11057,6 +12177,7 @@ fn extract_reminder_task_text(request_text: &str) -> Option<String> {
     infer_deferred_task(request_text).filter(|value| !value.is_empty())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn infer_browser_profile_id_from_request(request_text: &str) -> Option<String> {
     extract_after_phrase(request_text, "profile_id ")
         .or_else(|| extract_named_value(request_text, "profile_id"))
@@ -11066,6 +12187,7 @@ fn infer_browser_profile_id_from_request(request_text: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn infer_browser_session_id_from_request(request_text: &str) -> Option<String> {
     extract_after_phrase(request_text, "browser_session_id ")
         .or_else(|| extract_named_value(request_text, "browser_session_id"))
@@ -11074,6 +12196,7 @@ fn infer_browser_session_id_from_request(request_text: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn infer_domain_from_request(request_text: &str) -> Option<String> {
     extract_named_value(request_text, "domain")
         .or_else(|| extract_after_phrase(request_text, "domain "))
@@ -11110,6 +12233,7 @@ fn infer_domain_from_request(request_text: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn heuristic_specific_tool_call(
     request_text: &str,
     tool_name: &str,
@@ -11139,7 +12263,7 @@ fn heuristic_specific_tool_call(
                 invocation_id: None,
                 name: "read_file".into(),
                 arguments: serde_json::json!({ "path": path }).to_string(),
-            })
+})
         }
         "run_shell" => {
             let command = extract_named_value(request_text, "command")
@@ -11148,6 +12272,23 @@ fn heuristic_specific_tool_call(
                 invocation_id: None,
                 name: "run_shell".into(),
                 arguments: serde_json::json!({ "command": command }).to_string(),
+})
+        }
+        "search_web" => {
+            let query = extract_named_value(request_text, "query")
+                .or_else(|| extract_after_phrase(request_text, "search for "))
+                .or_else(|| extract_after_phrase(request_text, "look up "))
+                .or_else(|| extract_after_phrase(request_text, "lookup "))
+                .unwrap_or_else(|| request_text.trim().to_string());
+            let site = if request_text.to_ascii_lowercase().contains("twitter") {
+                Some("x.com".to_string())
+            } else {
+                None
+            };
+            Some(ToolCall {
+                invocation_id: None,
+                name: "search_web".into(),
+                arguments: serde_json::json!({ "query": query, "site": site }).to_string(),
             })
         }
         "fetch_url" | "web_fetch" | "web_extract" => {
@@ -11156,7 +12297,7 @@ fn heuristic_specific_tool_call(
                 invocation_id: None,
                 name: tool_name.to_string(),
                 arguments: serde_json::json!({ "url": url }).to_string(),
-            })
+})
         }
         "set_reminder" | "schedule_message" => {
             let intent = scheduling_intent?;
@@ -11196,7 +12337,7 @@ fn heuristic_specific_tool_call(
                 invocation_id: None,
                 name: "spawn_agent".into(),
                 arguments: serde_json::Value::Object(args).to_string(),
-            })
+})
         }
         "browser_profile_create" => {
             let profile_id = infer_browser_profile_id_from_request(request_text)
@@ -11232,13 +12373,13 @@ fn heuristic_specific_tool_call(
                 invocation_id: None,
                 name: "browser_profile_use".into(),
                 arguments: serde_json::json!({ "profile_id": profile_id }).to_string(),
-            })
+})
         }
         "browser_profile_list" | "browser_session_list" | "list_agent_runs" => Some(ToolCall {
             invocation_id: None,
             name: tool_name.to_string(),
             arguments: "{}".into(),
-        }),
+}),
         "get_agent_run" | "get_agent_run_events" | "get_agent_mailbox" => {
             let run_id = extract_named_value(request_text, "run_id")
                 .or_else(|| extract_after_phrase(request_text, "run "))?;
@@ -11246,7 +12387,7 @@ fn heuristic_specific_tool_call(
                 invocation_id: None,
                 name: tool_name.to_string(),
                 arguments: serde_json::json!({ "run_id": run_id }).to_string(),
-            })
+})
         }
         "browser_open" | "browser_snapshot" | "browser_screenshot" | "browser_extract" => {
             heuristic_browser_read_tool_call(request_text).and_then(|call| {
@@ -11272,7 +12413,7 @@ fn heuristic_specific_tool_call(
                 invocation_id: None,
                 name: "browser_session_start".into(),
                 arguments: serde_json::Value::Object(args).to_string(),
-            })
+})
         }
         "browser_session_status" => {
             let mut args = serde_json::Map::new();
@@ -11286,7 +12427,7 @@ fn heuristic_specific_tool_call(
                 invocation_id: None,
                 name: "browser_session_status".into(),
                 arguments: serde_json::Value::Object(args).to_string(),
-            })
+})
         }
         "browser_login_begin_manual" => {
             let domain = infer_domain_from_request(request_text)?;
@@ -11302,7 +12443,7 @@ fn heuristic_specific_tool_call(
                 invocation_id: None,
                 name: "browser_login_begin_manual".into(),
                 arguments: serde_json::Value::Object(args).to_string(),
-            })
+})
         }
         "browser_login_complete_manual" => {
             let domain = infer_domain_from_request(request_text)?;
@@ -11318,7 +12459,7 @@ fn heuristic_specific_tool_call(
                 invocation_id: None,
                 name: "browser_login_complete_manual".into(),
                 arguments: serde_json::Value::Object(args).to_string(),
-            })
+})
         }
         "browser_login_status" => {
             let mut args = serde_json::Map::new();
@@ -11335,12 +12476,13 @@ fn heuristic_specific_tool_call(
                 invocation_id: None,
                 name: "browser_login_status".into(),
                 arguments: serde_json::Value::Object(args).to_string(),
-            })
+})
         }
         _ => None,
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn heuristic_browser_read_tool_call(request_text: &str) -> Option<ToolCall> {
     if !request_is_browser_read_like(request_text) {
         return None;
@@ -11371,9 +12513,10 @@ fn heuristic_browser_read_tool_call(request_text: &str) -> Option<ToolCall> {
         invocation_id: None,
         name: selected.into(),
         arguments: serde_json::Value::Object(arguments).to_string(),
-    })
+})
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn heuristic_browser_action_tool_call(request_text: &str) -> Option<ToolCall> {
     if !request_is_browser_action_like(request_text) {
         return None;
@@ -11412,9 +12555,10 @@ fn heuristic_browser_action_tool_call(request_text: &str) -> Option<ToolCall> {
         invocation_id: None,
         name: "browser_act".into(),
         arguments: serde_json::Value::Object(arguments).to_string(),
-    })
+})
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn heuristic_mcp_tool_call(request_text: &str) -> Option<ToolCall> {
     if !request_is_mcp_operation_like(request_text) {
         return None;
@@ -11448,7 +12592,7 @@ fn heuristic_mcp_tool_call(request_text: &str) -> Option<ToolCall> {
             invocation_id: None,
             name: "register_mcp_server".into(),
             arguments: serde_json::Value::Object(arguments).to_string(),
-        });
+});
     }
 
     if lower.contains("import") && lower.contains("mcp tool") {
@@ -11479,7 +12623,7 @@ fn heuristic_mcp_tool_call(request_text: &str) -> Option<ToolCall> {
             invocation_id: None,
             name: "import_mcp_tool".into(),
             arguments: serde_json::Value::Object(arguments).to_string(),
-        });
+});
     }
 
     if lower.contains("import") && lower.contains("mcp prompt") {
@@ -11506,7 +12650,7 @@ fn heuristic_mcp_tool_call(request_text: &str) -> Option<ToolCall> {
             invocation_id: None,
             name: "import_mcp_prompt".into(),
             arguments: serde_json::Value::Object(arguments).to_string(),
-        });
+});
     }
 
     if lower.contains("import") && lower.contains("mcp resource") {
@@ -11533,7 +12677,7 @@ fn heuristic_mcp_tool_call(request_text: &str) -> Option<ToolCall> {
             invocation_id: None,
             name: "import_mcp_resource".into(),
             arguments: serde_json::Value::Object(arguments).to_string(),
-        });
+});
     }
 
     if lower.contains("bind") && lower.contains("mcp") {
@@ -11568,7 +12712,7 @@ fn heuristic_mcp_tool_call(request_text: &str) -> Option<ToolCall> {
             invocation_id: None,
             name: "bind_mcp_import".into(),
             arguments: serde_json::Value::Object(arguments).to_string(),
-        });
+});
     }
 
     if lower.contains("invoke") && lower.contains("mcp tool") {
@@ -11583,7 +12727,7 @@ fn heuristic_mcp_tool_call(request_text: &str) -> Option<ToolCall> {
             invocation_id: None,
             name: "invoke_mcp_tool".into(),
             arguments: serde_json::Value::Object(arguments).to_string(),
-        });
+});
     }
 
     if lower.contains("render") && lower.contains("mcp prompt") {
@@ -11598,7 +12742,7 @@ fn heuristic_mcp_tool_call(request_text: &str) -> Option<ToolCall> {
             invocation_id: None,
             name: "render_mcp_prompt".into(),
             arguments: serde_json::Value::Object(arguments).to_string(),
-        });
+});
     }
 
     if lower.contains("read") && lower.contains("mcp resource") {
@@ -11612,7 +12756,7 @@ fn heuristic_mcp_tool_call(request_text: &str) -> Option<ToolCall> {
             invocation_id: None,
             name: "read_mcp_resource".into(),
             arguments: serde_json::Value::Object(arguments).to_string(),
-        });
+});
     }
 
     None
@@ -11634,6 +12778,658 @@ fn request_is_scheduling_like(request_text: &str) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn request_is_file_write_like(request_text: &str) -> bool {
+    let lower = request_text.to_ascii_lowercase();
+    let mentions_file = lower.contains(" file")
+        || lower.contains(".js")
+        || lower.contains(".ts")
+        || lower.contains(".json")
+        || lower.contains(".md")
+        || lower.contains(".txt")
+        || lower.contains(".rs")
+        || lower.contains(".py");
+    let write_action = lower.contains("create")
+        || lower.contains("write")
+        || lower.contains("save")
+        || lower.contains("edit")
+        || lower.contains("update")
+        || lower.contains("append");
+    mentions_file && write_action
+}
+
+fn mcp_tool_alias_name(server_id: &str, tool_name: &str) -> String {
+    format!(
+        "mcp__{}__{}",
+        server_id.trim().replace(['/', ':', '-', '.'], "_"),
+        tool_name.trim().replace(['/', ':', '-', '.'], "_")
+    )
+}
+
+fn decode_mcp_tool_alias(alias: &str) -> Option<(String, String)> {
+    let rest = alias.strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
+    Some((server.to_string(), tool.to_string()))
+}
+
+fn synthesize_bound_mcp_tools(
+    store: &RuntimeStore,
+    agent_id: &str,
+) -> Result<Vec<CachedTool>, String> {
+    let bindings = store.list_mcp_bindings_for_agent(agent_id)?;
+    let mut out = Vec::new();
+    for binding in bindings {
+        if binding.primitive_kind != McpPrimitiveKind::Tool {
+            continue;
+        }
+        let imported = store
+            .list_mcp_imported_tools(&binding.server_id)?
+            .into_iter()
+            .find(|tool| tool.tool_name == binding.target_name);
+        let Some(imported) = imported else {
+            continue;
+        };
+        out.push(CachedTool {
+            name: mcp_tool_alias_name(&binding.server_id, &binding.target_name),
+            description: format!(
+                "{} (MCP {}::{})",
+                imported.description, binding.server_id, binding.target_name
+            ),
+            parameters_schema: imported.parameters_schema,
+            embedding: Vec::new(),
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
+        });
+    }
+    Ok(out)
+}
+
+fn synthesize_external_compat_tools() -> Vec<CachedTool> {
+    list_external_compat_tools()
+        .into_iter()
+        .map(|registration| CachedTool {
+            name: registration.tool_name,
+            description: format!("{} (external compat tool)", registration.description),
+            parameters_schema: registration.parameters_schema,
+            embedding: Vec::new(),
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: false,
+            modalities: vec![aria_core::ToolModality::Text],
+        })
+        .collect()
+}
+
+fn synthesize_remote_tools() -> Vec<CachedTool> {
+    list_remote_tools()
+        .into_iter()
+        .map(|registration| CachedTool {
+            name: registration.tool_name,
+            description: format!("{} (remote tool)", registration.description),
+            parameters_schema: registration.parameters_schema,
+            embedding: Vec::new(),
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: false,
+            modalities: vec![aria_core::ToolModality::Text],
+        })
+        .collect()
+}
+
+fn active_tool_catalog_entry(tool: &CachedTool) -> aria_core::ToolCatalogEntry {
+    if let Some((server_id, tool_name)) = decode_mcp_tool_alias(&tool.name) {
+        return aria_core::ToolCatalogEntry {
+            tool_id: format!("tool.mcp.{}.{}", server_id, tool_name),
+            public_name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters_json_schema: tool.parameters_schema.clone(),
+            execution_kind: aria_core::ToolExecutionKind::McpImported,
+            provider_kind: aria_core::ToolProviderKind::Mcp,
+            runner_class: aria_core::ToolRunnerClass::Mcp,
+            origin: aria_core::ToolOrigin {
+                provider_kind: aria_core::ToolProviderKind::Mcp,
+                provider_id: server_id,
+                origin_id: Some(tool_name),
+                display_name: None,
+            },
+            artifact_kind: Some("mcp".into()),
+            requires_approval: aria_core::ToolApprovalClass::None,
+            side_effect_level: aria_core::ToolSideEffectLevel::ReadOnly,
+            streaming_safe: tool.streaming_safe,
+            parallel_safe: tool.parallel_safe,
+            modalities: tool.modalities.clone(),
+            capability_requirements: vec!["mcp_binding".into()],
+        };
+    }
+    if let Some(registration) = get_external_compat_tool(&tool.name) {
+        return aria_core::ToolCatalogEntry {
+            tool_id: format!("tool.external_compat.{}", tool.name),
+            public_name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters_json_schema: tool.parameters_schema.clone(),
+            execution_kind: aria_core::ToolExecutionKind::Native,
+            provider_kind: aria_core::ToolProviderKind::ExternalCompat,
+            runner_class: aria_core::ToolRunnerClass::ExternalCompat,
+            origin: aria_core::ToolOrigin {
+                provider_kind: aria_core::ToolProviderKind::ExternalCompat,
+                provider_id: "external_compat".into(),
+                origin_id: Some(registration.tool_name),
+                display_name: Some("Local sidecar".into()),
+            },
+            artifact_kind: Some("external_compat".into()),
+            requires_approval: aria_core::ToolApprovalClass::None,
+            side_effect_level: aria_core::ToolSideEffectLevel::ReadOnly,
+            streaming_safe: tool.streaming_safe,
+            parallel_safe: tool.parallel_safe,
+            modalities: tool.modalities.clone(),
+            capability_requirements: vec!["external_compat_allowlist".into()],
+        };
+    }
+    if let Some(registration) = get_remote_tool(&tool.name) {
+        return aria_core::ToolCatalogEntry {
+            tool_id: format!("tool.remote.{}", tool.name),
+            public_name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters_json_schema: tool.parameters_schema.clone(),
+            execution_kind: aria_core::ToolExecutionKind::Native,
+            provider_kind: aria_core::ToolProviderKind::Remote,
+            runner_class: aria_core::ToolRunnerClass::Remote,
+            origin: aria_core::ToolOrigin {
+                provider_kind: aria_core::ToolProviderKind::Remote,
+                provider_id: registration.endpoint,
+                origin_id: Some(registration.tool_name),
+                display_name: Some("Remote tool".into()),
+            },
+            artifact_kind: Some("remote_tool".into()),
+            requires_approval: aria_core::ToolApprovalClass::None,
+            side_effect_level: aria_core::ToolSideEffectLevel::ReadOnly,
+            streaming_safe: tool.streaming_safe,
+            parallel_safe: tool.parallel_safe,
+            modalities: tool.modalities.clone(),
+            capability_requirements: vec!["remote_tool_allowlist".into()],
+        };
+    }
+    tool.catalog_entry()
+}
+
+struct NativeToolProvider<'a> {
+    store: &'a ToolManifestStore,
+}
+
+impl aria_intelligence::ToolProvider for NativeToolProvider<'_> {
+    fn readiness(&self) -> aria_core::ToolProviderReadiness {
+        aria_core::ToolProviderReadiness {
+            provider_kind: aria_core::ToolProviderKind::Native,
+            provider_id: "native".into(),
+            status: aria_core::ToolProviderHealthStatus::Ready,
+            installed: true,
+            imported: !self.store.is_empty(),
+            bound: !self.store.is_empty(),
+            auth_ready: true,
+            last_error: None,
+            latency_ms: None,
+        }
+    }
+
+    fn list_tools(&self) -> Vec<aria_core::ToolCatalogEntry> {
+        self.store.list_catalog_entries()
+    }
+}
+
+struct ExternalCompatToolProvider;
+
+impl aria_intelligence::ToolProvider for ExternalCompatToolProvider {
+    fn readiness(&self) -> aria_core::ToolProviderReadiness {
+        let installed = !list_external_compat_tools().is_empty();
+        aria_core::ToolProviderReadiness {
+            provider_kind: aria_core::ToolProviderKind::ExternalCompat,
+            provider_id: "external_compat".into(),
+            status: if installed {
+                aria_core::ToolProviderHealthStatus::Ready
+            } else {
+                aria_core::ToolProviderHealthStatus::Unavailable
+            },
+            installed,
+            imported: installed,
+            bound: installed,
+            auth_ready: true,
+            last_error: None,
+            latency_ms: None,
+        }
+    }
+
+    fn list_tools(&self) -> Vec<aria_core::ToolCatalogEntry> {
+        synthesize_external_compat_tools()
+            .iter()
+            .map(active_tool_catalog_entry)
+            .collect()
+    }
+}
+
+struct RemoteToolProvider;
+
+impl aria_intelligence::ToolProvider for RemoteToolProvider {
+    fn readiness(&self) -> aria_core::ToolProviderReadiness {
+        let installed = !list_remote_tools().is_empty();
+        aria_core::ToolProviderReadiness {
+            provider_kind: aria_core::ToolProviderKind::Remote,
+            provider_id: "remote".into(),
+            status: if installed {
+                aria_core::ToolProviderHealthStatus::Ready
+            } else {
+                aria_core::ToolProviderHealthStatus::Unavailable
+            },
+            installed,
+            imported: installed,
+            bound: installed,
+            auth_ready: installed,
+            last_error: None,
+            latency_ms: None,
+        }
+    }
+
+    fn list_tools(&self) -> Vec<aria_core::ToolCatalogEntry> {
+        synthesize_remote_tools()
+            .iter()
+            .map(active_tool_catalog_entry)
+            .collect()
+    }
+}
+
+struct McpBoundProvider<'a> {
+    store: &'a RuntimeStore,
+    agent_id: &'a str,
+}
+
+impl aria_intelligence::ToolProvider for McpBoundProvider<'_> {
+    fn readiness(&self) -> aria_core::ToolProviderReadiness {
+        let bindings = self
+            .store
+            .list_mcp_bindings_for_agent(self.agent_id)
+            .unwrap_or_default();
+        let installed = !bindings.is_empty();
+        aria_core::ToolProviderReadiness {
+            provider_kind: aria_core::ToolProviderKind::Mcp,
+            provider_id: format!("agent:{}", self.agent_id),
+            status: if installed {
+                aria_core::ToolProviderHealthStatus::Ready
+            } else {
+                aria_core::ToolProviderHealthStatus::Unavailable
+            },
+            installed,
+            imported: installed,
+            bound: installed,
+            auth_ready: true,
+            last_error: None,
+            latency_ms: None,
+        }
+    }
+
+    fn list_tools(&self) -> Vec<aria_core::ToolCatalogEntry> {
+        self.store
+            .list_mcp_bindings_for_agent(self.agent_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|binding| binding.primitive_kind == McpPrimitiveKind::Tool)
+            .map(|binding| {
+                let alias = format!("mcp__{}__{}", binding.server_id, binding.target_name);
+                active_tool_catalog_entry(&CachedTool {
+                    name: alias,
+                    description: format!("MCP tool {}", binding.target_name),
+                    parameters_schema: "{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":true}".into(),
+                    embedding: Vec::new(),
+                    requires_strict_schema: false,
+                    streaming_safe: false,
+                    parallel_safe: false,
+                    modalities: vec![aria_core::ToolModality::Text],
+                })
+            })
+            .collect()
+    }
+
+    fn list_prompt_assets(&self) -> Vec<aria_core::PromptAssetEntry> {
+        synthesize_bound_mcp_prompt_assets(self.store, self.agent_id).unwrap_or_default()
+    }
+
+    fn list_resource_entries(&self) -> Vec<aria_core::ResourceContextEntry> {
+        synthesize_bound_mcp_resource_entries(self.store, self.agent_id).unwrap_or_default()
+    }
+}
+
+struct WasmToolProvider<'a> {
+    store: &'a RuntimeStore,
+    agent_id: &'a str,
+}
+
+impl aria_intelligence::ToolProvider for WasmToolProvider<'_> {
+    fn readiness(&self) -> aria_core::ToolProviderReadiness {
+        let bindings = self
+            .store
+            .list_skill_bindings_for_agent(self.agent_id)
+            .unwrap_or_default();
+        let installed = !bindings.is_empty();
+        aria_core::ToolProviderReadiness {
+            provider_kind: aria_core::ToolProviderKind::WasmSkill,
+            provider_id: format!("agent:{}", self.agent_id),
+            status: if installed {
+                aria_core::ToolProviderHealthStatus::Degraded
+            } else {
+                aria_core::ToolProviderHealthStatus::Unavailable
+            },
+            installed,
+            imported: installed,
+            bound: installed,
+            auth_ready: true,
+            last_error: None,
+            latency_ms: None,
+        }
+    }
+
+    fn list_tools(&self) -> Vec<aria_core::ToolCatalogEntry> {
+        Vec::new()
+    }
+}
+
+fn build_runtime_tool_provider_catalog(
+    store: &RuntimeStore,
+    agent_id: &str,
+    tool_registry: &ToolManifestStore,
+) -> aria_intelligence::ToolProviderCatalog {
+    let native = NativeToolProvider { store: tool_registry };
+    let wasm = WasmToolProvider { store, agent_id };
+    let mcp = McpBoundProvider { store, agent_id };
+    let external = ExternalCompatToolProvider;
+    let remote = RemoteToolProvider;
+    aria_intelligence::build_tool_provider_catalog(&[
+        &native as &dyn aria_intelligence::ToolProvider,
+        &wasm,
+        &mcp,
+        &external,
+        &remote,
+    ])
+}
+
+fn build_visible_tool_catalog_context(active_tools: &[CachedTool]) -> String {
+    let mut entries = active_tools
+        .iter()
+        .map(active_tool_catalog_entry)
+        .collect::<Vec<_>>();
+    entries.sort_by(|lhs, rhs| lhs.public_name.cmp(&rhs.public_name));
+    entries
+        .into_iter()
+        .map(|entry| {
+            format!(
+                "- {} [{} / {}] {}",
+                entry.public_name,
+                format!("{:?}", entry.provider_kind).to_ascii_lowercase(),
+                format!("{:?}", entry.runner_class).to_ascii_lowercase(),
+                entry.description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn build_tool_visibility_context(
+    active_tools: &[CachedTool],
+    capability_profile: Option<&aria_core::ModelCapabilityProfile>,
+) -> Option<String> {
+    let mut visible = Vec::new();
+    let mut hidden = Vec::new();
+    for tool in active_tools {
+        let decision = aria_intelligence::explain_tool_visibility(tool, capability_profile);
+        if decision.available {
+            visible.push(format!("- {}: available", decision.tool_name));
+        } else {
+            hidden.push(format!(
+                "- {}: {}",
+                decision.tool_name,
+                decision.reason.as_message(&decision.tool_name)
+            ));
+        }
+    }
+    if hidden.is_empty() {
+        return None;
+    }
+    let mut sections = Vec::new();
+    if !visible.is_empty() {
+        sections.push(format!("Visible:\n{}", visible.join("\n")));
+    }
+    sections.push(format!("Hidden:\n{}", hidden.join("\n")));
+    Some(sections.join("\n\n"))
+}
+
+fn collect_hidden_tool_messages(
+    active_tools: &[CachedTool],
+    capability_profile: Option<&aria_core::ModelCapabilityProfile>,
+) -> Vec<String> {
+    active_tools
+        .iter()
+        .filter_map(|tool| {
+            let decision = aria_intelligence::explain_tool_visibility(tool, capability_profile);
+            (!decision.available).then(|| decision.reason.as_message(&decision.tool_name))
+        })
+        .collect()
+}
+
+fn synthesize_bound_mcp_prompt_assets(
+    store: &RuntimeStore,
+    agent_id: &str,
+) -> Result<Vec<aria_core::PromptAssetEntry>, String> {
+    let bindings = store.list_mcp_bindings_for_agent(agent_id)?;
+    let mut out = Vec::new();
+    for binding in bindings {
+        if binding.primitive_kind != McpPrimitiveKind::Prompt {
+            continue;
+        }
+        let imported = store
+            .list_mcp_imported_prompts(&binding.server_id)?
+            .into_iter()
+            .find(|prompt| prompt.prompt_name == binding.target_name);
+        let Some(imported) = imported else {
+            continue;
+        };
+        out.push(aria_core::PromptAssetEntry {
+            asset_id: format!("mcp.{}.{}", binding.server_id, binding.target_name),
+            public_name: binding.target_name.clone(),
+            description: imported.description,
+            origin: aria_core::ToolOrigin {
+                provider_kind: aria_core::ToolProviderKind::Mcp,
+                provider_id: binding.server_id.clone(),
+                origin_id: Some(imported.import_id),
+                display_name: None,
+            },
+            arguments_json_schema: imported.arguments_schema,
+        });
+    }
+    Ok(out)
+}
+
+fn synthesize_bound_mcp_resource_entries(
+    store: &RuntimeStore,
+    agent_id: &str,
+) -> Result<Vec<aria_core::ResourceContextEntry>, String> {
+    let bindings = store.list_mcp_bindings_for_agent(agent_id)?;
+    let mut out = Vec::new();
+    for binding in bindings {
+        if binding.primitive_kind != McpPrimitiveKind::Resource {
+            continue;
+        }
+        let imported = store
+            .list_mcp_imported_resources(&binding.server_id)?
+            .into_iter()
+            .find(|resource| resource.resource_uri == binding.target_name);
+        let Some(imported) = imported else {
+            continue;
+        };
+        out.push(aria_core::ResourceContextEntry {
+            resource_id: format!("mcp.{}.{}", binding.server_id, binding.target_name),
+            public_name: binding.target_name.clone(),
+            description: imported.description,
+            origin: aria_core::ToolOrigin {
+                provider_kind: aria_core::ToolProviderKind::Mcp,
+                provider_id: binding.server_id.clone(),
+                origin_id: Some(imported.import_id),
+                display_name: None,
+            },
+            mime_type: imported.mime_type,
+        });
+    }
+    Ok(out)
+}
+
+fn normalize_tool_alias_call(call: &ToolCall) -> ToolCall {
+    if let Some((server_id, tool_name)) = decode_mcp_tool_alias(&call.name) {
+        let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        return ToolCall {
+            invocation_id: call.invocation_id.clone(),
+            name: "invoke_mcp_tool".into(),
+            arguments: serde_json::json!({
+                "server_id": server_id,
+                "tool_name": tool_name,
+                "input": input,
+            })
+            .to_string(),
+        };
+    }
+    call.clone()
+}
+
+fn resolve_execution_contract(
+    request_text: &str,
+    scheduling_intent: Option<&SchedulingIntent>,
+) -> aria_core::ExecutionContract {
+    if scheduling_intent.is_some() || request_is_scheduling_like(request_text) {
+        return aria_core::ExecutionContract {
+            kind: aria_core::ExecutionContractKind::ScheduleCreate,
+            allowed_tool_classes: vec!["schedule".into()],
+            required_artifact_kinds: vec![aria_core::ExecutionArtifactKind::Schedule],
+            forbidden_completion_modes: vec!["plain_text_only".into()],
+            fallback_mode: Some("compat_tools".into()),
+            approval_required: false,
+        };
+    }
+    if request_is_browser_action_like(request_text) {
+        return aria_core::ExecutionContract {
+            kind: aria_core::ExecutionContractKind::BrowserAct,
+            allowed_tool_classes: vec!["browser".into()],
+            required_artifact_kinds: vec![aria_core::ExecutionArtifactKind::Browser],
+            forbidden_completion_modes: vec!["plain_text_only".into()],
+            fallback_mode: Some("native_tools".into()),
+            approval_required: false,
+        };
+    }
+    if request_is_browser_read_like(request_text) {
+        return aria_core::ExecutionContract {
+            kind: aria_core::ExecutionContractKind::BrowserRead,
+            allowed_tool_classes: vec!["browser".into()],
+            required_artifact_kinds: vec![aria_core::ExecutionArtifactKind::Browser],
+            forbidden_completion_modes: vec!["plain_text_only".into()],
+            fallback_mode: Some("native_tools".into()),
+            approval_required: false,
+        };
+    }
+    if request_is_mcp_operation_like(request_text) {
+        return aria_core::ExecutionContract {
+            kind: aria_core::ExecutionContractKind::McpInvoke,
+            allowed_tool_classes: vec!["mcp".into()],
+            required_artifact_kinds: vec![aria_core::ExecutionArtifactKind::Mcp],
+            forbidden_completion_modes: vec!["plain_text_only".into()],
+            fallback_mode: Some("native_tools".into()),
+            approval_required: false,
+        };
+    }
+    if request_is_file_write_like(request_text) {
+        return aria_core::ExecutionContract {
+            kind: aria_core::ExecutionContractKind::ArtifactCreate,
+            allowed_tool_classes: vec!["native".into(), "wasm".into()],
+            required_artifact_kinds: vec![aria_core::ExecutionArtifactKind::File],
+            forbidden_completion_modes: vec!["plain_text_only".into()],
+            fallback_mode: Some("native_tools".into()),
+            approval_required: true,
+        };
+    }
+    aria_core::ExecutionContract {
+        kind: aria_core::ExecutionContractKind::ToolAssisted,
+        allowed_tool_classes: vec!["native".into(), "wasm".into(), "mcp".into()],
+        required_artifact_kinds: Vec::new(),
+        forbidden_completion_modes: Vec::new(),
+        fallback_mode: Some("native_tools".into()),
+        approval_required: false,
+    }
+}
+
+fn execution_artifact_kind_for_tool(tool_name: &str) -> Option<aria_core::ExecutionArtifactKind> {
+    if matches!(tool_name, "set_reminder" | "schedule_message" | "manage_cron") {
+        return Some(aria_core::ExecutionArtifactKind::Schedule);
+    }
+    if tool_name.starts_with("browser_") || tool_name.starts_with("crawl_") || tool_name.starts_with("watch_") {
+        return Some(aria_core::ExecutionArtifactKind::Browser);
+    }
+    if matches!(tool_name, "invoke_mcp_tool" | "render_mcp_prompt" | "read_mcp_resource") {
+        return Some(aria_core::ExecutionArtifactKind::Mcp);
+    }
+    if tool_name == "spawn_agent" {
+        return Some(aria_core::ExecutionArtifactKind::SubAgent);
+    }
+    if tool_name == "search_tool_registry" {
+        return Some(aria_core::ExecutionArtifactKind::ToolSearch);
+    }
+    if matches!(tool_name, "read_file" | "write_file" | "edit_file" | "execute_file") {
+        return Some(aria_core::ExecutionArtifactKind::File);
+    }
+    None
+}
+
+fn infer_execution_artifacts(
+    tool_names: &[String],
+    response_text: &str,
+) -> Vec<aria_core::ExecutionArtifact> {
+    let mut artifacts = tool_names
+        .iter()
+        .filter_map(|tool_name| {
+            execution_artifact_kind_for_tool(tool_name).map(|kind| aria_core::ExecutionArtifact {
+                kind,
+                label: tool_name.clone(),
+                payload: None,
+            })
+        })
+        .collect::<Vec<_>>();
+    if artifacts.is_empty() && !response_text.trim().is_empty() {
+        artifacts.push(aria_core::ExecutionArtifact {
+            kind: aria_core::ExecutionArtifactKind::PlainAnswer,
+            label: "plain_answer".into(),
+            payload: None,
+        });
+    }
+    artifacts
+}
+
+fn validate_execution_contract(
+    contract: &aria_core::ExecutionContract,
+    artifacts: &[aria_core::ExecutionArtifact],
+) -> Result<(), aria_core::ContractFailureReason> {
+    if contract.required_artifact_kinds.is_empty() {
+        return Ok(());
+    }
+    let artifact_kinds = artifacts.iter().map(|artifact| artifact.kind).collect::<Vec<_>>();
+    if contract.required_artifact_kinds.iter().all(|kind| artifact_kinds.contains(kind)) {
+        return Ok(());
+    }
+    if artifact_kinds == vec![aria_core::ExecutionArtifactKind::PlainAnswer] || artifact_kinds.is_empty() {
+        return Err(aria_core::ContractFailureReason::MissingRequiredArtifact);
+    }
+    Err(aria_core::ContractFailureReason::MissingRequiredArtifact)
+}
+
+fn execution_contract_requires_tool_capable_model(
+    contract: &aria_core::ExecutionContract,
+) -> bool {
+    !contract.required_artifact_kinds.is_empty()
 }
 
 fn effective_tool_runtime_policy_for_request(
@@ -11659,6 +13455,25 @@ fn effective_tool_runtime_policy_for_request(
     })
 }
 
+fn resolve_workspace_lock_key(agent: &str, whitelist: &[String]) -> String {
+    let mut roots = whitelist
+        .iter()
+        .map(|root| {
+            std::fs::canonicalize(root)
+                .unwrap_or_else(|_| std::path::PathBuf::from(root))
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    if roots.is_empty() {
+        format!("agent:{}:workspace:default", agent)
+    } else {
+        format!("workspace:{}", roots.join("|"))
+    }
+}
+
 async fn process_request(
     req: &AgentRequest,
     learning: &LearningConfig,
@@ -11669,7 +13484,7 @@ async fn process_request(
     agent_store: &AgentConfigStore,
     tool_registry: &ToolManifestStore,
     session_memory: &aria_ssmu::SessionMemory,
-    page_index: &Arc<PageIndexTree>,
+    capability_index: &Arc<aria_ssmu::CapabilityIndex>,
     vector_store: &Arc<VectorStore>,
     keyword_index: &Arc<KeywordIndex>,
     firewall: &aria_safety::DfaFirewall,
@@ -11701,6 +13516,7 @@ async fn process_request(
         &request_text,
         chrono::Utc::now().with_timezone(&user_timezone),
     );
+    let execution_contract = resolve_execution_contract(&request_text, scheduling_intent.as_ref());
     if let Some(intent) = &scheduling_intent {
         debug!(
             mode = %intent.mode.as_tool_mode(),
@@ -11945,6 +13761,27 @@ async fn process_request(
         }
     }
 
+    if execution_contract_requires_tool_capable_model(&execution_contract) {
+        let override_text_only = matches!(
+            override_backend
+                .as_ref()
+                .and_then(|backend| backend.capability_profile())
+                .map(|profile| aria_intelligence::tool_calling_mode_for_model_with_repair(
+                    Some(&profile),
+                    false
+                )),
+            Some(aria_core::ToolCallingMode::TextFallbackNoTools)
+        );
+        if override_text_only {
+            warn!(
+                session_id = %session_uuid,
+                contract = ?execution_contract.kind,
+                "ignoring text-only session model override for artifact-bearing request"
+            );
+            override_backend = None;
+        }
+    }
+
     let active_model_capability = override_backend
         .as_ref()
         .and_then(|backend| backend.capability_profile())
@@ -11953,10 +13790,24 @@ async fn process_request(
         &current_repair_fallback_allowlist(),
         active_model_capability.as_ref(),
     );
+    if execution_contract_requires_tool_capable_model(&execution_contract)
+        && matches!(
+            aria_intelligence::tool_calling_mode_for_model_with_repair(
+                active_model_capability.as_ref(),
+                false
+            ),
+            aria_core::ToolCallingMode::TextFallbackNoTools
+        )
+    {
+        return Ok(aria_intelligence::OrchestratorResult::Completed(
+            "The active model cannot execute the required tools for this request. Clear the session model override or switch to a tool-capable model.".into(),
+        ));
+    }
 
     let executed_tool_names = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let llm_backend = PoolBackedLLM::new(llm_pool.clone(), override_backend);
     let orchestrator = AgentOrchestrator::new(
-        PoolBackedLLM::new(llm_pool.clone(), override_backend),
+        llm_backend.clone(),
         RecordingToolExecutor::new(policy_executor, Arc::clone(&executed_tool_names)),
     )
     .with_repair_fallback(allow_repair_fallback)
@@ -12042,7 +13893,9 @@ async fn process_request(
         let _ = cache.insert(CachedTool {
             name: "search_tool_registry".into(),
             description: "Search tool registry and inject best tool.".into(),
-            parameters_schema: r#"{"query":"string"}"#.into(),
+            parameters_schema:
+                r#"{"type":"object","properties":{"query":{"type":"string","description":"Description of the capability you need"}},"required":["query"],"additionalProperties":false}"#
+                    .into(),
             embedding: Vec::new(),
             requires_strict_schema: false,
             streaming_safe: false,
@@ -12067,6 +13920,19 @@ async fn process_request(
         };
         let _ = cache.insert(tool);
     }
+    if let Ok(bound_mcp_tools) =
+        synthesize_bound_mcp_tools(&RuntimeStore::for_sessions_dir(&sessions_dir), &agent)
+    {
+        for tool in bound_mcp_tools {
+            let _ = cache.insert(tool);
+        }
+    }
+    for tool in synthesize_external_compat_tools() {
+        let _ = cache.insert(tool);
+    }
+    for tool in synthesize_remote_tools() {
+        let _ = cache.insert(tool);
+    }
     let _ = RuntimeStore::for_sessions_dir(&sessions_dir).upsert_cache_snapshot(
         session_uuid,
         &agent,
@@ -12075,7 +13941,9 @@ async fn process_request(
     );
 
     let mut history_ctx = String::new();
+    let mut prompt_history_messages = Vec::new();
     let mut durable_constraints_ctx = String::new();
+    let mut session_history = Vec::new();
 
     if let Ok(constraints) = session_memory.get_durable_constraints(&session_uuid) {
         if !constraints.is_empty() {
@@ -12087,6 +13955,7 @@ async fn process_request(
     }
 
     if let Ok(hist) = session_memory.get_history(&session_uuid) {
+        session_history = hist.clone();
         let hist_len = hist.len();
 
         // Token-aware auto-compaction trigger
@@ -12139,6 +14008,11 @@ async fn process_request(
         // Build history text to pass to LLM
         for m in hist.iter().skip(start_idx) {
             history_ctx.push_str(&format!("{}: {}\n", m.role, m.content));
+            prompt_history_messages.push(aria_core::PromptContextMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+                timestamp_us: m.timestamp_us,
+            });
         }
         history_ctx = truncate_to_token_budget(&history_ctx, prompt_budget.history_tokens);
 
@@ -12154,6 +14028,11 @@ async fn process_request(
     }
 
     let store = RuntimeStore::for_sessions_dir(&sessions_dir);
+    let runtime_provider_catalog = build_runtime_tool_provider_catalog(&store, &agent, tool_registry);
+    let bound_prompt_assets =
+        synthesize_bound_mcp_prompt_assets(&store, &agent).unwrap_or_default();
+    let bound_resource_entries =
+        synthesize_bound_mcp_resource_entries(&store, &agent).unwrap_or_default();
     let now_us = chrono::Utc::now().timestamp_micros() as u64;
     for root in &whitelist {
         let path = Path::new(root);
@@ -12164,16 +14043,18 @@ async fn process_request(
 
     let query_embedding = embedder.embed(&request_text);
     let rag_started = std::time::Instant::now();
-    let (rag_context_raw, retrieval_metrics) = build_split_rag_context(
+    let (rag_context_raw, retrieved_context_bundle, retrieval_metrics) = build_split_rag_context(
         &request_text,
         &query_embedding,
+        &session_history,
         vector_store,
-        page_index,
+        capability_index,
         keyword_index,
         capability_profile.as_ref(),
         trust_profile,
     );
-    let mut rag_context = truncate_to_token_budget(&rag_context_raw, prompt_budget.rag_tokens);
+    let retrieval_context =
+        truncate_to_token_budget(&rag_context_raw, prompt_budget.rag_tokens);
     let control_document_conflicts =
         detect_control_document_conflicts(&store, &whitelist).unwrap_or_default();
     let control_doc_context_raw =
@@ -12181,19 +14062,22 @@ async fn process_request(
             .unwrap_or_default();
     let control_doc_context =
         truncate_to_token_budget(&control_doc_context_raw, prompt_budget.control_tokens);
+    let sub_agent_context_raw =
+        build_sub_agent_result_context(&store, session_uuid).unwrap_or_default();
+    let mut rag_context = retrieval_context.clone();
     if !control_doc_context.is_empty() {
-            if !rag_context.is_empty() {
-                rag_context.push_str("\n\n");
-            }
-            rag_context.push_str(&control_doc_context);
-    }
-    if let Ok(sub_agent_context) = build_sub_agent_result_context(&store, session_uuid) {
-        if !sub_agent_context.is_empty() {
-            if !rag_context.is_empty() {
-                rag_context.push_str("\n\n");
-            }
-            rag_context.push_str(&sub_agent_context);
+        if !rag_context.is_empty() {
+            rag_context.push_str("\n\n");
         }
+        rag_context.push_str(&control_doc_context);
+    }
+    let sub_agent_context =
+        truncate_to_token_budget(&sub_agent_context_raw, prompt_budget.control_tokens / 2);
+    if !sub_agent_context.is_empty() {
+        if !rag_context.is_empty() {
+            rag_context.push_str("\n\n");
+        }
+        rag_context.push_str(&sub_agent_context);
     }
     debug!(
         rag_context_len = rag_context.len(),
@@ -12205,13 +14089,30 @@ async fn process_request(
         content: request_text.clone(),
         timestamp_us: effective_req.timestamp_us,
     };
-    let _ = session_memory.append(session_uuid, user_msg.clone());
+    if let Err(err) = session_memory.append(session_uuid, user_msg.clone()) {
+        warn!(
+            session_id = %session_uuid,
+            error = %err,
+            "failed to append user message to session memory"
+        );
+        return Err(OrchestratorError::LLMError(format!(
+            "session memory append failed: {}",
+            err
+        )));
+    }
     let _ = session_memory.append_audit_event(sessions_dir, &session_uuid, &user_msg);
 
     let intent_ctx = scheduling_intent
         .as_ref()
         .map(|intent| scheduling_intent_context(intent, user_timezone))
         .unwrap_or_default();
+    let contract_prompt_ctx = format!(
+        "\n<execution_contract>\nkind={:?}\nrequired_artifacts={:?}\nforbidden_completion_modes={:?}\nfallback_mode={:?}\n</execution_contract>\n",
+        execution_contract.kind,
+        execution_contract.required_artifact_kinds,
+        execution_contract.forbidden_completion_modes,
+        execution_contract.fallback_mode
+    );
     let scenario_prompt_ctx = build_scenario_prompt_context(
         &effective_req,
         &request_text,
@@ -12233,21 +14134,38 @@ async fn process_request(
         .list_selector_models_for_request(&agent, &learning_prompt_mode, &request_text)
         .unwrap_or_default();
     apply_learning_selector_models(&mut cache, tool_registry, &selector_models);
-    let prompt_tools = select_prompt_tool_window(
+    let (mut prompt_tools, tool_selection) = select_prompt_tool_window(
         &request_text,
         &cache.active_tools(),
         tool_registry,
         embedder,
         active_model_capability.as_ref(),
+        effective_req.tool_runtime_policy.as_ref(),
+        allow_repair_fallback,
         prompt_budget,
     );
+    if scheduling_intent.is_some() {
+        for required_name in ["set_reminder", "schedule_message"] {
+            if prompt_tools.iter().any(|tool| tool.name == required_name) {
+                continue;
+            }
+            if let Some(tool) = cache
+                .active_tools()
+                .iter()
+                .find(|tool| tool.name == required_name)
+                .cloned()
+            {
+                prompt_tools.push(tool);
+            }
+        }
+    }
     let learning_rollout_ctx = build_learning_rollout_prompt_context(&promoted_learning_candidates);
     let final_system_prompt = format!(
         "{}{}{}{}{}",
         system_prompt,
         durable_constraints_ctx,
         intent_ctx,
-        scenario_prompt_ctx,
+        contract_prompt_ctx.clone() + &scenario_prompt_ctx,
         learning_rollout_ctx
     );
 
@@ -12268,6 +14186,22 @@ async fn process_request(
         }
         aria_safety::ScanResult::Clean => final_system_prompt,
     };
+    let retrieval_context_for_pack = match firewall.scan_egress(&retrieval_context) {
+        aria_safety::ScanResult::Alert(_) => "[Retrieval context redacted by firewall]".to_string(),
+        aria_safety::ScanResult::Clean => retrieval_context.clone(),
+    };
+    let control_doc_context_for_pack = match firewall.scan_egress(&control_doc_context) {
+        aria_safety::ScanResult::Alert(_) => {
+            "[Control document context redacted by firewall]".to_string()
+        }
+        aria_safety::ScanResult::Clean => control_doc_context.clone(),
+    };
+    let sub_agent_context_for_pack = match firewall.scan_egress(&sub_agent_context) {
+        aria_safety::ScanResult::Alert(_) => {
+            "[Sub-agent context redacted by firewall]".to_string()
+        }
+        aria_safety::ScanResult::Clean => sub_agent_context.clone(),
+    };
 
     let retrieval_trace = aria_core::RetrievalTraceRecord {
         trace_id: uuid::Uuid::new_v4().to_string(),
@@ -12285,88 +14219,196 @@ async fn process_request(
         policy_hits: retrieval_metrics.policy_hits,
         external_hits: retrieval_metrics.external_hits,
         social_hits: retrieval_metrics.social_hits,
-        page_context_hits: retrieval_metrics.page_context_hits,
+        document_context_hits: retrieval_metrics.document_context_hits,
         control_document_conflicts: control_document_conflicts.len() as u32,
         created_at_us: effective_req.timestamp_us,
     };
     let _ = RuntimeStore::for_sessions_dir(&sessions_dir).append_retrieval_trace(&retrieval_trace);
 
-    let direct_specific_tool_result = if let Some(aria_core::ToolRuntimePolicy {
-        tool_choice: aria_core::ToolChoicePolicy::Specific(tool_name),
-        ..
-    }) = effective_req.tool_runtime_policy.as_ref()
+    let mut context_blocks = Vec::new();
+    context_blocks.push(aria_core::ContextBlock {
+        kind: aria_core::ContextBlockKind::ContractRequirements,
+        label: "execution_contract".into(),
+        token_estimate: estimate_token_count(&contract_prompt_ctx) as u32,
+        content: contract_prompt_ctx.clone(),
+    });
+    if !retrieval_context_for_pack.trim().is_empty() {
+        context_blocks.push(aria_core::ContextBlock {
+            kind: aria_core::ContextBlockKind::Retrieval,
+            label: "retrieval".into(),
+            token_estimate: estimate_token_count(&retrieval_context_for_pack) as u32,
+            content: retrieval_context_for_pack.clone(),
+        });
+    }
+    if !control_doc_context_for_pack.trim().is_empty() {
+        context_blocks.push(aria_core::ContextBlock {
+            kind: aria_core::ContextBlockKind::ControlDocument,
+            label: "control_documents".into(),
+            token_estimate: estimate_token_count(&control_doc_context_for_pack) as u32,
+            content: control_doc_context_for_pack.clone(),
+        });
+    }
+    if !sub_agent_context_for_pack.trim().is_empty() {
+        context_blocks.push(aria_core::ContextBlock {
+            kind: aria_core::ContextBlockKind::SubAgentResult,
+            label: "sub_agent_results".into(),
+            token_estimate: estimate_token_count(&sub_agent_context_for_pack) as u32,
+            content: sub_agent_context_for_pack.clone(),
+        });
+    }
+    if let Some(tool_visibility_context) =
+        build_tool_visibility_context(&cache.active_tools(), active_model_capability.as_ref())
     {
-        if let Some(heuristic_call) = heuristic_specific_tool_call(
-            &request_text,
-            tool_name.as_str(),
-            scheduling_intent.as_ref(),
-        ) {
-            match build_policy_executor().execute(&heuristic_call).await {
-                Ok(tool_result) => {
-                    executed_tool_names
-                        .lock()
-                        .expect("executed tool names lock poisoned")
-                        .push(heuristic_call.name.clone());
-                    Some(aria_intelligence::OrchestratorResult::Completed(
-                        tool_result.render_for_prompt().to_string(),
-                    ))
-                }
-                Err(OrchestratorError::ToolError(message)) => {
-                    if let Ok((_, approval_text)) = persist_pending_approval_for_tool_error(
-                        sessions_dir,
-                        &effective_req,
-                        &heuristic_call,
-                        &message,
-                    ) {
-                        Some(aria_intelligence::OrchestratorResult::Completed(approval_text))
-                    } else {
-                        Some(aria_intelligence::OrchestratorResult::Completed(format!(
-                            "The forced tool '{}' could not be executed from this request: {}",
-                            tool_name, message
-                        )))
-                    }
-                }
-                Err(err) => Some(aria_intelligence::OrchestratorResult::Completed(format!(
-                    "The forced tool '{}' could not be executed from this request: {}",
-                    tool_name, err
-                ))),
-            }
-        } else {
-            None
-        }
-    } else {
-        None
+        context_blocks.push(aria_core::ContextBlock {
+            kind: aria_core::ContextBlockKind::ToolInstructions,
+            label: "tool_visibility".into(),
+            token_estimate: estimate_token_count(&tool_visibility_context) as u32,
+            content: tool_visibility_context,
+        });
+    }
+    let visible_tool_catalog_context = build_visible_tool_catalog_context(&prompt_tools);
+    if !visible_tool_catalog_context.trim().is_empty() {
+        context_blocks.push(aria_core::ContextBlock {
+            kind: aria_core::ContextBlockKind::ToolInstructions,
+            label: "visible_tool_catalog".into(),
+            token_estimate: estimate_token_count(&visible_tool_catalog_context) as u32,
+            content: visible_tool_catalog_context,
+        });
+    }
+    if !bound_prompt_assets.is_empty() {
+        let content = bound_prompt_assets
+            .iter()
+            .map(|entry| format!("- {}: {}", entry.public_name, entry.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+        context_blocks.push(aria_core::ContextBlock {
+            kind: aria_core::ContextBlockKind::PromptAsset,
+            label: "bound_prompt_assets".into(),
+            token_estimate: estimate_token_count(&content) as u32,
+            content,
+        });
+    }
+    if !bound_resource_entries.is_empty() {
+        let content = bound_resource_entries
+            .iter()
+            .map(|entry| format!("- {}: {}", entry.public_name, entry.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+        context_blocks.push(aria_core::ContextBlock {
+            kind: aria_core::ContextBlockKind::ResourceContext,
+            label: "bound_resource_context".into(),
+            token_estimate: estimate_token_count(&content) as u32,
+            content,
+        });
+    }
+    let inspection_pack = aria_core::ExecutionContextPack {
+        system_prompt: final_system_prompt.clone(),
+        history_messages: prompt_history_messages.clone(),
+        context_blocks: context_blocks.clone(),
+        user_request: request_text.clone(),
+        channel: effective_req.channel,
+        execution_contract: Some(execution_contract.clone()),
+        retrieved_context: Some(retrieved_context_bundle.clone()),
+    };
+    let default_tool_runtime_policy = aria_core::ToolRuntimePolicy::default();
+    let provider_request_payload = llm_backend.inspect_context_payload(
+        &inspection_pack,
+        &prompt_tools,
+        effective_req
+            .tool_runtime_policy
+            .as_ref()
+            .unwrap_or(&default_tool_runtime_policy),
+    );
+    let rendered_prompt = aria_intelligence::PromptManager::render_execution_context_pack(&inspection_pack);
+    let hidden_tool_messages =
+        collect_hidden_tool_messages(&cache.active_tools(), active_model_capability.as_ref());
+    let prompt_tool_names = prompt_tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let selected_tool_catalog = runtime_provider_catalog
+        .tools
+        .iter()
+        .filter(|entry| prompt_tool_names.contains(entry.public_name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let provider_request_payload = provider_request_payload;
+    let rendered_prompt = rendered_prompt;
+    let inspection_pack = inspection_pack;
+    let base_context_inspection = aria_core::ContextInspectionRecord {
+        context_id: uuid::Uuid::new_v4().to_string(),
+        request_id: effective_req.request_id,
+        session_id: *session_uuid.as_bytes(),
+        agent_id: agent.clone(),
+        channel: effective_req.channel,
+        provider_model: active_model_capability
+            .as_ref()
+            .map(|profile| profile.model_ref.as_slash_ref()),
+        prompt_mode: "execution".into(),
+        history_tokens: estimate_token_count(&history_ctx) as u32,
+        context_tokens: context_blocks
+            .iter()
+            .map(|block| block.token_estimate)
+            .sum(),
+        system_tokens: estimate_token_count(&final_system_prompt) as u32,
+        user_tokens: estimate_token_count(&request_text) as u32,
+        tool_count: prompt_tools.len() as u32,
+        active_tool_names: prompt_tools.iter().map(|tool| tool.name.clone()).collect(),
+        tool_runtime_policy: effective_req.tool_runtime_policy.clone(),
+        tool_selection: Some(tool_selection.clone()),
+        provider_request_payload,
+        selected_tool_catalog,
+        hidden_tool_messages,
+        emitted_artifacts: Vec::new(),
+        tool_provider_readiness: runtime_provider_catalog.provider_readiness.clone(),
+        pack: inspection_pack.clone(),
+        rendered_prompt: rendered_prompt.clone(),
+        created_at_us: effective_req.timestamp_us,
     };
 
-    let allow_scheduling_retry = steering_rx.is_none();
-    let mut orchestrator_result = if let Some(result) = direct_specific_tool_result {
-        result
-    } else {
-        orchestrator
-            .run_for_request_with_dynamic_tools(aria_intelligence::DynamicRunContext {
-                agent_system_prompt: &final_system_prompt,
-                request: &effective_req,
-                history_context: &history_ctx,
-                rag_context: &rag_context,
-                prompt_tools: Some(&prompt_tools),
-                cache: &mut cache,
-                tool_registry,
-                embedder,
-                max_tool_rounds: max_rounds,
-                model_capability: active_model_capability.as_ref(),
-                steering_rx,
-                global_estop,
-            })
-            .await?
-    };
+    let workspace_key = resolve_workspace_lock_key(&agent, &whitelist);
+    let _workspace_guard = workspace_lock_manager()
+        .acquire(
+            workspace_key.clone(),
+            format!("session:{}:agent:{}", session_uuid, agent),
+        )
+        .await
+        .map_err(|err| {
+            warn!(
+                session_id = %session_uuid,
+                workspace_key = %workspace_key,
+                error = %err,
+                "workspace coordination rejected request"
+            );
+            err
+        })?;
+
+    let allow_contract_retry = !execution_contract.required_artifact_kinds.is_empty();
+    let mut orchestrator_result = orchestrator
+        .run_for_request_with_dynamic_tools(aria_intelligence::DynamicRunContext {
+            agent_system_prompt: &final_system_prompt,
+            request: &effective_req,
+            history_context: &history_ctx,
+            rag_context: &rag_context,
+            history_messages: &prompt_history_messages,
+            context_blocks: &context_blocks,
+            prompt_tools: Some(&prompt_tools),
+            tool_selection: Some(&tool_selection),
+            cache: &mut cache,
+            tool_registry,
+            embedder,
+            max_tool_rounds: max_rounds,
+            model_capability: active_model_capability.as_ref(),
+            steering_rx,
+            global_estop,
+        })
+        .await?;
 
     let mut executed_tools_snapshot = executed_tool_names
         .lock()
         .expect("executed tool names lock poisoned")
         .clone();
-    if allow_scheduling_retry
-        && scheduling_intent.is_some()
-        && request_is_reminder_like(&request_text)
+    if allow_contract_retry
         && executed_tools_snapshot.is_empty()
         && matches!(
             orchestrator_result,
@@ -12375,12 +14417,13 @@ async fn process_request(
     {
         let mut retry_req = effective_req.clone();
         retry_req.tool_runtime_policy = Some(aria_core::ToolRuntimePolicy {
-            tool_choice: aria_core::ToolChoicePolicy::Specific("set_reminder".to_string()),
+            tool_choice: aria_core::ToolChoicePolicy::Required,
             allow_parallel_tool_calls: false,
         });
         retry_req.content = aria_core::MessageContent::Text(format!(
-            "{}\n\nUse the set_reminder tool to satisfy this scheduling request. Return the tool call if needed.",
-            request_text
+            "{}\n\nThe execution contract requires {:?}. Do not answer with a promise-only text reply. Execute the appropriate tool call and satisfy the required artifact.",
+            request_text,
+            execution_contract.required_artifact_kinds
         ));
         let retry_result = orchestrator
             .run_for_request_with_dynamic_tools(aria_intelligence::DynamicRunContext {
@@ -12388,7 +14431,10 @@ async fn process_request(
                 request: &retry_req,
                 history_context: &history_ctx,
                 rag_context: &rag_context,
+                history_messages: &prompt_history_messages,
+                context_blocks: &context_blocks,
                 prompt_tools: Some(&prompt_tools),
+                tool_selection: Some(&tool_selection),
                 cache: &mut cache,
                 tool_registry,
                 embedder,
@@ -12402,44 +14448,6 @@ async fn process_request(
             .lock()
             .expect("executed tool names lock poisoned")
             .clone();
-        if retry_tools_snapshot.len() == executed_tools_snapshot.len()
-            && matches!(
-                &retry_result,
-                aria_intelligence::OrchestratorResult::Completed(_)
-            )
-        {
-            if let Some(heuristic_call) = heuristic_specific_tool_call(
-                &request_text,
-                "set_reminder",
-                scheduling_intent.as_ref(),
-            ) {
-                match build_policy_executor().execute(&heuristic_call).await {
-                    Ok(tool_result) => {
-                        executed_tools_snapshot.push(heuristic_call.name.clone());
-                        orchestrator_result = aria_intelligence::OrchestratorResult::Completed(
-                            tool_result.render_for_prompt().to_string(),
-                        );
-                        let updated_snapshot = executed_tool_names
-                            .lock()
-                            .expect("executed tool names lock poisoned")
-                            .clone();
-                        executed_tools_snapshot = updated_snapshot;
-                    }
-                    Err(OrchestratorError::ToolError(message)) => {
-                        if let Ok((_, approval_text)) = persist_pending_approval_for_tool_error(
-                            sessions_dir,
-                            &retry_req,
-                            &heuristic_call,
-                            &message,
-                        ) {
-                            orchestrator_result =
-                                aria_intelligence::OrchestratorResult::Completed(approval_text);
-                        }
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
         if retry_tools_snapshot.len() > executed_tools_snapshot.len()
             || matches!(
                 retry_result,
@@ -12448,230 +14456,20 @@ async fn process_request(
         {
             orchestrator_result = retry_result;
             executed_tools_snapshot = retry_tools_snapshot;
-        }
-    }
-
-    if allow_scheduling_retry
-        && request_is_browser_read_like(&request_text)
-        && executed_tools_snapshot.is_empty()
-        && matches!(
-            orchestrator_result,
-            aria_intelligence::OrchestratorResult::Completed(_)
-        )
-    {
-        let mut retry_req = effective_req.clone();
-        retry_req.tool_runtime_policy = Some(browser_read_retry_policy(&request_text));
-        retry_req.content = aria_core::MessageContent::Text(format!(
-            "{}\n\nUse only the native browser read tools needed for this request: browser_open, browser_snapshot, browser_screenshot, browser_extract. Do not emit <tool_call> tags or explanatory tool plans; execute the tool call through the runtime.",
-            request_text
-        ));
-        let retry_result = orchestrator
-            .run_for_request_with_dynamic_tools(aria_intelligence::DynamicRunContext {
-                agent_system_prompt: &final_system_prompt,
-                request: &retry_req,
-                history_context: &history_ctx,
-                rag_context: &rag_context,
-                prompt_tools: Some(&prompt_tools),
-                cache: &mut cache,
-                tool_registry,
-                embedder,
-                max_tool_rounds: max_rounds,
-                model_capability: active_model_capability.as_ref(),
-                steering_rx: None,
-                global_estop,
-            })
-            .await?;
-        let retry_tools_snapshot = executed_tool_names
-            .lock()
-            .expect("executed tool names lock poisoned")
-            .clone();
-        let retry_completed_cleanly = matches!(
-            &retry_result,
-            aria_intelligence::OrchestratorResult::Completed(text)
-                if !looks_like_tool_payload(text)
-        );
-        if retry_tools_snapshot.len() > executed_tools_snapshot.len()
-            || matches!(
-                retry_result,
-                aria_intelligence::OrchestratorResult::ToolApprovalRequired { .. }
-            )
-            || retry_completed_cleanly
-        {
-            orchestrator_result = retry_result;
-            executed_tools_snapshot = retry_tools_snapshot;
-        }
-    }
-
-    if let aria_intelligence::OrchestratorResult::Completed(_) = &orchestrator_result {
-        if executed_tools_snapshot.is_empty() && request_is_browser_action_like(&request_text) {
-            if let Some(heuristic_call) = heuristic_browser_action_tool_call(&request_text) {
-                match build_policy_executor().execute(&heuristic_call).await {
-                    Ok(tool_result) => {
-                        executed_tools_snapshot.push(heuristic_call.name.clone());
-                        orchestrator_result = aria_intelligence::OrchestratorResult::Completed(
-                            tool_result.render_for_prompt().to_string(),
-                        );
-                    }
-                    Err(OrchestratorError::ToolError(message)) => {
-                        if let Ok((_, approval_text)) = persist_pending_approval_for_tool_error(
-                            sessions_dir,
-                            &effective_req,
-                            &heuristic_call,
-                            &message,
-                        )
-                        {
-                            orchestrator_result =
-                                aria_intelligence::OrchestratorResult::Completed(approval_text);
-                        }
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
-    }
-
-    if let aria_intelligence::OrchestratorResult::Completed(_) = &orchestrator_result {
-        if executed_tools_snapshot.is_empty() && request_is_mcp_operation_like(&request_text) {
-            if let Some(heuristic_call) = heuristic_mcp_tool_call(&request_text) {
-                match build_policy_executor().execute(&heuristic_call).await {
-                    Ok(tool_result) => {
-                        executed_tools_snapshot.push(heuristic_call.name.clone());
-                        orchestrator_result = aria_intelligence::OrchestratorResult::Completed(
-                            tool_result.render_for_prompt().to_string(),
-                        );
-                    }
-                    Err(OrchestratorError::ToolError(message)) => {
-                        if let Ok((_, approval_text)) = persist_pending_approval_for_tool_error(
-                            sessions_dir,
-                            &effective_req,
-                            &heuristic_call,
-                            &message,
-                        )
-                        {
-                            orchestrator_result =
-                                aria_intelligence::OrchestratorResult::Completed(approval_text);
-                        }
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
-    }
-
-    if let aria_intelligence::OrchestratorResult::Completed(_) = &orchestrator_result {
-        if executed_tools_snapshot.is_empty() {
-            if let Some(heuristic_call) = heuristic_browser_read_tool_call(&request_text) {
-                match build_policy_executor().execute(&heuristic_call).await {
-                    Ok(tool_result) => {
-                        executed_tools_snapshot.push(heuristic_call.name.clone());
-                        orchestrator_result = aria_intelligence::OrchestratorResult::Completed(
-                            tool_result.render_for_prompt().to_string(),
-                        );
-                    }
-                    Err(OrchestratorError::ToolError(message)) => {
-                        if let Ok((_, approval_text)) = persist_pending_approval_for_tool_error(
-                            sessions_dir,
-                            &effective_req,
-                            &heuristic_call,
-                            &message,
-                        )
-                        {
-                            orchestrator_result =
-                                aria_intelligence::OrchestratorResult::Completed(approval_text);
-                        }
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
-    }
-
-    if let aria_intelligence::OrchestratorResult::Completed(_) = &orchestrator_result {
-        if executed_tools_snapshot.is_empty() {
-            if let Some(heuristic_call) = heuristic_browser_action_tool_call(&request_text) {
-                match build_policy_executor().execute(&heuristic_call).await {
-                    Ok(tool_result) => {
-                        executed_tools_snapshot.push(heuristic_call.name.clone());
-                        orchestrator_result = aria_intelligence::OrchestratorResult::Completed(
-                            tool_result.render_for_prompt().to_string(),
-                        );
-                    }
-                    Err(OrchestratorError::ToolError(message)) => {
-                        if let Ok((_, approval_text)) = persist_pending_approval_for_tool_error(
-                            sessions_dir,
-                            &effective_req,
-                            &heuristic_call,
-                            &message,
-                        ) {
-                            orchestrator_result =
-                                aria_intelligence::OrchestratorResult::Completed(approval_text);
-                        }
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
-    }
-
-    if let aria_intelligence::OrchestratorResult::Completed(_) = &orchestrator_result {
-        if executed_tools_snapshot.is_empty() {
-            if let Some(aria_core::ToolRuntimePolicy {
-                tool_choice: aria_core::ToolChoicePolicy::Specific(tool_name),
-                ..
-            }) = effective_req.tool_runtime_policy.as_ref()
-            {
-                if let Some(heuristic_call) =
-                    heuristic_specific_tool_call(
-                        &request_text,
-                        tool_name.as_str(),
-                        scheduling_intent.as_ref(),
-                    )
-                {
-                    match build_policy_executor().execute(&heuristic_call).await {
-                        Ok(tool_result) => {
-                            executed_tools_snapshot.push(heuristic_call.name.clone());
-                            orchestrator_result = aria_intelligence::OrchestratorResult::Completed(
-                                tool_result.render_for_prompt().to_string(),
-                            );
-                        }
-                        Err(OrchestratorError::ToolError(message)) => {
-                            if let Ok((_, approval_text)) = persist_pending_approval_for_tool_error(
-                                sessions_dir,
-                                &effective_req,
-                                &heuristic_call,
-                                &message,
-                            ) {
-                                orchestrator_result =
-                                    aria_intelligence::OrchestratorResult::Completed(approval_text);
-                            } else {
-                                orchestrator_result = aria_intelligence::OrchestratorResult::Completed(
-                                    format!(
-                                        "The forced tool '{}' could not be executed from this request: {}",
-                                        tool_name, message
-                                    ),
-                                );
-                            }
-                        }
-                        Err(err) => {
-                            orchestrator_result = aria_intelligence::OrchestratorResult::Completed(
-                                format!(
-                                    "The forced tool '{}' could not be executed from this request: {}",
-                                    tool_name, err
-                                ),
-                            );
-                        }
-                    }
-                }
-            }
         }
     }
 
     if let aria_intelligence::OrchestratorResult::Completed(response_text) = &orchestrator_result {
         if executed_tools_snapshot.is_empty() {
-            if let Some(repaired_call) =
-                aria_intelligence::repair_tool_call_json(response_text, &cache.active_tools())
-            {
-                match build_policy_executor().execute(&repaired_call).await {
+            let compat_repair_allowed = matches!(
+                tool_selection.tool_calling_mode,
+                aria_core::ToolCallingMode::TextFallbackWithRepair
+            );
+            if compat_repair_allowed {
+                if let Some(repaired_call) =
+                    aria_intelligence::repair_tool_call_json(response_text, &cache.active_tools())
+                {
+                    match build_policy_executor().execute(&repaired_call).await {
                     Ok(tool_result) => {
                         executed_tools_snapshot.push(repaired_call.name.clone());
                         orchestrator_result = aria_intelligence::OrchestratorResult::Completed(
@@ -12709,7 +14507,25 @@ async fn process_request(
                     }
                 }
             }
+            }
         }
+    }
+
+    if let aria_intelligence::OrchestratorResult::Completed(response_text) = &orchestrator_result {
+        let execution_artifacts = infer_execution_artifacts(&executed_tools_snapshot, response_text);
+        let mut context_inspection = base_context_inspection.clone();
+        context_inspection.emitted_artifacts = execution_artifacts.clone();
+        let _ = RuntimeStore::for_sessions_dir(&sessions_dir)
+            .append_context_inspection(&context_inspection);
+        if let Err(reason) = validate_execution_contract(&execution_contract, &execution_artifacts) {
+            orchestrator_result = aria_intelligence::OrchestratorResult::Completed(format!(
+                "The request could not be completed because the required execution contract was not satisfied ({:?}). No durable artifact was produced.",
+                reason
+            ));
+        }
+    } else {
+        let _ = RuntimeStore::for_sessions_dir(&sessions_dir)
+            .append_context_inspection(&base_context_inspection);
     }
 
     let response_text = match &orchestrator_result {
@@ -12753,7 +14569,17 @@ async fn process_request(
             content: response_text.clone(),
             timestamp_us: effective_req.timestamp_us,
         };
-        let _ = session_memory.append(session_uuid, assistant_msg.clone());
+        if let Err(err) = session_memory.append(session_uuid, assistant_msg.clone()) {
+            warn!(
+                session_id = %session_uuid,
+                error = %err,
+                "failed to append assistant message to session memory"
+            );
+            return Err(OrchestratorError::LLMError(format!(
+                "session memory append failed: {}",
+                err
+            )));
+        }
         let _ = session_memory.append_audit_event(sessions_dir, &session_uuid, &assistant_msg);
     }
 
@@ -12978,12 +14804,14 @@ mod phase8_tests {
             expires_at_us: None,
         };
 
-        let selected = select_prompt_tool_window(
+        let (selected, decision) = select_prompt_tool_window(
             "read the file",
             &active_tools,
             &registry,
             &embedder,
             Some(&model_capability),
+            None,
+            false,
             PromptBudget {
                 tool_count: 1,
                 ..PromptBudget::default()
@@ -12991,5 +14819,144 @@ mod phase8_tests {
         );
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "text_tool");
+        assert_eq!(decision.selected_tool_names, vec!["text_tool"]);
+    }
+
+    #[test]
+    fn select_prompt_tool_window_degrades_to_textual_tools_when_model_tools_are_unavailable() {
+        let embedder = aria_intelligence::LocalHashEmbedder::new(32);
+        let registry = ToolManifestStore::new();
+        let active_tools = vec![CachedTool {
+            name: "search_web".into(),
+            description: "search the web".into(),
+            parameters_schema: "{}".into(),
+            embedding: vec![],
+            requires_strict_schema: false,
+            streaming_safe: true,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
+        }];
+        let model_capability = ModelCapabilityProfile {
+            model_ref: ModelRef::new("openrouter", "free/text-model"),
+            adapter_family: aria_core::AdapterFamily::OpenAiCompatible,
+            tool_calling: CapabilitySupport::Unsupported,
+            parallel_tool_calling: CapabilitySupport::Unsupported,
+            streaming: CapabilitySupport::Supported,
+            vision: CapabilitySupport::Unsupported,
+            json_mode: CapabilitySupport::Unsupported,
+            max_context_tokens: Some(32768),
+            tool_schema_mode: ToolSchemaMode::Unsupported,
+            tool_result_mode: ToolResultMode::Unsupported,
+            supports_images: CapabilitySupport::Unsupported,
+            supports_audio: CapabilitySupport::Unsupported,
+            source: aria_core::CapabilitySourceKind::ProviderCatalog,
+            source_detail: None,
+            observed_at_us: 1,
+            expires_at_us: None,
+        };
+
+        let (selected, decision) = select_prompt_tool_window(
+            "latest news on twitter",
+            &active_tools,
+            &registry,
+            &embedder,
+            Some(&model_capability),
+            None,
+            true,
+            PromptBudget {
+                tool_count: 2,
+                ..PromptBudget::default()
+            },
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "search_web");
+        assert!(decision.text_fallback_mode);
+    }
+
+    #[test]
+    fn select_prompt_tool_window_filters_irrelevant_recent_tools_for_low_information_prompts() {
+        let embedder = aria_intelligence::LocalHashEmbedder::new(32);
+        let registry = ToolManifestStore::new();
+        let active_tools = vec![
+            CachedTool {
+                name: "browser_session_start".into(),
+                description: "start a browser automation session".into(),
+                parameters_schema: "{}".into(),
+                embedding: vec![],
+                requires_strict_schema: false,
+                streaming_safe: true,
+                parallel_safe: true,
+                modalities: vec![aria_core::ToolModality::Text],
+            },
+            CachedTool {
+                name: "set_reminder".into(),
+                description: "schedule a reminder for the user".into(),
+                parameters_schema: "{}".into(),
+                embedding: vec![],
+                requires_strict_schema: false,
+                streaming_safe: true,
+                parallel_safe: true,
+                modalities: vec![aria_core::ToolModality::Text],
+            },
+        ];
+
+        let (selected, decision) = select_prompt_tool_window(
+            "hi",
+            &active_tools,
+            &registry,
+            &embedder,
+            None,
+            None,
+            true,
+            PromptBudget {
+                tool_count: 2,
+                ..PromptBudget::default()
+            },
+        );
+        assert!(selected.is_empty());
+        assert_eq!(
+            decision.relevance_threshold_millis,
+            Some((LOW_INFORMATION_PROMPT_TOOL_THRESHOLD * 1000.0).round() as i32)
+        );
+    }
+
+    #[test]
+    fn select_prompt_tool_window_honors_specific_tool_policy_even_below_threshold() {
+        let embedder = aria_intelligence::LocalHashEmbedder::new(32);
+        let registry = ToolManifestStore::new();
+        let active_tools = vec![CachedTool {
+            name: "browser_session_start".into(),
+            description: "start a browser automation session".into(),
+            parameters_schema: "{}".into(),
+            embedding: vec![],
+            requires_strict_schema: false,
+            streaming_safe: true,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
+        }];
+        let policy = aria_core::ToolRuntimePolicy {
+            tool_choice: aria_core::ToolChoicePolicy::Specific("browser_session_start".into()),
+            allow_parallel_tool_calls: true,
+        };
+
+        let (selected, decision) = select_prompt_tool_window(
+            "hi",
+            &active_tools,
+            &registry,
+            &embedder,
+            None,
+            Some(&policy),
+            true,
+            PromptBudget {
+                tool_count: 1,
+                ..PromptBudget::default()
+            },
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "browser_session_start");
+        assert_eq!(
+            decision.selected_tool_names,
+            vec![String::from("browser_session_start")]
+        );
     }
 }
