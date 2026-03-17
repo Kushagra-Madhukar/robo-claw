@@ -456,73 +456,73 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
                 LLMResponse::TextAnswer(answer) => {
                     if self.repair_fallback_permitted() {
                         if let Some(repaired) = self.repaired_tool_call_from_text(&answer, tools) {
-                        debug!(
-                            tool = %repaired.name,
-                            "Orchestrator: Repaired ToolCall from TextAnswer"
-                        );
-                        let calls = vec![repaired];
-                        let mut generic_context_pack = ExecutionContextPack {
-                            system_prompt: String::new(),
-                            history_messages: Vec::new(),
-                            context_blocks: Vec::new(),
-                            user_request: prompt.clone(),
-                            channel: GatewayChannel::Cli,
-                            execution_contract: None,
-                            retrieved_context: None,
-                            working_set: None,
-                            context_plan: None,
-                        };
-                        let mut uses_prompt_override = true;
-                        let mut progress = ToolLoopProgress {
-                            rounds: &mut rounds,
-                            max_tool_rounds,
-                            prompt: &mut prompt,
-                            context_pack: &mut generic_context_pack,
-                            uses_prompt_override: &mut uses_prompt_override,
-                            last_progress: &mut last_progress,
-                        };
-                        let ctx = GenericToolLoopContext {
-                            tools_cache: tools,
-                            tool_runtime_policy,
-                            steering_rx: steering_rx.as_deref_mut(),
-                        };
-                        let res = self
-                            .process_generic_tool_calls(calls, &mut progress, ctx)
-                            .await?;
-                        if matches!(res, OrchestratorResult::ToolApprovalRequired { .. }) {
-                            return Ok(res);
-                        }
-                        if let OrchestratorResult::Completed(ref s) = res {
-                            if s != "CONTINUE_LOOP" {
+                            debug!(
+                                tool = %repaired.name,
+                                "Orchestrator: Repaired ToolCall from TextAnswer"
+                            );
+                            let calls = vec![repaired];
+                            let mut generic_context_pack = ExecutionContextPack {
+                                system_prompt: String::new(),
+                                history_messages: Vec::new(),
+                                context_blocks: Vec::new(),
+                                user_request: prompt.clone(),
+                                channel: GatewayChannel::Cli,
+                                execution_contract: None,
+                                retrieved_context: None,
+                                working_set: None,
+                                context_plan: None,
+                            };
+                            let mut uses_prompt_override = true;
+                            let mut progress = ToolLoopProgress {
+                                rounds: &mut rounds,
+                                max_tool_rounds,
+                                prompt: &mut prompt,
+                                context_pack: &mut generic_context_pack,
+                                uses_prompt_override: &mut uses_prompt_override,
+                                last_progress: &mut last_progress,
+                            };
+                            let ctx = GenericToolLoopContext {
+                                tools_cache: tools,
+                                tool_runtime_policy,
+                                steering_rx: steering_rx.as_deref_mut(),
+                            };
+                            let res = self
+                                .process_generic_tool_calls(calls, &mut progress, ctx)
+                                .await?;
+                            if matches!(res, OrchestratorResult::ToolApprovalRequired { .. }) {
                                 return Ok(res);
                             }
-                        }
-                        } else {
-                        if let Some(tool_name) = extract_tool_name_candidate(&answer) {
-                            rounds += 1;
-                            if rounds > max_tool_rounds {
-                                return Err(OrchestratorError::MaxRoundsExceeded {
-                                    limit: max_tool_rounds,
-                                });
+                            if let OrchestratorResult::Completed(ref s) = res {
+                                if s != "CONTINUE_LOOP" {
+                                    return Ok(res);
+                                }
                             }
-                            let available = tools
-                                .iter()
-                                .map(|t| t.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            let limitation = tool_mode_limitation_message(
-                                self.llm.capability_profile().as_ref(),
-                            )
-                            .unwrap_or_default();
-                            prompt = format!(
+                        } else {
+                            if let Some(tool_name) = extract_tool_name_candidate(&answer) {
+                                rounds += 1;
+                                if rounds > max_tool_rounds {
+                                    return Err(OrchestratorError::MaxRoundsExceeded {
+                                        limit: max_tool_rounds,
+                                    });
+                                }
+                                let available = tools
+                                    .iter()
+                                    .map(|t| t.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let limitation = tool_mode_limitation_message(
+                                    self.llm.capability_profile().as_ref(),
+                                )
+                                .unwrap_or_default();
+                                prompt = format!(
                                 "{}\n\n<<SYSTEM INTERRUPT: Tool '{}' is not available in this session. {} Use one of [{}], or answer in plain text. If using a tool, return only valid JSON.>>",
                                 prompt, tool_name, limitation, available
                             );
-                            last_progress = std::time::Instant::now();
-                            continue;
-                        } else {
-                            return Ok(OrchestratorResult::Completed(answer));
-                        }
+                                last_progress = std::time::Instant::now();
+                                continue;
+                            } else {
+                                return Ok(OrchestratorResult::Completed(answer));
+                            }
                         }
                     } else if let Some(tool_name) = extract_tool_name_candidate(&answer) {
                         rounds += 1;
@@ -1151,9 +1151,8 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
                                     .map(|t| t.name.as_str())
                                     .collect::<Vec<_>>()
                                     .join(", ");
-                                let limitation =
-                                    tool_mode_limitation_message(model_capability)
-                                        .unwrap_or_default();
+                                let limitation = tool_mode_limitation_message(model_capability)
+                                    .unwrap_or_default();
                                 prompt = format!(
                                     "{}\n\n<<SYSTEM INTERRUPT: Tool '{}' is not available in this session. {} Use one of [{}], or answer in plain text. If using a tool, return only valid JSON.>>",
                                     prompt, tool_name, limitation, available
@@ -1173,9 +1172,11 @@ impl<L: LLMBackend, T: ToolExecutor> AgentOrchestrator<L, T> {
                                     });
                                 }
                                 enforced_tool_obligation = true;
-                                let available =
-                                    selected_tool_names_for_obligation(tool_selection, &active_tools)
-                                        .join(", ");
+                                let available = selected_tool_names_for_obligation(
+                                    tool_selection,
+                                    &active_tools,
+                                )
+                                .join(", ");
                                 prompt = format!(
                                     "{}\n\n<<SYSTEM INTERRUPT: A relevant tool path is available for this request. Do not answer with a plan or promise. Either return a valid JSON tool call using one of [{}], or explain concretely why none of the available tools can satisfy the request.>>",
                                     prompt, available
@@ -1546,10 +1547,7 @@ pub(crate) fn maybe_finalize_after_scheduler_tools(
     }
 }
 
-pub fn append_tool_results_to_prompt(
-    prompt: &str,
-    executed_tools: &[ExecutedToolCall],
-) -> String {
+pub fn append_tool_results_to_prompt(prompt: &str, executed_tools: &[ExecutedToolCall]) -> String {
     let rendered = executed_tools
         .iter()
         .map(|entry| {
