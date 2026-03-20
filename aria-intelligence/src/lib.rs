@@ -1,6 +1,6 @@
 //! # aria-intelligence
 //!
-//! ARIA-X semantic routing and dynamic tool cache.
+//! HiveClaw semantic routing and dynamic tool cache.
 //!
 //! ## SemanticRouter
 //!

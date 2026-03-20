@@ -2,7 +2,7 @@
 name = "aria-intelligence"
 version = "0.1.0"
 edition = "2021"
-description = "ARIA-X semantic routing and dynamic tool cache"
+description = "HiveClaw semantic routing and dynamic tool cache"
 
 [dependencies]
 aria-core = { path = "../aria-core" }

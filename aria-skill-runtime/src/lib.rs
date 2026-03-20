@@ -1,6 +1,6 @@
 //! # aria-skill-runtime
 //!
-//! Sandboxed WebAssembly skill executor for ARIA-X.
+//! Sandboxed WebAssembly skill executor for HiveClaw.
 //!
 //! Provides the [`WasmExecutor`] trait and [`ExtismBackend`] implementation
 //! for running Wasm-based skills inside a strict sandbox with configurable

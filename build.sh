@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build ARIA-X (debug by default, use --release for production)
+# Build HiveClaw (debug by default, use --release for production)
 set -e
 cd "$(dirname "$0")"
 

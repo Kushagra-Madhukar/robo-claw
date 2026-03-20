@@ -1079,13 +1079,13 @@ fn resolve_trusted_browser_automation_bridge_for_mode(
         .clone()
         .ok_or_else(|| {
         OrchestratorError::ToolError(
-            "browser automation bridge is not configured; set ARIA_BROWSER_AUTOMATION_BIN".into(),
+            "browser automation bridge is not configured; set HIVECLAW_BROWSER_AUTOMATION_BIN (or legacy ARIA_BROWSER_AUTOMATION_BIN)".into(),
         )
     })?;
     let path = PathBuf::from(&binary);
     if !path.is_absolute() {
         return Err(OrchestratorError::ToolError(
-            "ARIA_BROWSER_AUTOMATION_BIN must be an absolute path".into(),
+            "HIVECLAW_BROWSER_AUTOMATION_BIN (or legacy ARIA_BROWSER_AUTOMATION_BIN) must be an absolute path".into(),
         ));
     }
     let metadata = std::fs::metadata(&path).map_err(|e| {
@@ -1114,7 +1114,7 @@ fn resolve_trusted_browser_automation_bridge_for_mode(
     let expected = runtime_env().browser_automation_sha256_allowlist.clone();
     if expected.is_empty() {
         return Err(OrchestratorError::ToolError(
-            "ARIA_BROWSER_AUTOMATION_SHA256_ALLOWLIST must not be empty".into(),
+            "HIVECLAW_BROWSER_AUTOMATION_SHA256_ALLOWLIST (or legacy ARIA_BROWSER_AUTOMATION_SHA256_ALLOWLIST) must not be empty".into(),
         ));
     }
     let actual = sha256_file_hex(&path)?;
@@ -1573,7 +1573,7 @@ fn run_artifact_scan(
     let scan_path = PathBuf::from(&scan_bin);
     if !scan_path.is_absolute() {
         return Err(OrchestratorError::ToolError(
-            "ARIA_ARTIFACT_SCAN_BIN must be an absolute path".into(),
+            "HIVECLAW_ARTIFACT_SCAN_BIN (or legacy ARIA_ARTIFACT_SCAN_BIN) must be an absolute path".into(),
         ));
     }
     let output = std::process::Command::new(&scan_path)
@@ -1708,13 +1708,13 @@ fn enforce_web_storage_policy(sessions_dir: &Path) -> Result<(), OrchestratorErr
 fn browser_state_encryption_key() -> Result<Key<Aes256Gcm>, OrchestratorError> {
     let master_key_raw = runtime_env().master_key.clone().ok_or_else(|| {
         OrchestratorError::ToolError(
-            "ARIA_MASTER_KEY must be set before persisting or restoring browser session state"
+            "HIVECLAW_MASTER_KEY or ARIA_MASTER_KEY must be set before persisting or restoring browser session state"
                 .into(),
         )
     })?;
     if master_key_raw.trim().is_empty() {
         return Err(OrchestratorError::ToolError(
-            "ARIA_MASTER_KEY must not be empty when browser session state encryption is enabled"
+            "HIVECLAW_MASTER_KEY or ARIA_MASTER_KEY must not be empty when browser session state encryption is enabled"
                 .into(),
         ));
     }

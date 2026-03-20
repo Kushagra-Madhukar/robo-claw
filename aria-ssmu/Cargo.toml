@@ -2,7 +2,7 @@
 name = "aria-ssmu"
 version = "0.1.0"
 edition = "2021"
-description = "ARIA-X RAG engine: PageIndex tree + session memory"
+description = "HiveClaw RAG engine: PageIndex tree + session memory"
 
 [features]
 default = []

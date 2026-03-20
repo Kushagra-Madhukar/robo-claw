@@ -24,7 +24,7 @@ pub trait Ros2Bridge: Send + Sync {
         F: Fn(Ros2StringMessage) + Send + 'static;
 }
 
-/// Map a ROS2 topic into a logical ARIA-X channel.
+/// Map a ROS2 topic into a logical HiveClaw channel.
 fn channel_from_topic(topic: &str) -> GatewayChannel {
     if topic.starts_with("/ros2/companion") {
         GatewayChannel::Ros2

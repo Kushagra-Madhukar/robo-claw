@@ -1,4 +1,4 @@
-# ARIA-X Orchestrator Configuration
+# HiveClaw Orchestrator Configuration
 
 [vault]
 storage_path = "./vault.json"

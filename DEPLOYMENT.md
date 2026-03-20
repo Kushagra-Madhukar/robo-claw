@@ -1,4 +1,4 @@
-# ARIA-X Production Deployment Guide
+# HiveClaw Production Deployment Guide
 
 This guide walks you through building the production bundle and connecting it to Telegram and Ollama.
 
@@ -88,10 +88,10 @@ sessions_dir = "./workspace/sessions"
 |--------|----------|
 | `telegram_token = "..."` in config | Quick setup, avoid env |
 | `TELEGRAM_BOT_TOKEN` env var | Recommended for production |
-| `~/.aria/.env` or `./.env` | Persistent env (e.g. `TELEGRAM_BOT_TOKEN=...`) |
+| `~/.hiveclaw/.env`, legacy `~/.aria/.env`, or `./.env` | Persistent env (e.g. `TELEGRAM_BOT_TOKEN=...`) |
 | `telegram_token_file = "/path"` | Docker secrets, k8s secret mounts |
 
-Example `.env` (in project dir or `~/.aria/`):
+Example `.env` (in project dir or `~/.hiveclaw/`):
 
 ```
 TELEGRAM_BOT_TOKEN=123456789:ABCdef...
@@ -112,7 +112,7 @@ OLLAMA_HOST=http://localhost:11434
 # Install ngrok
 brew install ngrok
 
-# Start ARIA-X
+# Start HiveClaw
 ./aria-x config.toml
 
 # In another terminal, expose port 8080
@@ -168,7 +168,7 @@ RUST_LOG=aria_x=debug ./aria-x config.toml 2>&1 | tee aria.log
 
 **RUST_LOG** overrides config. Examples: `aria_x=info`, `aria_x=debug`, `debug` (everything).
 
-## 6. Run ARIA-X
+## 6. Run HiveClaw
 
 ```bash
 # From bundle directory
@@ -181,11 +181,11 @@ TELEGRAM_BOT_TOKEN=xxx RUST_LOG=debug ./aria-x config.toml
 Expected output:
 
 ```
-[aria-x] Loading config from: config.toml
-[aria-x] Config loaded (node=orchestrator-1 role=orchestrator tier=orchestrator | LLM: openrouter/arcee-ai/trinity-large-preview:free)
-[aria-x] LLM: OpenRouter (model=arcee-ai/trinity-large-preview:free)
-[aria-x] ✅ Telegram gateway listening on http://0.0.0.0:8080/webhook
-[aria-x] Set webhook: https://api.telegram.org/bot<TOKEN>/setWebhook?url=<YOUR_URL>/webhook
+[HiveClaw] Loading config from: config.toml
+[HiveClaw] Config loaded (node=orchestrator-1 role=orchestrator tier=orchestrator | LLM: openrouter/arcee-ai/trinity-large-preview:free)
+[HiveClaw] LLM: OpenRouter (model=arcee-ai/trinity-large-preview:free)
+[HiveClaw] ✅ Telegram gateway listening on http://0.0.0.0:8080/webhook
+[HiveClaw] Set webhook: https://api.telegram.org/bot<TOKEN>/setWebhook?url=<YOUR_URL>/webhook
 ```
 
 ## 7. Test

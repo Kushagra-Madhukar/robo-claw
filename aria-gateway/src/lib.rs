@@ -1,6 +1,6 @@
 //! # aria-gateway
 //!
-//! L1 Gateway adapters for ARIA-X signal normalization.
+//! L1 Gateway adapters for HiveClaw signal normalization.
 //!
 //! Inbound signals from external channels (Telegram, CLI, HTTP, etc.)
 //! are normalized into `AgentRequest` structs via channel-specific modules.

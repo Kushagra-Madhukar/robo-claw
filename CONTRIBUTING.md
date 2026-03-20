@@ -1,4 +1,4 @@
-# Contributing to ARIA-X
+# Contributing to HiveClaw
 
 Thanks for your interest in contributing.
 

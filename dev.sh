@@ -11,7 +11,7 @@ if [[ -f ".env" ]]; then
 fi
 
 RUN_ID="$(date +"%Y%m%d-%H%M%S")"
-LOG_DIR="${ARIA_LOG_DIR:-./logs/dev}"
+LOG_DIR="${HIVECLAW_LOG_DIR:-${ARIA_LOG_DIR:-./logs/dev}}"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/aria-x-$RUN_ID.log"
 ln -sfn "$(basename "$LOG_FILE")" "$LOG_DIR/latest.log"

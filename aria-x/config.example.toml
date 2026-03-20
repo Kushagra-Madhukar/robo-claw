@@ -1,4 +1,4 @@
-## ARIA-X Example Configuration (full schema)
+## HiveClaw Example Configuration (full schema)
 
 [llm]
 backend = "gemini"
@@ -34,7 +34,7 @@ adapter = "cli" # or "telegram" or "websocket"
 # telegram_token_file = ""      # Path to file (e.g. /run/secrets/telegram_token)
 # telegram_port = 8080          # Webhook listen port (only if telegram_mode = webhook)
 # telegram_mode = "polling"     # polling = no webhook (default). webhook = needs public URL
-# Env: TELEGRAM_BOT_TOKEN. Also load from .env or ~/.aria/.env
+# Env: TELEGRAM_BOT_TOKEN. Also load from .env or ~/.hiveclaw/.env
 # stt_mode = "auto"             # auto | local | cloud | off
 # stt_backend = "local_whisper" # legacy backend selector for provider wiring
 # Local Whisper requirements:

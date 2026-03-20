@@ -428,7 +428,7 @@ impl TuiState {
             input: String::new(),
             lines: vec![TuiLine {
                 role: "system",
-                text: "ARIA-X Terminal UI ready. Enter to send, F1 help, F2 /agents, F3 /approvals, F4 /runs, Ctrl+C to quit.".into(),
+                text: "HiveClaw Terminal UI ready. Enter to send, F1 help, F2 /agents, F3 /approvals, F4 /runs, Ctrl+C to quit.".into(),
             }],
             info: vec![
                 "Shortcuts".into(),
@@ -698,7 +698,7 @@ impl TuiState {
         let layout = TuiLayout::new(cols, rows, header_h, input_h, chat_w, chat_h, right_w);
 
         queue!(stdout, MoveTo(0, 0), Clear(ClearType::All)).map_err(|e| e.to_string())?;
-        draw_box(stdout, 0, 0, cols, header_h, " ARIA-X TUI ")?;
+        draw_box(stdout, 0, 0, cols, header_h, " HiveClaw TUI ")?;
         draw_box(stdout, 0, header_h, chat_w, chat_h + 1, " Transcript ")?;
         draw_box(
             stdout,
@@ -1766,7 +1766,8 @@ fn default_tui_active_agent() -> String {
 }
 
 fn tui_preferences_path() -> Option<std::path::PathBuf> {
-    let dirs = ProjectDirs::from("ai", "anima", "aria-x")?;
+    let dirs = ProjectDirs::from("ai", "anima", "hiveclaw")
+        .or_else(|| ProjectDirs::from("ai", "anima", "aria-x"))?;
     let dir = dirs.preference_dir();
     std::fs::create_dir_all(dir).ok()?;
     Some(dir.join("tui_prefs.json"))

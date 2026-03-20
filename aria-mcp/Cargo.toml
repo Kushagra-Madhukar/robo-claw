@@ -2,7 +2,7 @@
 name = "aria-mcp"
 version = "0.1.0"
 edition = "2021"
-description = "MCP registry and allowlist enforcement for ARIA-X"
+description = "MCP registry and allowlist enforcement for HiveClaw"
 
 [dependencies]
 aria-core = { path = "../aria-core" }

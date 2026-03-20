@@ -1,6 +1,6 @@
 //! # aria-policy
 //!
-//! Cedar-based zero-trust policy engine for ARIA-X.
+//! Cedar-based zero-trust policy engine for HiveClaw.
 //!
 //! Evaluates authorization requests against Cedar policies to determine
 //! whether an agent action should be allowed or denied. This implements
@@ -219,7 +219,7 @@ pub enum Decision {
 // CedarEvaluator
 // ---------------------------------------------------------------------------
 
-/// Cedar policy evaluator for ARIA-X authorization.
+/// Cedar policy evaluator for HiveClaw authorization.
 ///
 /// Loads Cedar policies and evaluates requests of the form:
 /// `(Principal=Agent::"<id>", Action::"<tool>", Resource::"<target>")`
@@ -501,7 +501,7 @@ impl CedarEvaluator {
 mod tests {
     use super::*;
 
-    /// The default ARIA-X policy set.
+    /// The default HiveClaw policy set.
     const DEFAULT_POLICY: &str = r#"
         permit (
             principal,

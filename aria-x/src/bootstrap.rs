@@ -79,7 +79,7 @@ fn render_cli_help(topic: Option<&str>) -> String {
             "  Copies the current aria-x binary into a user-level bin directory.",
             "  The default target is ~/.local/bin/aria-x.",
             "  The command does not edit shell startup files automatically.",
-            "  With --with-default-config it seeds the standard ARIA config path.",
+            "  With --with-default-config it seeds the standard HiveClaw config path.",
         ]
         .join("\n"),
         Some(topic) if topic == "completion" => [
@@ -288,7 +288,7 @@ fn run_install_command(args: &[String]) -> Result<String, String> {
     };
 
     Ok(format!(
-        "Installed aria-x.\nsource: {}\ntarget: {}\ninstall_mode: copy\n{}\n{}",
+        "Installed HiveClaw (aria-x binary).\nsource: {}\ntarget: {}\ninstall_mode: copy\n{}\n{}",
         current_exe.display(),
         target.display(),
         config_seed_status.unwrap_or_else(|| "config_seed: skipped".to_string()),
@@ -543,12 +543,12 @@ where
 }
 
 async fn actual_main() {
-    // Load .env from CWD and ~/.aria/.env before config (does not override existing vars)
+    // Load .env from CWD and ~/.hiveclaw/.env (plus legacy ~/.aria/.env) before config.
     load_env();
 
     let args: Vec<String> = std::env::args().collect();
     let runtime_env = load_runtime_env_config().unwrap_or_else(|err| {
-        eprintln!("[aria-x] Failed to resolve runtime environment config: {}", err);
+        eprintln!("[HiveClaw] Failed to resolve runtime environment config: {}", err);
         std::process::exit(1);
     });
 
@@ -559,7 +559,7 @@ async fn actual_main() {
                 return;
             }
             Err(err) => {
-                eprintln!("[aria-x] Command failed: {}", err);
+                eprintln!("[HiveClaw] Command failed: {}", err);
                 std::process::exit(1);
             }
         }
@@ -584,7 +584,7 @@ async fn actual_main() {
                 return;
             }
             Err(err) => {
-                eprintln!("[aria-x] Process command failed: {}", err);
+                eprintln!("[HiveClaw] Process command failed: {}", err);
                 std::process::exit(1);
             }
         }
@@ -596,19 +596,19 @@ async fn actual_main() {
             _ => None,
         };
         if let Err(err) = crate::tui::run_tui_mode(&config_path, attach_url).await {
-            eprintln!("[aria-x] TUI failed: {}", err);
+            eprintln!("[HiveClaw] TUI failed: {}", err);
             std::process::exit(1);
         }
         return;
     }
 
-    println!("[aria-x] Loading config from: {}", config_path);
+    println!("[HiveClaw] Loading config from: {}", config_path);
 
     let config = match load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "[aria-x] Failed to load config '{}' (cwd: {}): {}",
+                "[HiveClaw] Failed to load config '{}' (cwd: {}): {}",
                 config_path,
                 std::env::current_dir().unwrap_or_default().display(),
                 e
@@ -638,15 +638,15 @@ async fn actual_main() {
                 return;
             }
             Err(err) => {
-                eprintln!("[aria-x] STT command failed: {}", err);
+                eprintln!("[HiveClaw] STT command failed: {}", err);
                 std::process::exit(1);
             }
         }
     }
 
     if let Err(err) = validate_config(&config) {
-        eprintln!("[aria-x] Config validation error: {}", err);
-        eprintln!("[aria-x] For Telegram: set TELEGRAM_BOT_TOKEN or add telegram_token to config");
+        eprintln!("[HiveClaw] Config validation error: {}", err);
+        eprintln!("[HiveClaw] For Telegram: set TELEGRAM_BOT_TOKEN or add telegram_token to config");
         let _ = std::io::stderr().flush();
         std::process::exit(1);
     }
@@ -679,7 +679,7 @@ async fn actual_main() {
                 return;
             }
             Err(err) => {
-                eprintln!("[aria-x] Operator command failed: {}", err);
+                eprintln!("[HiveClaw] Operator command failed: {}", err);
                 std::process::exit(1);
             }
         }
@@ -696,7 +696,7 @@ async fn actual_main() {
         }
         Ok(None) => {}
         Err(err) => {
-            eprintln!("[aria-x] Inspect command failed: {}", err);
+            eprintln!("[HiveClaw] Inspect command failed: {}", err);
             std::process::exit(1);
         }
     }
@@ -707,7 +707,7 @@ async fn actual_main() {
         }
         Ok(None) => {}
         Err(err) => {
-            eprintln!("[aria-x] Explain command failed: {}", err);
+            eprintln!("[HiveClaw] Explain command failed: {}", err);
             std::process::exit(1);
         }
     }
@@ -740,7 +740,7 @@ async fn actual_main() {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
-                "[aria-x] Fatal: failed to read policy file '{}': {}",
+                "[HiveClaw] Fatal: failed to read policy file '{}': {}",
                 config.policy.policy_path, e
             );
             std::process::exit(1);
@@ -749,7 +749,7 @@ async fn actual_main() {
     let cedar = match aria_policy::CedarEvaluator::from_policy_str(&policy_content) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[aria-x] Fatal: failed to parse Cedar policies: {}", e);
+            eprintln!("[HiveClaw] Fatal: failed to parse Cedar policies: {}", e);
             std::process::exit(1);
         }
     };
@@ -1112,7 +1112,7 @@ async fn actual_main() {
     );
     // Initialize Credential Vault
     let master_key_raw = config.runtime.master_key.clone().unwrap_or_else(|| {
-        eprintln!("[aria-x] Fatal: ARIA_MASTER_KEY is required");
+        eprintln!("[HiveClaw] Fatal: HIVECLAW_MASTER_KEY or ARIA_MASTER_KEY is required");
         std::process::exit(1);
     });
     let mut master_key = [0u8; 32];
@@ -1236,7 +1236,7 @@ async fn actual_main() {
         reg.register(Arc::new(backends::openrouter::OpenRouterProvider {
             api_key: openrouter_key,
             site_url: "aria-x".into(),
-            site_title: "ARIA-X".into(),
+            site_title: "HiveClaw".into(),
             egress_broker: Some(provider_egress_broker.clone()),
         }));
         reg.register(Arc::new(backends::openai::OpenAiProvider {
@@ -1267,7 +1267,7 @@ async fn actual_main() {
         }
         Ok(None) => {}
         Err(err) => {
-            eprintln!("[aria-x] Live inspect command failed: {}", err);
+            eprintln!("[HiveClaw] Live inspect command failed: {}", err);
             std::process::exit(1);
         }
     }
@@ -1552,7 +1552,7 @@ async fn actual_main() {
 
     // Initialize Credential Vault
     let master_key_raw = config.runtime.master_key.clone().unwrap_or_else(|| {
-        eprintln!("[aria-x] Fatal: ARIA_MASTER_KEY is required");
+        eprintln!("[HiveClaw] Fatal: HIVECLAW_MASTER_KEY or ARIA_MASTER_KEY is required");
         std::process::exit(1);
     });
     let mut master_key = [0u8; 32];
@@ -2666,18 +2666,18 @@ fn run_process_control_command(args: &[String]) -> Option<Result<String, String>
 
 fn render_runtime_status() -> Result<String, String> {
     let Some(record) = read_runtime_pid_record()? else {
-        return Ok("ARIA-X is not running.".into());
+        return Ok("HiveClaw is not running.".into());
     };
     if process_is_alive(record.pid) {
         Ok(format!(
-            "ARIA-X is running.\npid: {}\nconfig: {}",
+            "HiveClaw is running.\npid: {}\nconfig: {}",
             record.pid, record.config_path
         ))
     } else {
         let path = runtime_pid_path()?;
         let _ = std::fs::remove_file(&path);
         Ok(format!(
-            "ARIA-X is not running, but a stale pid file was found and removed.\nstale_pid: {}\nconfig: {}",
+            "HiveClaw is not running, but a stale pid file was found and removed.\nstale_pid: {}\nconfig: {}",
             record.pid, record.config_path
         ))
     }
@@ -2685,13 +2685,13 @@ fn render_runtime_status() -> Result<String, String> {
 
 fn stop_runtime_process() -> Result<String, String> {
     let Some(record) = read_runtime_pid_record()? else {
-        return Ok("ARIA-X is not running.".into());
+        return Ok("HiveClaw is not running.".into());
     };
     if !process_is_alive(record.pid) {
         let path = runtime_pid_path()?;
         let _ = std::fs::remove_file(&path);
         return Ok(format!(
-            "ARIA-X was not running. Removed stale pid file for pid {}.",
+            "HiveClaw was not running. Removed stale pid file for pid {}.",
             record.pid
         ));
     }
@@ -2708,7 +2708,7 @@ fn stop_runtime_process() -> Result<String, String> {
                 record.pid, status
             ));
         }
-        Ok(format!("Sent SIGTERM to ARIA-X process {}.", record.pid))
+        Ok(format!("Sent SIGTERM to HiveClaw process {}.", record.pid))
     }
     #[cfg(not(unix))]
     {
@@ -2782,7 +2782,7 @@ fn render_doctor_summary(config: &ResolvedAppConfig) -> String {
         .unwrap_or(false);
 
     format!(
-        "ARIA-X doctor\n\
+        "HiveClaw doctor\n\
          runtime_status:\n{}\n\
          config_path: {}\n\
          llm_backend: {}\n\
@@ -3023,7 +3023,7 @@ fn default_local_whisper_model_path() -> Result<PathBuf, String> {
         .ok_or_else(|| "unable to resolve user home directory for local STT setup".to_string())?;
     Ok(user_dirs
         .home_dir()
-        .join(".aria")
+        .join(".hiveclaw")
         .join("models")
         .join("whisper")
         .join("ggml-small.bin"))

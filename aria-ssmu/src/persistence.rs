@@ -74,7 +74,7 @@ impl From<serde_json::Error> for PersistenceError {
     }
 }
 
-/// Embedded SQLite persistence for ARIA-X session state.
+/// Embedded SQLite persistence for HiveClaw session state.
 pub struct SqlitePersistence {
     conn: Connection,
 }

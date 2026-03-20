@@ -2,7 +2,7 @@
 name = "aria-gateway"
 version = "0.1.0"
 edition = "2021"
-description = "ARIA-X L1 gateway adapters for signal normalization"
+description = "HiveClaw L1 gateway adapters for signal normalization"
 
 [dependencies]
 aria-core = { path = "../aria-core" }

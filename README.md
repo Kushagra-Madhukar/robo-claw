@@ -1,4 +1,4 @@
-# ARIA-X/RoboClaw
+# HiveClaw
 
 ![Rust](https://img.shields.io/badge/Rust-Workspace-000000?logo=rust)
 ![Status](https://img.shields.io/badge/status-alpha-orange)
@@ -6,7 +6,7 @@
 ![Runtime](https://img.shields.io/badge/runtime-SQLite--first-2ea44f)
 ![Security](https://img.shields.io/badge/security-policy--gated-critical)
 
-ARIA-X is a local-first, multi-agent runtime and gateway platform written in Rust. It combines agent orchestration, policy enforcement, tool execution, retrieval, scheduling, browser automation, MCP integration, and multi-channel ingress into one cohesive system.
+HiveClaw is a local-first, multi-agent runtime and gateway platform written in Rust. It combines agent orchestration, policy enforcement, tool execution, retrieval, scheduling, browser automation, MCP integration, and multi-channel ingress into one cohesive system.
 
 The project is designed around a practical constraint set:
 
@@ -16,11 +16,11 @@ The project is designed around a practical constraint set:
 - human-in-the-loop approvals for risky actions
 - multi-channel operation without turning the core runtime into channel-specific code
 
-> ARIA-X is not a chat wrapper. It is an agent runtime with durable state, explicit policy boundaries, tool orchestration, background jobs, and operator visibility.
+> HiveClaw is not a chat wrapper. It is an agent runtime with durable state, explicit policy boundaries, tool orchestration, background jobs, and operator visibility.
 
 ## Table of Contents
 
-- [What ARIA-X Is](#what-aria-x-is)
+- [What HiveClaw Is](#what-hiveclaw-is)
 - [Current Platform Scope](#current-platform-scope)
 - [Architecture](#architecture)
 - [Runtime Flow](#runtime-flow)
@@ -36,9 +36,9 @@ The project is designed around a practical constraint set:
 - [Development](#development)
 - [License](#license)
 
-## What ARIA-X Is
+## What HiveClaw Is
 
-ARIA-X is a Rust workspace for building and running:
+HiveClaw is a Rust workspace for building and running:
 
 - multi-agent systems with explicit capability profiles
 - policy-gated tool execution
@@ -227,7 +227,7 @@ The current runtime path is:
 
 ## Channels and Interaction Surfaces
 
-ARIA-X separates transport concerns from core runtime behavior.
+HiveClaw separates transport concerns from core runtime behavior.
 
 ### Implemented and used in the current platform
 
@@ -365,14 +365,14 @@ If you want to switch providers later, change the `[llm]` block in [`aria-x/conf
 
 ### Speech-to-text modes
 
-ARIA-X supports:
+HiveClaw supports:
 
 - `auto`: prefer local STT when available, otherwise use configured cloud STT, otherwise stay off
 - `local`: require a valid local Whisper runtime
 - `cloud`: require a configured cloud STT endpoint
 - `off`: disable voice/video transcription
 
-For local Whisper, ARIA expects:
+For local Whisper, HiveClaw expects:
 
 - `WHISPER_CPP_MODEL`
 - `WHISPER_CPP_BIN`
@@ -417,7 +417,7 @@ Additional doctor scopes:
 - `doctor gateway`
 - `doctor browser`
 
-`install` copies the current `aria-x` binary into `~/.local/bin/aria-x` by default so you can run it from anywhere once that directory is on your shell `PATH`.
+`install` copies the current `aria-x` binary into `~/.local/bin/aria-x` by default so you can run the HiveClaw runtime from anywhere once that directory is on your shell `PATH`.
 
 You can also seed the standard application config path during install:
 
@@ -455,7 +455,7 @@ target/debug/aria-x tui aria-x/config.toml --attach ws://127.0.0.1:8090/ws
 
 ## Security Model
 
-ARIA-X is built around runtime-enforced boundaries, not prompt-only instructions.
+HiveClaw is built around runtime-enforced boundaries, not prompt-only instructions.
 
 ### Enforcement layers
 
@@ -596,6 +596,6 @@ Keep these local-only:
 
 ## License
 
-ARIA-X is licensed under the GNU Affero General Public License v3.0 or later.
+HiveClaw is licensed under the GNU Affero General Public License v3.0 or later.
 
 See [LICENSE](LICENSE) for the full license text.

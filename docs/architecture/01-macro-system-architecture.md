@@ -12,7 +12,7 @@ graph LR
   end
 
   subgraph Gateway["API Gateway and Control Plane"]
-    API["aria-x Gateway Runtime"]
+    API["HiveClaw Gateway Runtime"]
     AUTH["Auth, Policy and Safety Gates"]
     ROUTE["Session Resolver and Channel Router"]
     INSPECT["Operator and Inspect APIs"]

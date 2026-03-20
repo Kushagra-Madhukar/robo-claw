@@ -1,6 +1,6 @@
 # Architecture Reference Diagrams
 
-These diagrams describe the implemented ARIA architecture in this repository. They are reference views of the current system, not generic templates.
+These diagrams describe the implemented HiveClaw architecture in this repository. They are reference views of the current system, not generic templates.
 
 ## Contents
 

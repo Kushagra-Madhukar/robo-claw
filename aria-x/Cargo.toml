@@ -2,7 +2,7 @@
 name = "aria-x"
 version = "0.1.0"
 edition = "2021"
-description = "ARIA-X orchestrator binary — wires all crates into the final agent runtime"
+description = "HiveClaw orchestrator binary — wires all crates into the final agent runtime"
 
 [features]
 default = ["standard-runtime"]
