@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run RoboClaw. Builds first unless --no-build. Pass config path as last arg.
+# Run HiveClaw. Builds first unless --no-build. Pass config path as last arg.
 #   ./run.sh                    # build + run with aria-x/config.toml
 #   ./run.sh --no-build          # run without building
 #   ./run.sh dist/.../config.toml

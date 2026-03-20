@@ -1,6 +1,6 @@
 //! # aria-core
 //!
-//! Foundational types for the RoboClaw architecture.
+//! Foundational types for the HiveClaw architecture.
 //! This crate is `#![no_std]` compatible with the `alloc` crate.
 //!
 //! ## Types

@@ -2,7 +2,7 @@
 name = "aria-mesh"
 version = "0.1.0"
 edition = "2021"
-description = "RoboClaw L4 Mesh Transport — Zenoh-based pub/sub"
+description = "HiveClaw L4 Mesh Transport — Zenoh-based pub/sub"
 
 [dependencies]
 aria-core = { path = "../aria-core" }

@@ -2,7 +2,7 @@
 name = "aria-policy"
 version = "0.1.0"
 edition = "2021"
-description = "RoboClaw Cedar-based zero-trust policy engine"
+description = "HiveClaw Cedar-based zero-trust policy engine"
 
 [dependencies]
 aria-core = { path = "../aria-core" }

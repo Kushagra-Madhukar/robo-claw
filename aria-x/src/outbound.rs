@@ -39,16 +39,16 @@ pub(crate) fn cli_mark_awaiting_input(waiting: bool) {
 
 pub(crate) fn cli_print_prompt() {
     let _guard = cli_stdout_lock().lock().unwrap_or_else(|e| e.into_inner());
-    print!("\n[aria-x] Enter request > ");
+    print!("\n[HiveClaw] Enter request > ");
     let _ = io::stdout().flush();
 }
 
 fn cli_print_response_line(text: &str) {
     let _guard = cli_stdout_lock().lock().unwrap_or_else(|e| e.into_inner());
     print!("\r\x1b[2K");
-    println!("[aria-x] Agent: {}", text);
+    println!("[HiveClaw] Agent: {}", text);
     if CLI_AWAITING_INPUT.load(Ordering::SeqCst) {
-        print!("\n[aria-x] Enter request > ");
+        print!("\n[HiveClaw] Enter request > ");
         let _ = io::stdout().flush();
     }
 }

@@ -1,6 +1,6 @@
 //! # aria-ssmu
 //!
-//! RoboClaw RAG engine implementing internal index tree structures and
+//! HiveClaw RAG engine implementing internal index tree structures and
 //! thread-safe session memory.
 //!
 //! ## Index Trees

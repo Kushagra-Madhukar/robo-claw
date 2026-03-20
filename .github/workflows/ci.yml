@@ -48,7 +48,7 @@ jobs:
     - name: Dry-run Publish Validation
       run: |
         # Validate that all crates are publish-ready (metadata and dependencies)
-        for crate in aria-core aria-gateway aria-intelligence aria-mesh aria-policy aria-safety aria-skill-runtime aria-ssmu aria-vault roboclaw; do
+        for crate in aria-core aria-gateway aria-intelligence aria-mesh aria-policy aria-safety aria-skill-runtime aria-ssmu aria-vault aria-x; do
           if [ -d "$crate" ]; then
             echo "Validating $crate..."
             cargo publish --dry-run --package "$crate" --allow-dirty --no-verify || echo "$crate is not ready for publish"

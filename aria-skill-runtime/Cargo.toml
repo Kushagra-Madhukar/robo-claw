@@ -2,7 +2,7 @@
 name = "aria-skill-runtime"
 version = "0.1.0"
 edition = "2021"
-description = "RoboClaw sandboxed WebAssembly skill executor via Extism"
+description = "HiveClaw sandboxed WebAssembly skill executor via Extism"
 
 [features]
 default = []

@@ -1,4 +1,4 @@
-// Default RoboClaw authorization policies.
+// Default HiveClaw authorization policies.
 //
 // Entities:
 //   Principal: Agent::"<agent_id>"

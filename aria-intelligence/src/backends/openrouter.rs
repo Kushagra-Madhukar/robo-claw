@@ -109,8 +109,9 @@ impl OpenRouterBackend {
     }
 
     fn completion_cap(&self) -> u64 {
-        std::env::var("ARIA_OPENROUTER_MAX_TOKENS")
+        std::env::var("HIVECLAW_OPENROUTER_MAX_TOKENS")
             .ok()
+            .or_else(|| std::env::var("ARIA_OPENROUTER_MAX_TOKENS").ok())
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(Self::DEFAULT_MAX_TOKENS)
@@ -121,8 +122,9 @@ impl OpenRouterBackend {
     }
 
     fn send_attempts(&self) -> u32 {
-        std::env::var("ARIA_OPENROUTER_SEND_ATTEMPTS")
+        std::env::var("HIVECLAW_OPENROUTER_SEND_ATTEMPTS")
             .ok()
+            .or_else(|| std::env::var("ARIA_OPENROUTER_SEND_ATTEMPTS").ok())
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(Self::DEFAULT_SEND_ATTEMPTS)
@@ -1004,7 +1006,7 @@ impl ModelProvider for OpenRouterProvider {
     async fn list_models(&self) -> Result<Vec<ModelMetadata>, OrchestratorError> {
         let url = "https://openrouter.ai/api/v1/models";
         let client = reqwest::Client::builder()
-            .user_agent("aria-x/1.0")
+            .user_agent("HiveClaw/1.0 (aria-x)")
             .build()
             .unwrap_or_default();
 

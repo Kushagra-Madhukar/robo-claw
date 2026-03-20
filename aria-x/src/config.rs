@@ -600,12 +600,19 @@ fn default_global_request_concurrency_limit() -> usize {
 }
 
 fn project_dirs() -> Option<ProjectDirs> {
+    ProjectDirs::from("com", "anima", "hiveclaw")
+}
+
+fn legacy_project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("com", "anima", "aria")
 }
 
 fn default_project_config_path() -> PathBuf {
     let standard = project_dirs().map(|dirs| dirs.config_dir().join("config.toml"));
+    let legacy = legacy_project_dirs().map(|dirs| dirs.config_dir().join("config.toml"));
     if let Some(path) = standard.filter(|path| path.exists()) {
+        path
+    } else if let Some(path) = legacy.filter(|path| path.exists()) {
         path
     } else {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.toml")
@@ -619,6 +626,7 @@ fn default_runtime_config_path() -> PathBuf {
 fn default_sessions_dir() -> String {
     project_dirs()
         .map(|dirs| dirs.data_local_dir().join("sessions"))
+        .or_else(|| legacy_project_dirs().map(|dirs| dirs.data_local_dir().join("sessions")))
         .unwrap_or_else(|| PathBuf::from("./workspace/sessions"))
         .to_string_lossy()
         .to_string()
@@ -806,13 +814,19 @@ fn configured_gateway_adapters(gateway: &GatewayConfig) -> Vec<String> {
     }
 }
 
-/// Load `.env` from CWD and the standard ARIA config dir. Does not override existing env vars.
+/// Load `.env` from CWD and the standard HiveClaw config dir. Does not override existing env vars.
 fn load_env() {
     let _ = dotenvy::from_path(".env");
     if let Some(project_dirs) = project_dirs() {
-        let aria_env = project_dirs.config_dir().join(".env");
-        if aria_env.exists() {
-            let _ = dotenvy::from_path(aria_env);
+        let hiveclaw_env = project_dirs.config_dir().join(".env");
+        if hiveclaw_env.exists() {
+            let _ = dotenvy::from_path(hiveclaw_env);
+        }
+    }
+    if let Some(project_dirs) = legacy_project_dirs() {
+        let legacy_env = project_dirs.config_dir().join(".env");
+        if legacy_env.exists() {
+            let _ = dotenvy::from_path(legacy_env);
         }
     }
 }
@@ -824,8 +838,16 @@ fn non_empty_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn non_empty_env_any(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| non_empty_env(name))
+}
+
 fn env_flag_override(name: &str) -> Option<bool> {
     non_empty_env(name).and_then(|value| parse_flag_value(&value))
+}
+
+fn env_flag_override_any(names: &[&str]) -> Option<bool> {
+    names.iter().find_map(|name| env_flag_override(name))
 }
 
 fn parse_flag_value(value: &str) -> Option<bool> {
@@ -902,6 +924,10 @@ fn load_runtime_env_config() -> Result<RuntimeEnvConfig, figment::Error> {
             Env::prefixed("ARIA_")
                 .ignore(&["ALLOW_PRIVATE_WEB_TARGETS", "BROWSER_AUTOMATION_OS_CONTAINMENT"]),
         )
+        .merge(
+            Env::prefixed("HIVECLAW_")
+                .ignore(&["ALLOW_PRIVATE_WEB_TARGETS", "BROWSER_AUTOMATION_OS_CONTAINMENT"]),
+        )
         .extract()?;
 
     Ok(RuntimeEnvConfig {
@@ -917,7 +943,10 @@ fn load_runtime_env_config() -> Result<RuntimeEnvConfig, figment::Error> {
         whisper_cpp_bin: non_empty_env("WHISPER_CPP_BIN").unwrap_or(raw.whisper_cpp_bin),
         ffmpeg_bin: non_empty_env("FFMPEG_BIN").unwrap_or(raw.ffmpeg_bin),
         whisper_cpp_language: non_empty_env("WHISPER_CPP_LANGUAGE").or(raw.whisper_cpp_language),
-        allow_private_web_targets: env_flag_override("ARIA_ALLOW_PRIVATE_WEB_TARGETS")
+        allow_private_web_targets: env_flag_override_any(&[
+            "HIVECLAW_ALLOW_PRIVATE_WEB_TARGETS",
+            "ARIA_ALLOW_PRIVATE_WEB_TARGETS",
+        ])
             .or_else(|| raw.allow_private_web_targets.as_deref().and_then(parse_flag_value))
             .unwrap_or(false),
         browser_chromium_bin: raw.browser_chromium_bin,
@@ -929,9 +958,10 @@ fn load_runtime_env_config() -> Result<RuntimeEnvConfig, figment::Error> {
             raw.browser_automation_sha256_allowlist,
             &[],
         ),
-        browser_automation_os_containment: env_flag_override(
+        browser_automation_os_containment: env_flag_override_any(&[
+            "HIVECLAW_BROWSER_AUTOMATION_OS_CONTAINMENT",
             "ARIA_BROWSER_AUTOMATION_OS_CONTAINMENT",
-        )
+        ])
         .or_else(|| {
             raw.browser_automation_os_containment
                 .as_deref()
@@ -974,7 +1004,9 @@ fn load_runtime_env_config() -> Result<RuntimeEnvConfig, figment::Error> {
             raw.blocked_download_extensions,
             &["exe", "msi", "dmg", "pkg", "app", "bat", "cmd", "ps1", "sh"],
         ),
-        master_key: raw.master_key.or_else(|| non_empty_env("ARIA_MASTER_KEY")),
+        master_key: raw.master_key.or_else(|| {
+            non_empty_env_any(&["HIVECLAW_MASTER_KEY", "ARIA_MASTER_KEY"])
+        }),
         idempotency_cache_max_entries: raw.idempotency_cache_max_entries,
         idempotency_cache_ttl_secs: raw.idempotency_cache_ttl_secs,
         dedupe_key_retention_secs: raw.dedupe_key_retention_secs,
@@ -1625,7 +1657,7 @@ fn runtime_deployment_profile() -> DeploymentProfile {
 fn runtime_env_with_test_overrides(base: &RuntimeEnvConfig) -> RuntimeEnvConfig {
     let mut runtime = base.clone();
 
-    if let Some(value) = non_empty_env("ARIA_CONFIG_PATH") {
+    if let Some(value) = non_empty_env_any(&["HIVECLAW_CONFIG_PATH", "ARIA_CONFIG_PATH"]) {
         runtime.config_path = Some(value);
     }
     if let Some(value) = non_empty_env("RUST_LOG") {
@@ -1661,34 +1693,61 @@ fn runtime_env_with_test_overrides(base: &RuntimeEnvConfig) -> RuntimeEnvConfig 
     if let Some(value) = non_empty_env("WHISPER_CPP_LANGUAGE") {
         runtime.whisper_cpp_language = Some(value);
     }
-    if let Some(value) = env_flag_override("ARIA_ALLOW_PRIVATE_WEB_TARGETS") {
+    if let Some(value) = env_flag_override_any(&[
+        "HIVECLAW_ALLOW_PRIVATE_WEB_TARGETS",
+        "ARIA_ALLOW_PRIVATE_WEB_TARGETS",
+    ]) {
         runtime.allow_private_web_targets = value;
     }
-    if let Some(value) = non_empty_env("ARIA_BROWSER_CHROMIUM_BIN") {
+    if let Some(value) = non_empty_env_any(&[
+        "HIVECLAW_BROWSER_CHROMIUM_BIN",
+        "ARIA_BROWSER_CHROMIUM_BIN",
+    ]) {
         runtime.browser_chromium_bin = Some(value);
     }
-    if let Some(value) = non_empty_env("ARIA_BROWSER_CHROME_BIN") {
+    if let Some(value) = non_empty_env_any(&[
+        "HIVECLAW_BROWSER_CHROME_BIN",
+        "ARIA_BROWSER_CHROME_BIN",
+    ]) {
         runtime.browser_chrome_bin = Some(value);
     }
-    if let Some(value) = non_empty_env("ARIA_BROWSER_EDGE_BIN") {
+    if let Some(value) = non_empty_env_any(&[
+        "HIVECLAW_BROWSER_EDGE_BIN",
+        "ARIA_BROWSER_EDGE_BIN",
+    ]) {
         runtime.browser_edge_bin = Some(value);
     }
-    if let Some(value) = non_empty_env("ARIA_BROWSER_SAFARI_BIN") {
+    if let Some(value) = non_empty_env_any(&[
+        "HIVECLAW_BROWSER_SAFARI_BIN",
+        "ARIA_BROWSER_SAFARI_BIN",
+    ]) {
         runtime.browser_safari_bin = Some(value);
     }
-    if let Some(value) = non_empty_env("ARIA_BROWSER_AUTOMATION_BIN") {
+    if let Some(value) = non_empty_env_any(&[
+        "HIVECLAW_BROWSER_AUTOMATION_BIN",
+        "ARIA_BROWSER_AUTOMATION_BIN",
+    ]) {
         runtime.browser_automation_bin = Some(value);
     }
-    if let Some(value) = non_empty_env("ARIA_BROWSER_AUTOMATION_SHA256_ALLOWLIST") {
+    if let Some(value) = non_empty_env_any(&[
+        "HIVECLAW_BROWSER_AUTOMATION_SHA256_ALLOWLIST",
+        "ARIA_BROWSER_AUTOMATION_SHA256_ALLOWLIST",
+    ]) {
         runtime.browser_automation_sha256_allowlist = parse_csv_list(Some(value), &[]);
     }
-    if let Some(value) = env_flag_override("ARIA_BROWSER_AUTOMATION_OS_CONTAINMENT") {
+    if let Some(value) = env_flag_override_any(&[
+        "HIVECLAW_BROWSER_AUTOMATION_OS_CONTAINMENT",
+        "ARIA_BROWSER_AUTOMATION_OS_CONTAINMENT",
+    ]) {
         runtime.browser_automation_os_containment = value;
     }
-    if let Some(value) = non_empty_env("ARIA_ARTIFACT_SCAN_BIN") {
+    if let Some(value) = non_empty_env_any(&[
+        "HIVECLAW_ARTIFACT_SCAN_BIN",
+        "ARIA_ARTIFACT_SCAN_BIN",
+    ]) {
         runtime.artifact_scan_bin = Some(value);
     }
-    if let Some(value) = non_empty_env("ARIA_MASTER_KEY") {
+    if let Some(value) = non_empty_env_any(&["HIVECLAW_MASTER_KEY", "ARIA_MASTER_KEY"]) {
         runtime.master_key = Some(value);
     }
 

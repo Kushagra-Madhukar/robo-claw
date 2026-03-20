@@ -182,7 +182,7 @@ pub struct RouterIndex {
     pub tie_break_gap: f32,
 }
 
-/// Routing decision output that aligns with the RoboClaw architecture:
+/// Routing decision output that aligns with the HiveClaw architecture:
 /// direct semantic dispatch when confident, otherwise fallback path.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RouterDecision {

@@ -1,4 +1,4 @@
-# Contributing to RoboClaw
+# Contributing to HiveClaw
 
 Thanks for your interest in contributing.
 

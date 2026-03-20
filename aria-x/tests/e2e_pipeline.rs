@@ -1,6 +1,6 @@
 //! E2E pipeline integration test.
 //!
-//! Traces a request through the full RoboClaw stack using mocks:
+//! Traces a request through the full HiveClaw stack using mocks:
 //! Gateway → SemanticRouter → AgentOrchestrator → Cedar → Wasm → Response
 
 use aria_core::{AgentRequest, GatewayChannel, MessageContent};

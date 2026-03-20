@@ -18,7 +18,7 @@ Summary:
 - This is not a rename or a documentation cleanup task. It means implementing actual PageIndex-like document-tree generation and retrieval behavior, then routing into it selectively where it outperforms current hybrid RAG.
 
 Why Deferred:
-- Current hybrid retrieval is already working and remains the correct default for most RoboClaw workflows.
+- Current hybrid retrieval is already working and remains the correct default for most HiveClaw workflows.
 - True PageIndex adds significant complexity and should only be taken on if long structured-document analysis becomes a first-class product requirement.
 - The effort is substantial enough that it needs its own benchmark and acceptance track, not opportunistic incremental edits.
 
@@ -54,7 +54,7 @@ Expected Crates Affected:
   - retrieval mode enums
   - tree metadata types
   - retrieval trace fields
-- `roboclaw`
+- `aria-x`
   - ingestion/update hooks
   - retrieval planner/router integration
   - operator inspection/debug views

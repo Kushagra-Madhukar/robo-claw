@@ -2938,7 +2938,7 @@ async fn run_telegram_gateway(
     let token = match resolve_telegram_token(&config) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("[aria-x] Fatal: {}", e);
+            eprintln!("[HiveClaw] Fatal: {}", e);
             std::process::exit(1);
         }
     };

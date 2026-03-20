@@ -2,7 +2,7 @@
 name = "aria-learning"
 version = "0.1.0"
 edition = "2021"
-description = "RoboClaw learning-plane types and task fingerprinting"
+description = "HiveClaw learning-plane types and task fingerprinting"
 
 [dependencies]
 aria-core = { path = "../aria-core" }

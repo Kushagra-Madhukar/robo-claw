@@ -461,7 +461,7 @@ pub fn build_stt_backend(
                 let primary = cloud_backend.unwrap_or_else(|| {
                     Arc::new(DisabledSttBackend {
                         reason: Some(
-                            "Voice transcription is unavailable on this runtime. Ask the operator to run `aria-x doctor stt`."
+                            "Voice transcription is unavailable on this runtime. Ask the operator to run `aria-x doctor stt` for HiveClaw."
                                 .to_string(),
                         ),
                     }) as Arc<dyn SpeechToTextBackend>
@@ -473,7 +473,7 @@ pub fn build_stt_backend(
             }
             _ => Arc::new(DisabledSttBackend {
                 reason: Some(
-                    "Voice transcription is unavailable on this runtime. Ask the operator to run `aria-x doctor stt`."
+                    "Voice transcription is unavailable on this runtime. Ask the operator to run `aria-x doctor stt` for HiveClaw."
                         .to_string(),
                 ),
             }),

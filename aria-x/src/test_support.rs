@@ -1,13 +1,11 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aria_core::{
-        AgentClass, OutboundEnvelope, SecretUsageAuditRecord, SideEffectLevel,
-    };
+    use aria_core::{AgentClass, OutboundEnvelope, SecretUsageAuditRecord, SideEffectLevel};
     use aria_intelligence::{AgentConfig, LocalHashEmbedder, ModelMetadata, ModelProvider};
     use async_trait::async_trait;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Mutex;
 
     struct TestEmbedder;
 
@@ -110,26 +108,18 @@ mod tests {
             content: MessageContent::Text("/session".into()),
             ..req.clone()
         };
-        let session_reply = handle_cli_control_command(
-            &session_req,
-            &config,
-            &agent_store,
-            &session_memory,
-        )
-        .expect("session command handled");
+        let session_reply =
+            handle_cli_control_command(&session_req, &config, &agent_store, &session_memory)
+                .expect("session command handled");
         assert!(session_reply.contains("agent_override=developer"));
 
         let clear_req = AgentRequest {
             content: MessageContent::Text("/agent clear".into()),
             ..req.clone()
         };
-        let cleared_reply = handle_cli_control_command(
-            &clear_req,
-            &config,
-            &agent_store,
-            &session_memory,
-        )
-        .expect("clear command handled");
+        let cleared_reply =
+            handle_cli_control_command(&clear_req, &config, &agent_store, &session_memory)
+                .expect("clear command handled");
         assert!(cleared_reply.contains("Session history was not cleared"));
 
         let (cleared_agent_override, _) = session_memory
@@ -149,19 +139,17 @@ mod tests {
         )
         .expect("session command handled after clear");
         assert!(cleared_session_reply.contains("agent_override=default"));
-        assert!(
-            handle_cli_control_command(
-                &AgentRequest {
-                    content: MessageContent::Text("/session clear".into()),
-                    ..cleared_session_req.clone()
-                },
-                &config,
-                &agent_store,
-                &session_memory,
-            )
-            .expect("clear session handled")
-            .contains("Session history cleared")
-        );
+        assert!(handle_cli_control_command(
+            &AgentRequest {
+                content: MessageContent::Text("/session clear".into()),
+                ..cleared_session_req.clone()
+            },
+            &config,
+            &agent_store,
+            &session_memory,
+        )
+        .expect("clear session handled")
+        .contains("Session history cleared"));
     }
 
     #[test]
@@ -277,8 +265,9 @@ mod tests {
             timestamp_us: 1,
         };
 
-        let output = handle_shared_control_command(&set_req, &config, &agent_store, &session_memory)
-            .expect("telegram switch handled");
+        let output =
+            handle_shared_control_command(&set_req, &config, &agent_store, &session_memory)
+                .expect("telegram switch handled");
         assert!(output.text.contains("developer"));
 
         let stable_uuid = stable_channel_user_session_uuid(GatewayChannel::Telegram, "tg_user");
@@ -596,7 +585,10 @@ mod tests {
             .into_iter()
             .find(|record| record.agent_id == "researcher")
             .expect("presence record after queued");
-        assert_eq!(presence.availability, aria_core::AgentAvailabilityState::Busy);
+        assert_eq!(
+            presence.availability,
+            aria_core::AgentAvailabilityState::Busy
+        );
         assert_eq!(presence.active_run_count, 1);
 
         let mut completed = queued.clone();
@@ -607,14 +599,19 @@ mod tests {
             error: None,
             completed_at_us: Some(2),
         });
-        store.upsert_agent_run(&completed, 2).expect("upsert completed");
+        store
+            .upsert_agent_run(&completed, 2)
+            .expect("upsert completed");
         let presence = store
             .list_agent_presence()
             .expect("list presence after complete")
             .into_iter()
             .find(|record| record.agent_id == "researcher")
             .expect("presence record after complete");
-        assert_eq!(presence.availability, aria_core::AgentAvailabilityState::Available);
+        assert_eq!(
+            presence.availability,
+            aria_core::AgentAvailabilityState::Available
+        );
         assert_eq!(presence.active_run_count, 0);
     }
 
@@ -638,13 +635,8 @@ mod tests {
         };
         write_approval_record(sessions_dir.path(), &record).expect("write approval");
 
-        let resolved = resolve_cli_approval_id(
-            sessions_dir.path(),
-            session_id,
-            "cli_user",
-            "1",
-        )
-        .expect("resolve by index");
+        let resolved = resolve_cli_approval_id(sessions_dir.path(), session_id, "cli_user", "1")
+            .expect("resolve by index");
         assert_eq!(resolved, "approval-1");
     }
 
@@ -745,16 +737,10 @@ mod tests {
         };
         write_approval_record(sessions_dir.path(), &record).expect("write approval");
 
-        let reply = handle_cli_approval_command(
-            &req,
-            &config,
-            &session_memory,
-            &vault,
-            &cedar,
-            &tx_cron,
-        )
-        .await
-        .expect("alias command handled");
+        let reply =
+            handle_cli_approval_command(&req, &config, &session_memory, &vault, &cedar, &tx_cron)
+                .await
+                .expect("alias command handled");
         assert!(reply.contains("Denied approval"));
         let updated =
             read_approval_record(sessions_dir.path(), "approval-alias-1").expect("read approval");
@@ -803,13 +789,9 @@ mod tests {
         };
         write_approval_record(sessions_dir.path(), &record).expect("write approval");
         let handle = ensure_approval_handle(sessions_dir.path(), &record).expect("handle");
-        let resolved = resolve_cli_approval_id(
-            sessions_dir.path(),
-            session_id,
-            user_id,
-            handle.as_str(),
-        )
-        .expect("resolve by handle");
+        let resolved =
+            resolve_cli_approval_id(sessions_dir.path(), session_id, user_id, handle.as_str())
+                .expect("resolve by handle");
         assert_eq!(resolved, "approval-handle-1");
     }
 
@@ -851,7 +833,10 @@ mod tests {
             }])
         }
 
-        fn create_backend(&self, _model_id: &str) -> Result<Box<dyn LLMBackend>, OrchestratorError> {
+        fn create_backend(
+            &self,
+            _model_id: &str,
+        ) -> Result<Box<dyn LLMBackend>, OrchestratorError> {
             Ok(Box::new(LocalMockLLM))
         }
 
@@ -951,7 +936,10 @@ mod tests {
         .expect("profile");
 
         assert_eq!(profile.max_context_tokens, Some(64000));
-        assert_eq!(profile.source, aria_core::CapabilitySourceKind::RuntimeProbe);
+        assert_eq!(
+            profile.source,
+            aria_core::CapabilitySourceKind::RuntimeProbe
+        );
         assert_eq!(profile.source_detail.as_deref(), Some("api probe"));
 
         let store = RuntimeStore::for_sessions_dir(sessions.path());
@@ -1015,16 +1003,28 @@ mod tests {
         .await
         .expect("profile");
 
-        assert_eq!(profile.source, aria_core::CapabilitySourceKind::LocalOverride);
-        assert_eq!(profile.tool_calling, aria_core::CapabilitySupport::Unsupported);
+        assert_eq!(
+            profile.source,
+            aria_core::CapabilitySourceKind::LocalOverride
+        );
+        assert_eq!(
+            profile.tool_calling,
+            aria_core::CapabilitySupport::Unsupported
+        );
         assert_eq!(profile.max_context_tokens, Some(2048));
-        assert_eq!(profile.adapter_family, aria_core::AdapterFamily::TextOnlyCli);
+        assert_eq!(
+            profile.adapter_family,
+            aria_core::AdapterFamily::TextOnlyCli
+        );
 
         let store = RuntimeStore::for_sessions_dir(sessions.path());
         let persisted = store
             .read_model_capability("test-provider/tool-model")
             .expect("persisted");
-        assert_eq!(persisted.source, aria_core::CapabilitySourceKind::LocalOverride);
+        assert_eq!(
+            persisted.source,
+            aria_core::CapabilitySourceKind::LocalOverride
+        );
         assert_eq!(persisted.source_detail.as_deref(), Some("local override"));
     }
 
@@ -1391,7 +1391,8 @@ mod tests {
             let mut guard = self.calls.lock().expect("tool llm lock poisoned");
             if *guard == 0 {
                 *guard += 1;
-                Ok(LLMResponse::ToolCalls(vec![ToolCall { invocation_id: None,
+                Ok(LLMResponse::ToolCalls(vec![ToolCall {
+                    invocation_id: None,
                     name: "write_file".into(),
                     arguments: serde_json::json!({
                         "path": "selector-generated.txt",
@@ -1420,7 +1421,8 @@ mod tests {
             let mut guard = self.calls.lock().expect("spawn llm lock poisoned");
             if *guard == 0 {
                 *guard += 1;
-                Ok(LLMResponse::ToolCalls(vec![ToolCall { invocation_id: None,
+                Ok(LLMResponse::ToolCalls(vec![ToolCall {
+                    invocation_id: None,
                     name: "spawn_agent".into(),
                     arguments: serde_json::json!({
                         "agent_id": "researcher",
@@ -1456,7 +1458,8 @@ mod tests {
                 .expect("malicious run shell lock poisoned");
             if *guard == 0 {
                 *guard += 1;
-                Ok(LLMResponse::ToolCalls(vec![ToolCall { invocation_id: None,
+                Ok(LLMResponse::ToolCalls(vec![ToolCall {
+                    invocation_id: None,
                     name: "run_shell".into(),
                     arguments: serde_json::json!({
                         "command": format!("touch {}", self.target_path),
@@ -1487,7 +1490,8 @@ mod tests {
             let mut guard = self.calls.lock().expect("malicious mcp lock poisoned");
             if *guard == 0 {
                 *guard += 1;
-                Ok(LLMResponse::ToolCalls(vec![ToolCall { invocation_id: None,
+                Ok(LLMResponse::ToolCalls(vec![ToolCall {
+                    invocation_id: None,
                     name: "read_mcp_resource".into(),
                     arguments: serde_json::json!({
                         "server_id": "github",
@@ -1554,10 +1558,10 @@ mod tests {
             description: "Search tools".into(),
             parameters_schema: r#"{"query":"string"}"#.into(),
             embedding: Vec::new(),
-        requires_strict_schema: false,
-        streaming_safe: false,
-        parallel_safe: true,
-        modalities: vec![aria_core::ToolModality::Text],
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
         });
 
         let captured = Arc::new(Mutex::new(None));
@@ -1605,7 +1609,8 @@ mod tests {
             false,
         );
         let vector_store = Arc::new(vector_store_inner);
-        let session_tool_caches = SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
+        let session_tool_caches =
+            SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
 
         let session_id = uuid::Uuid::new_v4().into_bytes();
         let session_uuid = uuid::Uuid::from_bytes(session_id);
@@ -1916,7 +1921,8 @@ mod tests {
         let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let kw_index = Arc::new(KeywordIndex::new().expect("keyword index"));
-        let session_tool_caches = SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
+        let session_tool_caches =
+            SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
 
         let req = AgentRequest {
             request_id: uuid::Uuid::new_v4().into_bytes(),
@@ -1990,7 +1996,10 @@ mod tests {
             observed_policy: observed_policy.clone(),
         };
         let llm = PoolBackedLLM::new(
-            Arc::new(LlmBackendPool::new(vec!["primary".into()], Duration::from_millis(100))),
+            Arc::new(LlmBackendPool::new(
+                vec!["primary".into()],
+                Duration::from_millis(100),
+            )),
             Some(Arc::new(backend)),
         );
 
@@ -2075,20 +2084,20 @@ mod tests {
             description: "Search tools".into(),
             parameters_schema: r#"{"query":"string"}"#.into(),
             embedding: Vec::new(),
-        requires_strict_schema: false,
-        streaming_safe: false,
-        parallel_safe: true,
-        modalities: vec![aria_core::ToolModality::Text],
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
         });
         tool_registry.register(CachedTool {
             name: "spawn_agent".into(),
             description: "Queue a child agent for background work".into(),
             parameters_schema: r#"{"agent_id":"string","prompt":"string"}"#.into(),
             embedding: Vec::new(),
-        requires_strict_schema: false,
-        streaming_safe: false,
-        parallel_safe: true,
-        modalities: vec![aria_core::ToolModality::Text],
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
         });
 
         let llm_pool = LlmBackendPool::new(vec!["primary".into()], Duration::from_millis(100));
@@ -2252,20 +2261,20 @@ mod tests {
             description: "Search tools".into(),
             parameters_schema: r#"{"query":"string"}"#.into(),
             embedding: Vec::new(),
-        requires_strict_schema: false,
-        streaming_safe: false,
-        parallel_safe: true,
-        modalities: vec![aria_core::ToolModality::Text],
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
         });
         tool_registry.register(CachedTool {
             name: "write_file".into(),
             description: "Write file".into(),
             parameters_schema: r#"{"path":"string","content":"string"}"#.into(),
             embedding: Vec::new(),
-        requires_strict_schema: false,
-        streaming_safe: false,
-        parallel_safe: true,
-        modalities: vec![aria_core::ToolModality::Text],
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
         });
 
         let llm_pool = LlmBackendPool::new(vec!["primary".into()], Duration::from_millis(100));
@@ -2312,7 +2321,8 @@ mod tests {
         ));
         let (tx_cron, _rx_cron) = tokio::sync::mpsc::channel(1);
         let provider_registry = Arc::new(tokio::sync::Mutex::new(ProviderRegistry::new()));
-        let session_tool_caches = SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
+        let session_tool_caches =
+            SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
         let hooks = HookRegistry::new();
         let session_locks = dashmap::DashMap::new();
         let embed_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
@@ -2437,10 +2447,10 @@ mod tests {
             description: "Run shell".into(),
             parameters_schema: r#"{"command":"string","cwd":"string"}"#.into(),
             embedding: Vec::new(),
-        requires_strict_schema: false,
-        streaming_safe: false,
-        parallel_safe: true,
-        modalities: vec![aria_core::ToolModality::Text],
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
         });
 
         let llm_pool = LlmBackendPool::new(vec!["primary".into()], Duration::from_millis(100));
@@ -2591,10 +2601,10 @@ mod tests {
             description: "Read MCP resource".into(),
             parameters_schema: r#"{"server_id":"string","resource_uri":"string"}"#.into(),
             embedding: Vec::new(),
-        requires_strict_schema: false,
-        streaming_safe: false,
-        parallel_safe: true,
-        modalities: vec![aria_core::ToolModality::Text],
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
         });
 
         let llm_pool = LlmBackendPool::new(vec!["primary".into()], Duration::from_millis(100));
@@ -2933,20 +2943,20 @@ mod tests {
             description: "Search tools".into(),
             parameters_schema: r#"{"query":"string"}"#.into(),
             embedding: Vec::new(),
-        requires_strict_schema: false,
-        streaming_safe: false,
-        parallel_safe: true,
-        modalities: vec![aria_core::ToolModality::Text],
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
         });
         tool_registry.register(CachedTool {
             name: "write_file".into(),
             description: "Write file".into(),
             parameters_schema: r#"{"path":"string","content":"string"}"#.into(),
             embedding: Vec::new(),
-        requires_strict_schema: false,
-        streaming_safe: false,
-        parallel_safe: true,
-        modalities: vec![aria_core::ToolModality::Text],
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
         });
 
         let llm_pool = LlmBackendPool::new(vec!["primary".into()], Duration::from_millis(100));
@@ -3019,7 +3029,8 @@ mod tests {
         ));
         let (tx_cron, _rx_cron) = tokio::sync::mpsc::channel(1);
         let provider_registry = Arc::new(tokio::sync::Mutex::new(ProviderRegistry::new()));
-        let session_tool_caches = SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
+        let session_tool_caches =
+            SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
         let hooks = HookRegistry::new();
         let session_locks = dashmap::DashMap::new();
         let embed_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
@@ -3165,7 +3176,8 @@ mod tests {
         ));
         let (tx_cron, _rx_cron) = tokio::sync::mpsc::channel(1);
         let provider_registry = Arc::new(tokio::sync::Mutex::new(ProviderRegistry::new()));
-        let session_tool_caches = SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
+        let session_tool_caches =
+            SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
         let hooks = HookRegistry::new();
         let session_locks = dashmap::DashMap::new();
         let embed_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
@@ -3326,20 +3338,20 @@ mod tests {
             description: "Schedule reminder behavior".into(),
             parameters_schema: "{}".into(),
             embedding: Vec::new(),
-        requires_strict_schema: false,
-        streaming_safe: false,
-        parallel_safe: true,
-        modalities: vec![aria_core::ToolModality::Text],
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
         });
         tool_registry.register(CachedTool {
             name: "search_tool_registry".into(),
             description: "Search tools".into(),
             parameters_schema: r#"{"query":"string"}"#.into(),
             embedding: Vec::new(),
-        requires_strict_schema: false,
-        streaming_safe: false,
-        parallel_safe: true,
-        modalities: vec![aria_core::ToolModality::Text],
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
         });
 
         let captured = Arc::new(Mutex::new(None));
@@ -3367,7 +3379,8 @@ mod tests {
         ));
         let (tx_cron, _rx_cron) = tokio::sync::mpsc::channel(4);
         let provider_registry = Arc::new(tokio::sync::Mutex::new(ProviderRegistry::new()));
-        let session_tool_caches = SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
+        let session_tool_caches =
+            SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
         let hooks = HookRegistry::new();
         let session_locks = dashmap::DashMap::new();
         let embed_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
@@ -3449,10 +3462,10 @@ mod tests {
                 description: "Read file".into(),
                 parameters_schema: "{}".into(),
                 embedding: Vec::new(),
-            requires_strict_schema: false,
-            streaming_safe: false,
-            parallel_safe: true,
-            modalities: vec![aria_core::ToolModality::Text],
+                requires_strict_schema: false,
+                streaming_safe: false,
+                parallel_safe: true,
+                modalities: vec![aria_core::ToolModality::Text],
             }],
         );
         assert!(context.contains("--- Planning Guidance ---"));
@@ -3534,10 +3547,10 @@ mod tests {
             description: "Search tools".into(),
             parameters_schema: r#"{"query":"string"}"#.into(),
             embedding: Vec::new(),
-        requires_strict_schema: false,
-        streaming_safe: false,
-        parallel_safe: true,
-        modalities: vec![aria_core::ToolModality::Text],
+            requires_strict_schema: false,
+            streaming_safe: false,
+            parallel_safe: true,
+            modalities: vec![aria_core::ToolModality::Text],
         });
 
         let llm_pool = LlmBackendPool::new(vec!["primary".into()], Duration::from_millis(100));
@@ -3556,7 +3569,8 @@ mod tests {
         let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let kw_index = Arc::new(KeywordIndex::new().expect("keyword index"));
-        let session_tool_caches = SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
+        let session_tool_caches =
+            SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
         let sessions_temp = tempfile::tempdir().expect("sessions tempdir");
 
         let session_id = uuid::Uuid::new_v4().into_bytes();
@@ -3705,7 +3719,8 @@ mod tests {
         let capability_index = Arc::new(build_dynamic_capability_index(&agent_store));
         let vector_store = Arc::new(VectorStore::new());
         let kw_index = Arc::new(KeywordIndex::new().expect("keyword index"));
-        let session_tool_caches = SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
+        let session_tool_caches =
+            SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
         let sessions_temp = tempfile::tempdir().expect("sessions tempdir");
 
         let session_id = uuid::Uuid::new_v4().into_bytes();
@@ -4046,7 +4061,8 @@ mod tests {
             .execute(&ToolCall {
                 invocation_id: None,
                 name: "schedule_message".into(),
-                arguments: r#"{"task":"Run report","delay":"every:60s","agent_id":"planner"}"#.into(),
+                arguments: r#"{"task":"Run report","delay":"every:60s","agent_id":"planner"}"#
+                    .into(),
             })
             .await
             .expect("legacy delay should be normalized");
@@ -4104,7 +4120,10 @@ mod tests {
 
         assert!(result.contains("Scheduled reminder notification"));
         let job = job_rx.await.expect("expected Add job command");
-        assert!(matches!(job.schedule, aria_intelligence::ScheduleSpec::Once(_)));
+        assert!(matches!(
+            job.schedule,
+            aria_intelligence::ScheduleSpec::Once(_)
+        ));
     }
 
     #[tokio::test]
@@ -4197,7 +4216,10 @@ mod tests {
 
         assert!(result.contains("Cron"));
         let job = job_rx.await.expect("expected Add job command");
-        assert!(matches!(job.schedule, aria_intelligence::ScheduleSpec::Once(_)));
+        assert!(matches!(
+            job.schedule,
+            aria_intelligence::ScheduleSpec::Once(_)
+        ));
     }
 
     #[test]
@@ -4523,7 +4545,8 @@ mod tests {
         ));
         let (tx_cron, _rx_cron) = tokio::sync::mpsc::channel(1);
         let provider_registry = Arc::new(tokio::sync::Mutex::new(ProviderRegistry::new()));
-        let session_tool_caches = SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
+        let session_tool_caches =
+            SessionToolCacheStore::new(runtime_env().session_tool_cache_max_entries);
         let hooks = HookRegistry::new();
         let session_locks = dashmap::DashMap::new();
         let embed_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
@@ -4911,10 +4934,11 @@ mod tests {
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "run_shell".into(),
                 arguments: r#"{"command":"echo hi"}"#.into(),
-})
+            })
             .await
             .expect_err("run_shell should be denied");
 
@@ -4963,7 +4987,8 @@ mod tests {
         );
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "read_file".into(),
                 arguments: format!(r#"{{"path":"{}"}}"#, path.display()),
             })
@@ -5024,7 +5049,8 @@ mod tests {
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "read_file".into(),
                 arguments: format!(r#"{{"path":"{}"}}"#, blocked_path.display()),
             })
@@ -5091,7 +5117,8 @@ mod tests {
         );
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "read_file".into(),
                 arguments: format!(r#"{{"path":"{}"}}"#, allowed_path.display()),
             })
@@ -5144,7 +5171,8 @@ mod tests {
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "run_shell".into(),
                 arguments: format!(
                     r#"{{"command":"pwd","cwd":"{}"}}"#,
@@ -5199,7 +5227,8 @@ mod tests {
         );
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "run_shell".into(),
                 arguments: format!(
                     r#"{{"command":"pwd","cwd":"{}"}}"#,
@@ -5256,7 +5285,8 @@ mod tests {
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "run_shell".into(),
                 arguments: format!(
                     r#"{{"command":"echo hello && echo world","cwd":"{}"}}"#,
@@ -5306,7 +5336,8 @@ mod tests {
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "spawn_agent".into(),
                 arguments: r#"{"agent_id":"researcher","prompt":"search for updates"}"#.into(),
             })
@@ -5356,7 +5387,8 @@ mod tests {
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "spawn_agent".into(),
                 arguments: r#"{"agent_id":"omni","prompt":"do privileged work"}"#.into(),
             })
@@ -5431,7 +5463,8 @@ mod tests {
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "spawn_agent".into(),
                 arguments: r#"{"agent_id":"researcher","prompt":"second background task"}"#.into(),
             })
@@ -5518,10 +5551,11 @@ mod tests {
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "activate_skill".into(),
                 arguments: r#"{"skill_id":"github_review"}"#.into(),
-})
+            })
             .await
             .expect_err("activation should require binding");
         assert!(format!("{}", err).contains("not bound"));
@@ -5613,7 +5647,8 @@ mod tests {
         );
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "activate_skill".into(),
                 arguments: r#"{"skill_id":"github_review","run_id":"run-1"}"#.into(),
             })
@@ -5719,7 +5754,8 @@ mod tests {
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "execute_skill".into(),
                 arguments: r#"{"skill_id":"wasm_review","function_name":"greet","input":"world"}"#
                     .into(),
@@ -5829,7 +5865,8 @@ mod tests {
         );
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "execute_skill".into(),
                 arguments: r#"{"skill_id":"wasm_review","function_name":"greet","input":"world"}"#
                     .into(),
@@ -5958,7 +5995,8 @@ enabled = true
         };
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "install_skill_from_dir".into(),
                 arguments: format!("{{\"skill_dir\":\"{}\"}}", skill_dir.path().display()),
             })
@@ -6011,7 +6049,8 @@ enabled = true
             user_timezone: chrono_tz::UTC,
         };
 
-        exec.execute(&ToolCall { invocation_id: None,
+        exec.execute(&ToolCall {
+            invocation_id: None,
             name: "install_skill_from_dir".into(),
             arguments: format!("{{\"skill_dir\":\"{}\"}}", skill_dir.path().display()),
         })
@@ -6019,7 +6058,8 @@ enabled = true
         .expect("install base skill from dir");
 
         let key_hex = "1111111111111111111111111111111111111111111111111111111111111111";
-        exec.execute(&ToolCall { invocation_id: None,
+        exec.execute(&ToolCall {
+            invocation_id: None,
             name: "export_signed_skill_manifest".into(),
             arguments: format!(
                 "{{\"skill_id\":\"triage\",\"output_dir\":\"{}\",\"signing_key_hex\":\"{}\"}}",
@@ -6041,7 +6081,8 @@ enabled = true
         std::fs::write(exported_skill_dir.join("SKILL.md"), "# Issue Triage").expect("write entry");
 
         let install_result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "install_signed_skill_from_dir".into(),
                 arguments: format!(
                     "{{\"skill_dir\":\"{}\",\"expected_public_key_hex\":\"{}\"}}",
@@ -6058,8 +6099,12 @@ enabled = true
             .list_skill_signatures(Some("triage"))
             .expect("list skill signatures");
         assert!(signatures.len() >= 2);
-        assert!(signatures.iter().any(|record| record.source == "export_signed_skill_manifest"));
-        assert!(signatures.iter().any(|record| record.source == "install_signed_skill_from_dir"));
+        assert!(signatures
+            .iter()
+            .any(|record| record.source == "export_signed_skill_manifest"));
+        assert!(signatures
+            .iter()
+            .any(|record| record.source == "install_signed_skill_from_dir"));
     }
 
     #[tokio::test]
@@ -6097,7 +6142,8 @@ enabled = true
             user_timezone: chrono_tz::UTC,
         };
 
-        exec.execute(&ToolCall { invocation_id: None,
+        exec.execute(&ToolCall {
+            invocation_id: None,
             name: "install_skill_from_dir".into(),
             arguments: format!("{{\"skill_dir\":\"{}\"}}", skill_dir.path().display()),
         })
@@ -6105,7 +6151,8 @@ enabled = true
         .expect("install base skill from dir");
 
         let key_hex = "1111111111111111111111111111111111111111111111111111111111111111";
-        exec.execute(&ToolCall { invocation_id: None,
+        exec.execute(&ToolCall {
+            invocation_id: None,
             name: "export_signed_skill_manifest".into(),
             arguments: format!(
                 "{{\"skill_id\":\"triage\",\"output_dir\":\"{}\",\"signing_key_hex\":\"{}\"}}",
@@ -6131,12 +6178,10 @@ enabled = true
         std::fs::write(exported_skill_dir.join("SKILL.md"), "# Issue Triage").expect("write entry");
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "install_signed_skill_from_dir".into(),
-                arguments: format!(
-                    "{{\"skill_dir\":\"{}\"}}",
-                    exported_skill_dir.display()
-                ),
+                arguments: format!("{{\"skill_dir\":\"{}\"}}", exported_skill_dir.display()),
             })
             .await
             .expect_err("tampered manifest should fail signature verification");
@@ -6162,7 +6207,8 @@ enabled = true
         };
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "run_shell".into(),
                 arguments: r#"{"command":"sleep 2","timeout_seconds":1}"#.into(),
             })
@@ -6249,7 +6295,8 @@ enabled = true
         };
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "run_shell".into(),
                 arguments: r#"{"command":"echo hello","os_containment":true}"#.into(),
             })
@@ -6278,7 +6325,8 @@ enabled = true
             user_timezone: chrono_tz::UTC,
         };
 
-        exec.execute(&ToolCall { invocation_id: None,
+        exec.execute(&ToolCall {
+            invocation_id: None,
             name: "run_shell".into(),
             arguments: r#"{"command":"echo audited","timeout_seconds":5}"#.into(),
         })
@@ -6286,7 +6334,10 @@ enabled = true
         .expect("run_shell should succeed");
 
         let audits = RuntimeStore::for_sessions_dir(sessions.path())
-            .list_shell_exec_audits(Some(&uuid::Uuid::from_bytes(session_id).to_string()), Some("developer"))
+            .list_shell_exec_audits(
+                Some(&uuid::Uuid::from_bytes(session_id).to_string()),
+                Some("developer"),
+            )
             .expect("list shell audits");
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].command, "echo audited");
@@ -6331,7 +6382,8 @@ enabled = true
         };
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "bind_skill".into(),
                 arguments: r#"{"skill_id":"github_review","activation_policy":"manual"}"#.into(),
             })
@@ -6559,7 +6611,8 @@ enabled = true
         };
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "bind_mcp_import".into(),
                 arguments:
                     r#"{"server_id":"github","primitive_kind":"tool","target_name":"create_issue"}"#
@@ -6673,7 +6726,8 @@ enabled = true
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "invoke_mcp_tool".into(),
                 arguments:
                     r#"{"server_id":"github","tool_name":"create_issue","input":{"title":"Bug"}}"#
@@ -6778,7 +6832,8 @@ enabled = true
         );
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "invoke_mcp_tool".into(),
                 arguments:
                     r#"{"server_id":"github","tool_name":"create_issue","input":{"title":"Bug"}}"#
@@ -7003,7 +7058,10 @@ enabled = true
             .await
             .expect("compat tool should succeed");
         assert_eq!(result.render_for_prompt(), "compat ok");
-        assert_eq!(result.as_provider_payload()["mode"], serde_json::json!("compat"));
+        assert_eq!(
+            result.as_provider_payload()["mode"],
+            serde_json::json!("compat")
+        );
     }
 
     #[tokio::test]
@@ -7357,7 +7415,8 @@ enabled = true
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "render_mcp_prompt".into(),
                 arguments:
                     r#"{"server_id":"github","prompt_name":"review_pr","arguments":{"pr":42}}"#
@@ -7462,7 +7521,8 @@ enabled = true
         );
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "render_mcp_prompt".into(),
                 arguments:
                     r#"{"server_id":"github","prompt_name":"review_pr","arguments":{"pr":42}}"#
@@ -7569,7 +7629,8 @@ enabled = true
         );
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "read_mcp_resource".into(),
                 arguments: r#"{"server_id":"github","resource_uri":"repo://issues"}"#.into(),
             })
@@ -7674,7 +7735,8 @@ enabled = true
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "read_mcp_resource".into(),
                 arguments: r#"{"server_id":"github","resource_uri":"repo://issues"}"#.into(),
             })
@@ -7783,10 +7845,11 @@ enabled = true
         };
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "cancel_agent_run".into(),
                 arguments: r#"{"run_id":"run-cancel-1"}"#.into(),
-})
+            })
             .await
             .expect("cancel should succeed");
         assert!(result.render_for_prompt().contains("Cancelled child run"));
@@ -7849,10 +7912,11 @@ enabled = true
         };
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "retry_agent_run".into(),
                 arguments: r#"{"run_id":"run-source-1"}"#.into(),
-})
+            })
             .await
             .expect("retry should succeed");
         let new_run_id = match result {
@@ -7946,40 +8010,48 @@ enabled = true
         };
 
         let list = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "list_agent_runs".into(),
                 arguments: "{}".into(),
-})
+            })
             .await
             .expect("list_agent_runs");
         assert!(list.render_for_prompt().contains("Found 1 runs"));
 
         let detail = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "get_agent_run".into(),
                 arguments: r#"{"run_id":"run-read-1"}"#.into(),
-})
+            })
             .await
             .expect("get_agent_run");
-        assert!(detail.render_for_prompt().contains("Fetched run 'run-read-1'"));
+        assert!(detail
+            .render_for_prompt()
+            .contains("Fetched run 'run-read-1'"));
 
         let events = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "get_agent_run_events".into(),
                 arguments: r#"{"run_id":"run-read-1"}"#.into(),
-})
+            })
             .await
             .expect("get_agent_run_events");
         assert!(events.render_for_prompt().contains("Found 1 events"));
 
         let mailbox = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "get_agent_mailbox".into(),
                 arguments: r#"{"run_id":"run-read-1"}"#.into(),
-})
+            })
             .await
             .expect("get_agent_mailbox");
-        assert!(mailbox.render_for_prompt().contains("Found 1 mailbox messages"));
+        assert!(mailbox
+            .render_for_prompt()
+            .contains("Found 1 mailbox messages"));
     }
 
     #[tokio::test]
@@ -8490,7 +8562,8 @@ enabled = true
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "run_shell".into(),
                 arguments: format!(
                     r#"{{"command":"echo hi","cwd":"{}","os_containment":false}}"#,
@@ -8560,10 +8633,11 @@ enabled = true
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "browser_download".into(),
                 arguments: r#"{"url":"https://example.com/file.txt"}"#.into(),
-})
+            })
             .await
             .expect_err("telegram social download should be denied");
         assert!(format!("{}", err).contains("blocked for untrusted social agents"));
@@ -8676,10 +8750,7 @@ enabled = true
             cedar,
             "developer".into(),
             GatewayChannel::Cli,
-            vec![std::env::current_dir()
-                .expect("cwd")
-                .display()
-                .to_string()],
+            vec![std::env::current_dir().expect("cwd").display().to_string()],
             vec![],
             None,
             None,
@@ -8687,7 +8758,8 @@ enabled = true
         );
 
         let err = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "write_file".into(),
                 arguments: r#"{"path":"./tmp.txt","content":"hello"}"#.into(),
             })
@@ -8725,7 +8797,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://blocked.example/docs"}"#.into(),
-})
+            })
             .await
             .expect_err("blocked domain should be denied");
 
@@ -8767,7 +8839,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://docs.rs/serde"}"#.into(),
-})
+            })
             .await
             .expect("allowlisted domain should be allowed");
 
@@ -8801,7 +8873,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"http://127.0.0.1/private"}"#.into(),
-})
+            })
             .await
             .expect_err("private network target should be blocked");
         assert!(format!("{}", err).contains("private or non-public IP address"));
@@ -8837,7 +8909,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"http://127.0.0.1/private"}"#.into(),
-})
+            })
             .await
             .expect("privileged trusted local agent should be allowed");
         assert_eq!(result, "ok");
@@ -8863,7 +8935,11 @@ enabled = true
             GatewayChannel::Cli,
             vec![],
             vec![],
-            Some(build_capability_profile("researcher", &["fetch_url"], false)),
+            Some(build_capability_profile(
+                "researcher",
+                &["fetch_url"],
+                false,
+            )),
             None,
             None,
         );
@@ -8873,7 +8949,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://blocked.example/docs"}"#.into(),
-})
+            })
             .await
             .expect_err("cedar should deny blocked domain");
         assert!(format!("{}", err).contains("policy denied"));
@@ -8905,7 +8981,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://unknown.example/page"}"#.into(),
-})
+            })
             .await
             .expect_err("unknown domain should require approval");
 
@@ -8958,7 +9034,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://approved.example/docs"}"#.into(),
-})
+            })
             .await
             .expect("persisted allow decision should allow");
 
@@ -9012,7 +9088,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://denied.example/private"}"#.into(),
-})
+            })
             .await
             .expect_err("persisted deny decision should deny");
 
@@ -9075,7 +9151,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://once.example/docs"}"#.into(),
-})
+            })
             .await
             .expect("allow once should permit first request");
         assert_eq!(first, "ok");
@@ -9090,7 +9166,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://once.example/docs"}"#.into(),
-})
+            })
             .await
             .expect_err("after consumption the request should require approval again");
         assert!(format!("{}", err).contains(aria_intelligence::APPROVAL_REQUIRED_PREFIX));
@@ -9143,7 +9219,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://deny-once.example/private"}"#.into(),
-})
+            })
             .await
             .expect_err("deny once should deny first request");
         assert!(format!("{}", err).contains("denied by stored policy"));
@@ -9158,7 +9234,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://deny-once.example/private"}"#.into(),
-})
+            })
             .await
             .expect_err("after consumption the request should require approval again");
         assert!(format!("{}", err).contains(aria_intelligence::APPROVAL_REQUIRED_PREFIX));
@@ -9197,7 +9273,7 @@ enabled = true
                 invocation_id: None,
                 name: "fetch_url".into(),
                 arguments: r#"{"url":"https://docs.rs/serde"}"#.into(),
-})
+            })
             .await
             .expect_err("firewall should block poisoned web content");
 
@@ -9284,7 +9360,10 @@ enabled = true
             .list_domain_access_decisions(Some("github.com"), Some("researcher"))
             .expect("list decisions");
         assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].decision, aria_core::DomainDecisionKind::AllowForSession);
+        assert_eq!(
+            stored[0].decision,
+            aria_core::DomainDecisionKind::AllowForSession
+        );
         assert_eq!(stored[0].session_id, Some(session_id));
         assert_eq!(stored[0].action_family, aria_core::WebActionFamily::Login);
     }
@@ -9325,7 +9404,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_profile_list".into(),
                 arguments: "{}".into(),
-})
+            })
             .await
             .expect("list browser profiles");
         let payload = listed.as_provider_payload();
@@ -9339,7 +9418,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_profile_use".into(),
                 arguments: r#"{"profile_id":"work-profile"}"#.into(),
-})
+            })
             .await
             .expect("bind browser profile");
         assert!(bound.contains("Bound browser profile"));
@@ -9383,7 +9462,7 @@ enabled = true
             invocation_id: None,
             name: "browser_profile_create".into(),
             arguments: r#"{"name":"Team Browser"}"#.into(),
-})
+        })
         .await
         .expect("create browser profile from name fallback");
         assert!(browser_profile_dir(sessions.path(), "team-browser").is_dir());
@@ -9442,7 +9521,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_session_start".into(),
                 arguments: r#"{"url":"https://example.com"}"#.into(),
-})
+            })
             .await
             .expect("start browser session");
         let started_payload = started.as_provider_payload();
@@ -9534,7 +9613,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_session_status".into(),
                 arguments: "{}".into(),
-})
+            })
             .await
             .expect("status browser session");
         assert!(status.contains("browser-session-active"));
@@ -9631,7 +9710,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_login_status".into(),
                 arguments: r#"{"domain":"github.com"}"#.into(),
-})
+            })
             .await
             .expect("browser login status");
         assert!(status.contains("Found 1 browser login state record(s)."));
@@ -9706,7 +9785,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_session_start".into(),
                 arguments: r#"{"url":"https://github.com"}"#.into(),
-})
+            })
             .await
             .expect("start browser session");
         let started_payload = started.as_provider_payload();
@@ -9721,13 +9800,16 @@ enabled = true
                 invocation_id: None,
                 name: "browser_session_list".into(),
                 arguments: "{}".into(),
-})
+            })
             .await
             .expect("list browser sessions");
         let listed_payload = listed.as_provider_payload();
         let browser_sessions = listed_payload.as_array().expect("browser sessions payload");
         assert_eq!(browser_sessions.len(), 1);
-        assert_eq!(browser_sessions[0]["browser_session_id"], browser_session_id);
+        assert_eq!(
+            browser_sessions[0]["browser_session_id"],
+            browser_session_id
+        );
 
         let status = exec
             .execute(&ToolCall {
@@ -9810,7 +9892,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_session_start".into(),
                 arguments: r#"{"url":"https://github.com"}"#.into(),
-})
+            })
             .await
             .expect_err("attached transport should not silently reuse managed launch");
         assert!(format!("{}", err).contains("attached browser transport"));
@@ -9885,7 +9967,7 @@ enabled = true
                 invocation_id: None,
                 name: "browser_session_start".into(),
                 arguments: r#"{"url":"https://github.com"}"#.into(),
-})
+            })
             .await
             .expect("start browser session");
         let payload = result.as_provider_payload();
@@ -9897,7 +9979,10 @@ enabled = true
             .list_browser_artifacts(Some(session_id), Some(browser_session_id))
             .expect("list artifacts");
         assert_eq!(artifacts.len(), 1);
-        assert_eq!(artifacts[0].kind, aria_core::BrowserArtifactKind::LaunchMetadata);
+        assert_eq!(
+            artifacts[0].kind,
+            aria_core::BrowserArtifactKind::LaunchMetadata
+        );
         assert!(std::path::Path::new(&artifacts[0].storage_path).exists());
 
         let audits = store
@@ -9960,10 +10045,11 @@ printf '{"cookies":[{"name":"sid","value":"cookie-secret"}],"localStorage":{"tok
             perms.set_mode(0o755);
             std::fs::set_permissions(&fake_bridge, perms).expect("chmod fake bridge");
         }
-        let (original_bridge, original_allowlist, original_containment) = set_test_browser_bridge_env(&fake_bridge);
-        let original_master_key = std::env::var_os("ARIA_MASTER_KEY");
+        let (original_bridge, original_allowlist, original_containment) =
+            set_test_browser_bridge_env(&fake_bridge);
+        let original_master_key = std::env::var_os("HIVECLAW_MASTER_KEY");
         unsafe {
-            std::env::set_var("ARIA_MASTER_KEY", "test-browser-session-master-key");
+            std::env::set_var("HIVECLAW_MASTER_KEY", "test-browser-session-master-key");
         }
 
         let exec = NativeToolExecutor {
@@ -9987,7 +10073,7 @@ printf '{"cookies":[{"name":"sid","value":"cookie-secret"}],"localStorage":{"tok
                 invocation_id: None,
                 name: "browser_session_persist_state".into(),
                 arguments: r#"{"browser_session_id":"browser-session-1"}"#.into(),
-})
+            })
             .await
             .expect("persist session state");
         let payload = result.as_provider_payload();
@@ -10004,9 +10090,9 @@ printf '{"cookies":[{"name":"sid","value":"cookie-secret"}],"localStorage":{"tok
 
         restore_test_browser_bridge_env(original_bridge, original_allowlist, original_containment);
         if let Some(value) = original_master_key {
-            unsafe { std::env::set_var("ARIA_MASTER_KEY", value) };
+            unsafe { std::env::set_var("HIVECLAW_MASTER_KEY", value) };
         } else {
-            unsafe { std::env::remove_var("ARIA_MASTER_KEY") };
+            unsafe { std::env::remove_var("HIVECLAW_MASTER_KEY") };
         }
     }
 
@@ -10042,14 +10128,18 @@ printf '{"cookies":[{"name":"sid","value":"cookie-secret"}],"localStorage":{"tok
             "cookies": [{"name":"sid","value":"cookie-secret"}],
             "localStorage": {"token":"local-secret"},
         });
-        let original_master_key = std::env::var_os("ARIA_MASTER_KEY");
+        let original_master_key = std::env::var_os("HIVECLAW_MASTER_KEY");
         unsafe {
-            std::env::set_var("ARIA_MASTER_KEY", "test-browser-session-master-key");
+            std::env::set_var("HIVECLAW_MASTER_KEY", "test-browser-session-master-key");
         }
-        let encrypted =
-            encrypt_browser_session_state_payload(&serde_json::to_vec(&plaintext).expect("serialize state"))
-                .expect("encrypt");
-        let state_dir = sessions.path().join("browser_session_state").join("work-profile");
+        let encrypted = encrypt_browser_session_state_payload(
+            &serde_json::to_vec(&plaintext).expect("serialize state"),
+        )
+        .expect("encrypt");
+        let state_dir = sessions
+            .path()
+            .join("browser_session_state")
+            .join("work-profile");
         std::fs::create_dir_all(&state_dir).expect("create state dir");
         let state_path = state_dir.join("browser-session-1.enc.json");
         std::fs::write(
@@ -10068,7 +10158,11 @@ printf '{"cookies":[{"name":"sid","value":"cookie-secret"}],"localStorage":{"tok
                     storage_path: state_path.to_string_lossy().to_string(),
                     content_sha256_hex: format!(
                         "{:x}",
-                        Sha256::digest(serde_json::to_vec(&plaintext).expect("serialize").as_slice())
+                        Sha256::digest(
+                            serde_json::to_vec(&plaintext)
+                                .expect("serialize")
+                                .as_slice()
+                        )
                     ),
                     last_restored_at_us: None,
                     created_at_us: 1,
@@ -10098,7 +10192,8 @@ printf '{"cookies":[{"name":"sid","value":"cookie-secret"}],"localStorage":{"tok
             perms.set_mode(0o755);
             std::fs::set_permissions(&fake_bridge, perms).expect("chmod fake bridge");
         }
-        let (original_bridge, original_allowlist, original_containment) = set_test_browser_bridge_env(&fake_bridge);
+        let (original_bridge, original_allowlist, original_containment) =
+            set_test_browser_bridge_env(&fake_bridge);
 
         let exec = NativeToolExecutor {
             tx_cron: {
@@ -10120,7 +10215,7 @@ printf '{"cookies":[{"name":"sid","value":"cookie-secret"}],"localStorage":{"tok
             invocation_id: None,
             name: "browser_session_restore_state".into(),
             arguments: r#"{"browser_session_id":"browser-session-1"}"#.into(),
-})
+        })
         .await
         .expect("restore session state");
 
@@ -10134,9 +10229,9 @@ printf '{"cookies":[{"name":"sid","value":"cookie-secret"}],"localStorage":{"tok
 
         restore_test_browser_bridge_env(original_bridge, original_allowlist, original_containment);
         if let Some(value) = original_master_key {
-            unsafe { std::env::set_var("ARIA_MASTER_KEY", value) };
+            unsafe { std::env::set_var("HIVECLAW_MASTER_KEY", value) };
         } else {
-            unsafe { std::env::remove_var("ARIA_MASTER_KEY") };
+            unsafe { std::env::remove_var("HIVECLAW_MASTER_KEY") };
         }
     }
 
@@ -10186,10 +10281,11 @@ printf '{"cookies":[]}'"#,
             perms.set_mode(0o755);
             std::fs::set_permissions(&fake_bridge, perms).expect("chmod fake bridge");
         }
-        let (original_bridge, original_allowlist, original_containment) = set_test_browser_bridge_env(&fake_bridge);
-        let original_master_key = std::env::var_os("ARIA_MASTER_KEY");
+        let (original_bridge, original_allowlist, original_containment) =
+            set_test_browser_bridge_env(&fake_bridge);
+        let original_master_key = std::env::var_os("HIVECLAW_MASTER_KEY");
         unsafe {
-            std::env::remove_var("ARIA_MASTER_KEY");
+            std::env::remove_var("HIVECLAW_MASTER_KEY");
         }
 
         let exec = NativeToolExecutor {
@@ -10213,16 +10309,16 @@ printf '{"cookies":[]}'"#,
                 invocation_id: None,
                 name: "browser_session_persist_state".into(),
                 arguments: r#"{"browser_session_id":"browser-session-1"}"#.into(),
-})
+            })
             .await
             .expect_err("persist state should fail without master key");
-        assert!(format!("{}", err).contains("ARIA_MASTER_KEY must be set"));
+        assert!(format!("{}", err).contains("HIVECLAW_MASTER_KEY must be set"));
 
         restore_test_browser_bridge_env(original_bridge, original_allowlist, original_containment);
         if let Some(value) = original_master_key {
-            unsafe { std::env::set_var("ARIA_MASTER_KEY", value) };
+            unsafe { std::env::set_var("HIVECLAW_MASTER_KEY", value) };
         } else {
-            unsafe { std::env::remove_var("ARIA_MASTER_KEY") };
+            unsafe { std::env::remove_var("HIVECLAW_MASTER_KEY") };
         }
     }
 
@@ -10235,9 +10331,15 @@ printf '{"cookies":[]}'"#,
         let profile_dir = sessions.path().join("profiles").join("work-profile");
         std::fs::create_dir_all(&profile_dir).expect("create profile dir");
 
-        let artifact_root = sessions.path().join("browser_artifacts").join("browser-session-1");
+        let artifact_root = sessions
+            .path()
+            .join("browser_artifacts")
+            .join("browser-session-1");
         std::fs::create_dir_all(&artifact_root).expect("create artifact root");
-        let state_root = sessions.path().join("browser_session_state").join("work-profile");
+        let state_root = sessions
+            .path()
+            .join("browser_session_state")
+            .join("work-profile");
         std::fs::create_dir_all(&state_root).expect("create state root");
 
         for index in 0..2_u64 {
@@ -10486,8 +10588,11 @@ printf '{"cookies":[]}'"#,
             std::env::remove_var("ARIA_BROWSER_AUTOMATION_OS_CONTAINMENT");
         }
 
-        let err = build_browser_automation_stdin_command(&[temp.path().to_path_buf()], "fill_credentials")
-            .expect_err("unsupported command should fail");
+        let err = build_browser_automation_stdin_command(
+            &[temp.path().to_path_buf()],
+            "fill_credentials",
+        )
+        .expect_err("unsupported command should fail");
         assert!(format!("{}", err).contains("does not support required command"));
 
         restore_test_browser_bridge_env(original_bridge, original_allowlist, original_containment);
@@ -10530,7 +10635,7 @@ printf '{"cookies":[]}'"#,
             agent_id: "researcher".into(),
             profile_id: "profile-1".into(),
             engine: aria_core::BrowserEngine::Chromium,
-                    transport: aria_core::BrowserTransportKind::ManagedBrowser,
+            transport: aria_core::BrowserTransportKind::ManagedBrowser,
             status: aria_core::BrowserSessionStatus::Launched,
             pid: None,
             profile_dir: temp.path().display().to_string(),
@@ -10550,8 +10655,7 @@ printf '{"cookies":[]}'"#,
             millis: None,
         };
         let (command, writable_dirs) =
-            build_browser_automation_command(&browser_session, &request)
-                .expect("build command");
+            build_browser_automation_command(&browser_session, &request).expect("build command");
         let output =
             run_browser_json_command(&command, &writable_dirs).expect("run browser json command");
         assert_eq!(output["secret"], "");
@@ -10693,12 +10797,12 @@ printf '{"cookies":[]}'"#,
             .list_browser_artifacts(Some(session_id), Some(&browser_session_id))
             .expect("list artifacts");
         assert_eq!(artifacts.len(), 4);
-        assert!(artifacts.iter().any(|artifact| {
-            artifact.kind == aria_core::BrowserArtifactKind::DomSnapshot
-        }));
-        assert!(artifacts.iter().any(|artifact| {
-            artifact.kind == aria_core::BrowserArtifactKind::ExtractedText
-        }));
+        assert!(artifacts
+            .iter()
+            .any(|artifact| { artifact.kind == aria_core::BrowserArtifactKind::DomSnapshot }));
+        assert!(artifacts
+            .iter()
+            .any(|artifact| { artifact.kind == aria_core::BrowserArtifactKind::ExtractedText }));
 
         if let Some(value) = original_bin {
             unsafe { std::env::set_var("ARIA_BROWSER_CHROMIUM_BIN", value) };
@@ -10951,7 +11055,10 @@ exit 0
         let payload = result.as_provider_payload();
         assert_eq!(payload["kind"], "download");
         let path = payload["storage_path"].as_str().expect("storage_path");
-        assert_eq!(std::fs::read_to_string(path).expect("read download"), "download-body");
+        assert_eq!(
+            std::fs::read_to_string(path).expect("read download"),
+            "download-body"
+        );
 
         let audits = store
             .list_browser_action_audits(Some(session_id), Some("researcher"))
@@ -11020,8 +11127,7 @@ exit 0
             user_timezone: chrono_tz::UTC,
         };
         let original_private = set_private_web_targets_env(true);
-        let server_url =
-            start_test_http_server("binary", "application/x-msdownload").await;
+        let server_url = start_test_http_server("binary", "application/x-msdownload").await;
 
         let original_bin = std::env::var_os("ARIA_BROWSER_CHROMIUM_BIN");
         unsafe {
@@ -11222,7 +11328,8 @@ exit 0
         exec.execute(&ToolCall {
             invocation_id: None,
             name: "browser_act".into(),
-            arguments: r#"{"browser_session_id":"browser-session-1","action":"wait","millis":1}"#.into(),
+            arguments: r#"{"browser_session_id":"browser-session-1","action":"wait","millis":1}"#
+                .into(),
         })
         .await
         .expect("wait action");
@@ -11387,7 +11494,8 @@ printf '{"ok":true,"mode":"bridge"}'
             std::fs::set_permissions(&fake_bridge, perms).expect("chmod fake bridge");
         }
 
-        let (original_bridge, original_allowlist, original_containment) = set_test_browser_bridge_env(&fake_bridge);
+        let (original_bridge, original_allowlist, original_containment) =
+            set_test_browser_bridge_env(&fake_bridge);
 
         let exec = NativeToolExecutor {
             tx_cron: {
@@ -11555,7 +11663,9 @@ printf '{"ok":true,"mode":"bridge"}'
             .execute(&ToolCall {
                 invocation_id: None,
                 name: "browser_act".into(),
-                arguments: r#"{"browser_session_id":"browser-session-1","action":"wait","millis":1}"#.into(),
+                arguments:
+                    r#"{"browser_session_id":"browser-session-1","action":"wait","millis":1}"#
+                        .into(),
             })
             .await
             .expect_err("paused session should reject actions");
@@ -11750,7 +11860,8 @@ printf '{"ok":true,"mode":"bridge"}'
             perms.set_mode(0o755);
             std::fs::set_permissions(&fake_bridge, perms).expect("chmod fake bridge");
         }
-        let (original_bridge, original_allowlist, original_containment) = set_test_browser_bridge_env(&fake_bridge);
+        let (original_bridge, original_allowlist, original_containment) =
+            set_test_browser_bridge_env(&fake_bridge);
 
         let exec = NativeToolExecutor {
             tx_cron: {
@@ -11994,7 +12105,7 @@ printf '{"ok":true,"mode":"bridge"}'
                 invocation_id: None,
                 name: "browser_session_start".into(),
                 arguments: r#"{"url":"https://github.com"}"#.into(),
-})
+            })
             .await
             .expect("browser_session_start");
         let payload = result.as_provider_payload();
@@ -12043,12 +12154,10 @@ printf '{"ok":true,"mode":"bridge"}'
             .expect("fetch_url");
         let fetch_alias_payload = fetched.as_provider_payload();
         assert_eq!(fetch_alias_payload["url"], server_url);
-        assert!(
-            fetch_alias_payload["body"]
-                .as_str()
-                .expect("body string")
-                .contains("Hello")
-        );
+        assert!(fetch_alias_payload["body"]
+            .as_str()
+            .expect("body string")
+            .contains("Hello"));
 
         let fetched = exec
             .execute(&ToolCall {
@@ -12060,12 +12169,10 @@ printf '{"ok":true,"mode":"bridge"}'
             .expect("web_fetch");
         let fetch_payload = fetched.as_provider_payload();
         assert_eq!(fetch_payload["url"], server_url);
-        assert!(
-            fetch_payload["body"]
-                .as_str()
-                .expect("body string")
-                .contains("Hello")
-        );
+        assert!(fetch_payload["body"]
+            .as_str()
+            .expect("body string")
+            .contains("Hello"));
 
         let extracted = exec
             .execute(&ToolCall {
@@ -12108,7 +12215,9 @@ printf '{"ok":true,"mode":"bridge"}'
         let text = extract_html_text(html);
         assert!(text.contains("Hello & Welcome"));
         assert!(text.contains("World 'quoted'"));
-        assert!(!text.to_ascii_lowercase().contains("ignore previous instructions"));
+        assert!(!text
+            .to_ascii_lowercase()
+            .contains("ignore previous instructions"));
         assert!(!text.contains("Ignore title"));
     }
 
@@ -12177,8 +12286,12 @@ printf '{"ok":true,"mode":"bridge"}'
         "#;
 
         let extracted = extract_html_content(html);
-        assert!(extracted.text.contains("Use the client to authenticate requests."));
-        assert!(extracted.text.contains("Responses are returned as JSON documents."));
+        assert!(extracted
+            .text
+            .contains("Use the client to authenticate requests."));
+        assert!(extracted
+            .text
+            .contains("Responses are returned as JSON documents."));
         assert!(!extracted.text.contains("Pricing"));
         assert_eq!(extracted.headings[0], "API Reference");
     }
@@ -12277,7 +12390,9 @@ printf '{"ok":true,"mode":"bridge"}'
             html,
         );
         assert_eq!(extracted.site_adapter, Some("docs_rs"));
-        assert!(extracted.text.contains("JSON serialization and deserialization support."));
+        assert!(extracted
+            .text
+            .contains("JSON serialization and deserialization support."));
         assert!(!extracted.text.contains("Crate Source"));
     }
 
@@ -12305,7 +12420,9 @@ printf '{"ok":true,"mode":"bridge"}'
             html,
         );
         assert_eq!(extracted.site_adapter, Some("github_docs"));
-        assert!(extracted.text.contains("Use jobs to define parallel execution."));
+        assert!(extracted
+            .text
+            .contains("Use jobs to define parallel execution."));
         assert!(!extracted.text.contains("Actions"));
     }
 
@@ -12328,10 +12445,11 @@ printf '{"ok":true,"mode":"bridge"}'
             </html>
         "#;
 
-        let extracted =
-            extract_html_content_for_url(Some("https://github.com/kush/anima"), html);
+        let extracted = extract_html_content_for_url(Some("https://github.com/kush/anima"), html);
         assert_eq!(extracted.site_adapter, Some("github_repository"));
-        assert!(extracted.text.contains("ARIA runtime and orchestration platform."));
+        assert!(extracted
+            .text
+            .contains("ARIA runtime and orchestration platform."));
         assert!(!extracted.text.contains("Issues"));
         assert!(!extracted.text.contains("Releases"));
     }
@@ -12502,7 +12620,13 @@ printf '{"ok":true,"mode":"bridge"}'
         let payload = result.as_provider_payload();
         assert_eq!(payload["pages"].as_array().expect("pages").len(), 1);
         assert_eq!(payload["crawl_job"]["status"], "completed");
-        assert_eq!(payload["changed_paths"].as_array().expect("changed paths").len(), 1);
+        assert_eq!(
+            payload["changed_paths"]
+                .as_array()
+                .expect("changed paths")
+                .len(),
+            1
+        );
 
         let jobs = RuntimeStore::for_sessions_dir(sessions.path())
             .list_crawl_jobs()
@@ -12577,7 +12701,13 @@ printf '{"ok":true,"mode":"bridge"}'
         let pages = payload["pages"].as_array().expect("pages");
         assert_eq!(payload["crawl_job"]["status"], "completed");
         assert_eq!(pages.len(), 3);
-        assert_eq!(payload["changed_paths"].as_array().expect("changed paths").len(), 3);
+        assert_eq!(
+            payload["changed_paths"]
+                .as_array()
+                .expect("changed paths")
+                .len(),
+            3
+        );
         assert!(pages.iter().all(|page| {
             page["url"]
                 .as_str()
@@ -12748,10 +12878,7 @@ exit 0
             .execute(&ToolCall {
                 invocation_id: None,
                 name: "crawl_page".into(),
-                arguments: format!(
-                    r#"{{"url":"{}","capture_screenshots":true}}"#,
-                    server_url
-                ),
+                arguments: format!(r#"{{"url":"{}","capture_screenshots":true}}"#, server_url),
             })
             .await
             .expect("crawl_page");
@@ -12821,7 +12948,10 @@ exit 0
         let scheduled = job_rx.await.expect("scheduled job");
         assert_eq!(scheduled.id, watch_id);
         assert_eq!(scheduled.agent_id, "researcher");
-        assert_eq!(scheduled.kind, aria_intelligence::ScheduledJobKind::Orchestrate);
+        assert_eq!(
+            scheduled.kind,
+            aria_intelligence::ScheduledJobKind::Orchestrate
+        );
 
         let jobs = RuntimeStore::for_sessions_dir(sessions.path())
             .list_watch_jobs()
@@ -12873,7 +13003,10 @@ exit 0
         let scheduled = job_rx.await.expect("scheduled job");
         assert_eq!(scheduled.id, watch_id);
         assert_eq!(scheduled.agent_id, "researcher");
-        assert_eq!(scheduled.kind, aria_intelligence::ScheduledJobKind::Orchestrate);
+        assert_eq!(
+            scheduled.kind,
+            aria_intelligence::ScheduledJobKind::Orchestrate
+        );
 
         let jobs = RuntimeStore::for_sessions_dir(sessions.path())
             .list_watch_jobs()
@@ -12966,7 +13099,8 @@ exit 0
                 1,
             )
             .expect("upsert watch job");
-        let original_limits = set_web_storage_policy_env(&[("ARIA_WATCH_MAX_JOBS_PER_DOMAIN", "1")]);
+        let original_limits =
+            set_web_storage_policy_env(&[("ARIA_WATCH_MAX_JOBS_PER_DOMAIN", "1")]);
         let (tx, _rx) = tokio::sync::mpsc::channel::<aria_intelligence::CronCommand>(1);
 
         let exec = NativeToolExecutor {
@@ -13064,7 +13198,7 @@ exit 0
                 invocation_id: None,
                 name: "list_watch_jobs".into(),
                 arguments: "{}".into(),
-})
+            })
             .await
             .expect("list_watch_jobs");
         let payload = result.as_provider_payload();
@@ -13130,13 +13264,19 @@ exit 0
             .list_browser_challenge_events(Some(session_id), Some("researcher"))
             .expect("list challenge events");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].challenge, aria_core::BrowserChallengeKind::BotDefense);
+        assert_eq!(
+            events[0].challenge,
+            aria_core::BrowserChallengeKind::BotDefense
+        );
 
         let audits = store
             .list_browser_action_audits(Some(session_id), Some("researcher"))
             .expect("list action audits");
         assert_eq!(audits.len(), 1);
-        assert_eq!(audits[0].action, aria_core::BrowserActionKind::ChallengeDetected);
+        assert_eq!(
+            audits[0].action,
+            aria_core::BrowserActionKind::ChallengeDetected
+        );
 
         let session = store
             .list_browser_sessions(Some(session_id), Some("researcher"))
@@ -13194,14 +13334,14 @@ exit 0
             invocation_id: None,
             name: "browser_session_pause".into(),
             arguments: r#"{"browser_session_id":"browser-session-1"}"#.into(),
-})
+        })
         .await
         .expect("pause session");
         exec.execute(&ToolCall {
             invocation_id: None,
             name: "browser_session_resume".into(),
             arguments: r#"{"browser_session_id":"browser-session-1"}"#.into(),
-})
+        })
         .await
         .expect("resume session");
 
@@ -13240,7 +13380,11 @@ exit 0
                     transport: aria_core::BrowserTransportKind::ManagedBrowser,
                     status: aria_core::BrowserSessionStatus::Launched,
                     pid: Some(999_999),
-                    profile_dir: sessions.path().join("profile").to_string_lossy().to_string(),
+                    profile_dir: sessions
+                        .path()
+                        .join("profile")
+                        .to_string_lossy()
+                        .to_string(),
                     start_url: Some("https://example.com".into()),
                     launch_command: vec!["/usr/bin/false".into()],
                     error: None,
@@ -13272,7 +13416,7 @@ exit 0
                 invocation_id: None,
                 name: "browser_session_cleanup".into(),
                 arguments: "{}".into(),
-})
+            })
             .await
             .expect("browser_session_cleanup");
         assert!(result.contains("Cleaned up 1 stale browser session"));
@@ -13345,7 +13489,7 @@ exit 0
                 invocation_id: None,
                 name: "browser_profile_use".into(),
                 arguments: r#"{"profile_id":"work-profile"}"#.into(),
-})
+            })
             .await
             .expect_err("profile outside allowlist should be denied");
         assert!(format!("{}", err).contains("not permitted"));
@@ -13409,7 +13553,7 @@ exit 0
                 invocation_id: None,
                 name: "browser_profile_use".into(),
                 arguments: r#"{"profile_id":"attached-profile"}"#.into(),
-})
+            })
             .await
             .expect_err("attached profile should be denied");
         assert!(format!("{}", err).contains("transport"));
@@ -13444,8 +13588,7 @@ exit 0
             .expect("upsert profile");
         let mut profile = build_capability_profile("researcher", &["browser_profile_use"], false);
         profile.browser_profile_allowlist = vec!["extension-profile".into()];
-        profile.web_transport_allowlist =
-            vec![aria_core::BrowserTransportKind::ExtensionBrowser];
+        profile.web_transport_allowlist = vec![aria_core::BrowserTransportKind::ExtensionBrowser];
         let session_id = *uuid::Uuid::new_v4().as_bytes();
         let exec = PolicyCheckedExecutor::new(
             TestOkExecutor,
@@ -13463,7 +13606,7 @@ exit 0
             invocation_id: None,
             name: "browser_profile_use".into(),
             arguments: r#"{"profile_id":"extension-profile"}"#.into(),
-})
+        })
         .await
         .expect("extension profile should be allowed");
     }
@@ -13519,7 +13662,7 @@ exit 0
                 invocation_id: None,
                 name: "browser_profile_use".into(),
                 arguments: r#"{"profile_id":"work-profile"}"#.into(),
-})
+            })
             .await
             .expect_err("cedar should deny browser profile");
         assert!(format!("{}", err).contains("policy denied"));
@@ -13676,7 +13819,10 @@ exit 0
             "123".into(),
             payload,
         );
-        assert!(matches!(telegram_envelope.content, MessageContent::Image { .. }));
+        assert!(matches!(
+            telegram_envelope.content,
+            MessageContent::Image { .. }
+        ));
     }
 
     #[test]
@@ -13828,7 +13974,7 @@ exit 0
             runtime,
         };
         let summary = render_doctor_summary(&cfg);
-        assert!(summary.contains("RoboClaw doctor"));
+        assert!(summary.contains("HiveClaw doctor"));
         assert!(summary.contains("runtime_status:"));
         assert!(summary.contains("configured_channels:"));
         assert!(summary.contains("stt_effective_mode:"));
@@ -14461,7 +14607,10 @@ exit 0
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0]["relative_path"], "instructions.md");
         assert_eq!(docs[0]["kind"], "instructions");
-        assert_eq!(json["workspace_root"], workspace.path().to_string_lossy().to_string());
+        assert_eq!(
+            json["workspace_root"],
+            workspace.path().to_string_lossy().to_string()
+        );
         assert_eq!(json["conflicts"].as_array().expect("conflicts").len(), 0);
     }
 
@@ -14656,8 +14805,9 @@ exit 0
             .expect("inspect durable dlq");
         let records = dlq.as_array().expect("dlq array");
         assert_eq!(records.len(), 1);
-        let replayed = replay_durable_dlq_json(sessions.path(), records[0]["dlq_id"].as_str().unwrap())
-            .expect("replay dlq");
+        let replayed =
+            replay_durable_dlq_json(sessions.path(), records[0]["dlq_id"].as_str().unwrap())
+                .expect("replay dlq");
         assert_eq!(replayed["status"], "pending");
     }
 
@@ -14967,23 +15117,18 @@ exit 0
             json["rule"],
             "Use MCP for leaf external integrations. Keep trust-boundary subsystems native/internal."
         );
-        assert!(
-            json["native_internal"]
-                .as_array()
-                .expect("native_internal array")
-                .iter()
-                .any(|rule| {
-                    rule["target"] == "browser_runtime"
-                        && rule["classification"] == "native_internal"
-                })
-        );
-        assert!(
-            json["leaf_external"]
-                .as_array()
-                .expect("leaf_external array")
-                .iter()
-                .any(|rule| rule["target"] == "github" && rule["classification"] == "leaf_external")
-        );
+        assert!(json["native_internal"]
+            .as_array()
+            .expect("native_internal array")
+            .iter()
+            .any(|rule| {
+                rule["target"] == "browser_runtime" && rule["classification"] == "native_internal"
+            }));
+        assert!(json["leaf_external"]
+            .as_array()
+            .expect("leaf_external array")
+            .iter()
+            .any(|rule| rule["target"] == "github" && rule["classification"] == "leaf_external"));
     }
 
     #[test]
@@ -15033,8 +15178,8 @@ exit 0
             .expect("inspect derivatives");
         assert_eq!(derivatives[0]["notes"], "synthesized prompt");
 
-        let traces = inspect_learning_traces_json(sessions.path(), "sess-1")
-            .expect("inspect traces");
+        let traces =
+            inspect_learning_traces_json(sessions.path(), "sess-1").expect("inspect traces");
         assert_eq!(traces.as_array().expect("traces array").len(), 1);
         assert_eq!(
             traces[0]["tool_runtime_policy"]["tool_choice"]["specific"],
@@ -15131,8 +15276,9 @@ exit 0
             })
             .expect("append shell audit");
 
-        let json = inspect_shell_exec_audits_json(sessions.path(), Some("sess-1"), Some("developer"))
-            .expect("inspect shell audits");
+        let json =
+            inspect_shell_exec_audits_json(sessions.path(), Some("sess-1"), Some("developer"))
+                .expect("inspect shell audits");
         let audits = json.as_array().expect("audits array");
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0]["command"], "echo hello");
@@ -15164,7 +15310,10 @@ exit 0
         let audits = json.as_array().expect("audits array");
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0]["request_id"], "req-1");
-        assert_eq!(audits[0]["tool_runtime_policy"]["tool_choice"]["specific"], "read_file");
+        assert_eq!(
+            audits[0]["tool_runtime_policy"]["tool_choice"]["specific"],
+            "read_file"
+        );
     }
 
     #[test]
@@ -15198,7 +15347,10 @@ exit 0
         let approvals = json.as_array().expect("approvals array");
         assert_eq!(approvals.len(), 1);
         assert_eq!(approvals[0]["record"]["tool_name"], "browser_download");
-        assert_eq!(approvals[0]["display"]["risk_summary"], "medium: artifact persistence and content ingestion");
+        assert_eq!(
+            approvals[0]["display"]["risk_summary"],
+            "medium: artifact persistence and content ingestion"
+        );
     }
 
     #[test]
@@ -15222,9 +15374,8 @@ exit 0
             pending_prompt: "pending".into(),
         };
 
-        let (record, text) =
-            persist_pending_approval_for_result(sessions.path(), &req, &result)
-                .expect("persist approval");
+        let (record, text) = persist_pending_approval_for_result(sessions.path(), &req, &result)
+            .expect("persist approval");
         assert_eq!(record.tool_name, "browser_download");
         assert!(text.contains("download remote content"));
         assert!(text.contains("Stored pending approval"));
@@ -15260,7 +15411,8 @@ exit 0
             )
             .expect("upsert browser profile");
 
-        let json = inspect_browser_profiles_json(sessions.path()).expect("inspect browser profiles");
+        let json =
+            inspect_browser_profiles_json(sessions.path()).expect("inspect browser profiles");
         let profiles = json.as_array().expect("profiles array");
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0]["profile_id"], "work-profile");
@@ -15390,8 +15542,8 @@ exit 0
             )
             .expect("upsert watch job");
 
-        let json =
-            inspect_watch_jobs_json(sessions.path(), Some("researcher")).expect("inspect watch jobs");
+        let json = inspect_watch_jobs_json(sessions.path(), Some("researcher"))
+            .expect("inspect watch jobs");
         let jobs = json.as_array().expect("jobs array");
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0]["watch_id"], "watch-1");
@@ -15402,7 +15554,10 @@ exit 0
     fn inspect_web_storage_policy_json_returns_stable_shape() {
         let _guard = browser_env_test_guard();
         let sessions = tempfile::tempdir().expect("sessions");
-        let artifact_dir = sessions.path().join("browser_artifacts").join("browser-session-1");
+        let artifact_dir = sessions
+            .path()
+            .join("browser_artifacts")
+            .join("browser-session-1");
         std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
         let artifact_path = artifact_dir.join("artifact-1.json");
         std::fs::write(&artifact_path, br#"{"url":"https://github.com"}"#).expect("write artifact");
@@ -15446,11 +15601,15 @@ exit 0
             perms.set_mode(0o755);
             std::fs::set_permissions(&bridge, perms).expect("chmod");
         }
-        let (original_bridge, original_allowlist, original_containment) = set_test_browser_bridge_env(&bridge);
+        let (original_bridge, original_allowlist, original_containment) =
+            set_test_browser_bridge_env(&bridge);
 
         let json = inspect_browser_bridge_json().expect("inspect browser bridge");
         assert_eq!(json["required_protocol_version"], 1);
-        assert!(json["binary"].as_str().expect("binary").ends_with("-wrapper.sh"));
+        assert!(json["binary"]
+            .as_str()
+            .expect("binary")
+            .ends_with("-wrapper.sh"));
         assert_eq!(json["manifest"]["protocol_version"], 1);
         assert_eq!(json["manifest"]["supported_modes"][0], "argv_json");
         assert_eq!(json["os_containment_requested"], false);
@@ -15562,7 +15721,11 @@ exit 0
                     transport: aria_core::BrowserTransportKind::ManagedBrowser,
                     status: aria_core::BrowserSessionStatus::Launched,
                     pid: Some(999_999),
-                    profile_dir: sessions.path().join("profile").to_string_lossy().to_string(),
+                    profile_dir: sessions
+                        .path()
+                        .join("profile")
+                        .to_string_lossy()
+                        .to_string(),
                     start_url: Some("https://example.com".into()),
                     launch_command: vec!["/usr/bin/false".into()],
                     error: None,
@@ -15647,7 +15810,10 @@ exit 0
         .expect("inspect browser sessions");
         let browser_sessions = json.as_array().expect("browser sessions array");
         assert_eq!(browser_sessions.len(), 1);
-        assert_eq!(browser_sessions[0]["browser_session_id"], "browser-session-1");
+        assert_eq!(
+            browser_sessions[0]["browser_session_id"],
+            "browser-session-1"
+        );
         assert_eq!(browser_sessions[0]["status"], "launched");
     }
 
@@ -15827,9 +15993,18 @@ exit 0
         assert_eq!(json["session_id"], "sess-1");
         assert_eq!(json["request_count"], 1);
         assert_eq!(json["requests"][0]["request_id"], "req-1");
-        assert_eq!(json["requests"][0]["events"].as_array().expect("events").len(), 3);
+        assert_eq!(
+            json["requests"][0]["events"]
+                .as_array()
+                .expect("events")
+                .len(),
+            3
+        );
         assert_eq!(json["requests"][0]["phases"][0]["phase"], "follow_up");
-        assert_eq!(json["requests"][0]["phases"][0]["latest_mode"], "fallback_used");
+        assert_eq!(
+            json["requests"][0]["phases"][0]["latest_mode"],
+            "fallback_used"
+        );
         assert_eq!(json["requests"][0]["phases"][0]["fell_back"], true);
     }
 
@@ -15838,9 +16013,27 @@ exit 0
         let sessions = tempfile::tempdir().expect("sessions");
         let store = RuntimeStore::for_sessions_dir(sessions.path());
         for (audit_id, request_id, mode, model_ref, created_at_us) in [
-            ("stream-1", "req-1", "stream_used", Some("openai/gpt-4o-mini"), 1_u64),
-            ("stream-2", "req-2", "fallback_used", Some("openai/gpt-4o-mini"), 2_u64),
-            ("stream-3", "req-3", "stream_used", Some("anthropic/claude-3-7-sonnet"), 3_u64),
+            (
+                "stream-1",
+                "req-1",
+                "stream_used",
+                Some("openai/gpt-4o-mini"),
+                1_u64,
+            ),
+            (
+                "stream-2",
+                "req-2",
+                "fallback_used",
+                Some("openai/gpt-4o-mini"),
+                2_u64,
+            ),
+            (
+                "stream-3",
+                "req-3",
+                "stream_used",
+                Some("anthropic/claude-3-7-sonnet"),
+                3_u64,
+            ),
         ] {
             store
                 .append_streaming_decision_audit(&StreamingDecisionAuditRecord {
@@ -16040,15 +16233,24 @@ exit 0
         assert_eq!(json["runs"].as_array().expect("runs").len(), 1);
         assert_eq!(json["learning_traces"].as_array().expect("traces").len(), 1);
         assert_eq!(
-            json["request_policy_audits"].as_array().expect("reqpol").len(),
+            json["request_policy_audits"]
+                .as_array()
+                .expect("reqpol")
+                .len(),
             1
         );
         assert_eq!(
-            json["pending_approvals"].as_array().expect("approvals").len(),
+            json["pending_approvals"]
+                .as_array()
+                .expect("approvals")
+                .len(),
             0
         );
         assert_eq!(
-            json["repair_fallback_audits"].as_array().expect("repair").len(),
+            json["repair_fallback_audits"]
+                .as_array()
+                .expect("repair")
+                .len(),
             1
         );
         assert_eq!(
@@ -16060,9 +16262,18 @@ exit 0
         );
         assert_eq!(json["streaming_activity"]["request_count"], 1);
         assert_eq!(json["scope_denials"].as_array().expect("denials").len(), 1);
-        assert_eq!(json["shell_exec_audits"].as_array().expect("shell").len(), 1);
+        assert_eq!(
+            json["shell_exec_audits"].as_array().expect("shell").len(),
+            1
+        );
         assert_eq!(json["compaction_state"]["status"], "succeeded");
-        assert_eq!(json["retrieval_traces"].as_array().expect("retrieval").len(), 1);
+        assert_eq!(
+            json["retrieval_traces"]
+                .as_array()
+                .expect("retrieval")
+                .len(),
+            1
+        );
         assert!(json["web_storage"].is_object());
         assert!(json["browser_runtime_health"].is_object());
     }
@@ -16133,8 +16344,8 @@ exit 0
             })
             .expect("probe");
 
-        let providers =
-            inspect_provider_capabilities_json(sessions.path()).expect("inspect provider capabilities");
+        let providers = inspect_provider_capabilities_json(sessions.path())
+            .expect("inspect provider capabilities");
         assert_eq!(providers[0]["provider_id"], "openrouter");
 
         let models = inspect_model_capabilities_json(sessions.path(), "openrouter", None)
@@ -16256,7 +16467,10 @@ exit 0
         assert_eq!(summary["effective_source"], "local_override");
         assert_eq!(summary["override_defined"], true);
         assert_eq!(summary["latest_probe"]["probe_method"], "catalog_lookup");
-        assert_eq!(summary["effective_profile"]["adapter_family"], "text_only_cli");
+        assert_eq!(
+            summary["effective_profile"]["adapter_family"],
+            "text_only_cli"
+        );
     }
 
     #[test]
@@ -16365,8 +16579,12 @@ exit 0
         .expect("inspect command")
         .expect("json payload");
         let channels = json["channels"].as_array().expect("channels array");
-        assert!(channels.iter().any(|entry| entry["channel"] == "telegram" && entry["transport"] == "polling"));
-        assert!(channels.iter().any(|entry| entry["channel"] == "websocket" && entry["transport"] == "websocket"));
+        assert!(channels
+            .iter()
+            .any(|entry| entry["channel"] == "telegram" && entry["transport"] == "polling"));
+        assert!(channels
+            .iter()
+            .any(|entry| entry["channel"] == "websocket" && entry["transport"] == "websocket"));
     }
 
     #[tokio::test]
@@ -16378,19 +16596,20 @@ exit 0
         let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
         let tx_for_task = Arc::clone(&tx);
         let shutdown = Arc::new(ShutdownCoordinator::new());
-        let handle = spawn_supervised_adapter("test", GatewayChannel::WebSocket, shutdown, move || {
-            let attempts = Arc::clone(&attempts_for_task);
-            let tx = Arc::clone(&tx_for_task);
-            async move {
-                let current = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if current == 0 {
-                    panic!("boom");
+        let handle =
+            spawn_supervised_adapter("test", GatewayChannel::WebSocket, shutdown, move || {
+                let attempts = Arc::clone(&attempts_for_task);
+                let tx = Arc::clone(&tx_for_task);
+                async move {
+                    let current = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if current == 0 {
+                        panic!("boom");
+                    }
+                    if let Some(sender) = tx.lock().expect("tx lock").take() {
+                        let _ = sender.send(());
+                    }
                 }
-                if let Some(sender) = tx.lock().expect("tx lock").take() {
-                    let _ = sender.send(());
-                }
-            }
-        });
+            });
         tokio::time::timeout(std::time::Duration::from_secs(5), rx)
             .await
             .expect("supervisor should restart")
@@ -16601,11 +16820,12 @@ exit 0
             .expect("bind whatsapp mock server");
         let addr = listener.local_addr().expect("local addr");
         let server_handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve whatsapp mock");
+            axum::serve(listener, app)
+                .await
+                .expect("serve whatsapp mock");
         });
 
-        config_file.gateway.whatsapp_outbound_url =
-            Some(format!("http://{}/whatsapp", addr));
+        config_file.gateway.whatsapp_outbound_url = Some(format!("http://{}/whatsapp", addr));
         let config_dir = tempfile::tempdir().expect("config dir");
         let config = ResolvedAppConfig {
             path: config_dir.path().join("config.toml"),
@@ -16780,13 +17000,11 @@ exit 0
             json["rule"],
             "Use MCP for leaf external integrations. Keep trust-boundary subsystems native/internal."
         );
-        assert!(
-            json["native_internal"]
-                .as_array()
-                .expect("native_internal array")
-                .iter()
-                .any(|rule| rule["target"] == "scheduler_core")
-        );
+        assert!(json["native_internal"]
+            .as_array()
+            .expect("native_internal array")
+            .iter()
+            .any(|rule| rule["target"] == "scheduler_core"));
     }
 
     #[test]
@@ -16833,7 +17051,10 @@ exit 0
         .expect("json");
         assert_eq!(json.as_array().expect("trace array").len(), 1);
         assert_eq!(json[0]["tool_runtime_policy"]["tool_choice"], "required");
-        assert_eq!(json[0]["tool_runtime_policy"]["allow_parallel_tool_calls"], false);
+        assert_eq!(
+            json[0]["tool_runtime_policy"]["allow_parallel_tool_calls"],
+            false
+        );
     }
 
     #[tokio::test]
@@ -17070,7 +17291,10 @@ exit 0
         .expect("json");
         assert_eq!(json["session_id"], session_id_str);
         assert_eq!(json["runs"].as_array().expect("runs").len(), 1);
-        assert!(json["learning_traces"].as_array().expect("traces").is_empty());
+        assert!(json["learning_traces"]
+            .as_array()
+            .expect("traces")
+            .is_empty());
     }
 
     #[test]
@@ -17252,12 +17476,10 @@ exit 0
 
         let mut config = base_test_config();
         config.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
-        let json = run_admin_inspect_command(
-            &config,
-            &["aria-x".into(), "--inspect-crawl-jobs".into()],
-        )
-        .expect("inspect command")
-        .expect("json");
+        let json =
+            run_admin_inspect_command(&config, &["aria-x".into(), "--inspect-crawl-jobs".into()])
+                .expect("inspect command")
+                .expect("json");
 
         assert_eq!(json[0]["crawl_id"], "crawl-1");
         assert_eq!(json[0]["scope"], "same_origin");
@@ -17351,7 +17573,10 @@ exit 0
     fn admin_inspect_command_reads_web_storage_policy() {
         let _guard = browser_env_test_guard();
         let sessions = tempfile::tempdir().expect("sessions");
-        let artifact_dir = sessions.path().join("browser_artifacts").join("browser-session-1");
+        let artifact_dir = sessions
+            .path()
+            .join("browser_artifacts")
+            .join("browser-session-1");
         std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
         let artifact_path = artifact_dir.join("artifact-1.json");
         std::fs::write(&artifact_path, br#"{"url":"https://github.com"}"#).expect("write artifact");
@@ -17396,7 +17621,8 @@ exit 0
             perms.set_mode(0o755);
             std::fs::set_permissions(&bridge, perms).expect("chmod");
         }
-        let (original_bridge, original_allowlist, original_containment) = set_test_browser_bridge_env(&bridge);
+        let (original_bridge, original_allowlist, original_containment) =
+            set_test_browser_bridge_env(&bridge);
 
         let json = run_admin_inspect_command(
             &base_test_config(),
@@ -17774,7 +18000,8 @@ exit 0
         };
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "schedule_message".into(),
                 arguments: r#"{"task":"Random number: 42","agent_id":"omni"}"#.into(),
             })
@@ -17822,7 +18049,8 @@ exit 0
         };
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "schedule_message".into(),
                 arguments: r#"{"task":"Send contents of new_ok.js","mode":"notify"}"#.into(),
             })
@@ -17869,7 +18097,8 @@ exit 0
         };
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "schedule_message".into(),
                 arguments: r#"{"task":"Go to office","agent_id":"planner"}"#.into(),
             })
@@ -18170,7 +18399,8 @@ exit 0
         let path = dir.join("file.txt");
 
         let first = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "write_file".into(),
                 arguments: format!(
                     r#"{{"path":"{}","content":"first","idempotency_key":"same-key"}}"#,
@@ -18180,7 +18410,8 @@ exit 0
             .await
             .expect("first write");
         let second = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "write_file".into(),
                 arguments: format!(
                     r#"{{"path":"{}","content":"second","idempotency_key":"same-key"}}"#,
@@ -18238,10 +18469,11 @@ exit 0
         };
 
         let result = exec
-            .execute(&ToolCall { invocation_id: None,
+            .execute(&ToolCall {
+                invocation_id: None,
                 name: "manage_cron".into(),
                 arguments: r#"{"action":"list"}"#.into(),
-})
+            })
             .await
             .expect("list crons");
 
@@ -18328,10 +18560,7 @@ exit 0
             .expect("list browser profiles");
         let json = run_admin_inspect_command(
             &resolved,
-            &[
-                "aria-x".into(),
-                "--inspect-web-storage-policy".into(),
-            ],
+            &["aria-x".into(), "--inspect-web-storage-policy".into()],
         )
         .expect("inspect command")
         .expect("inspect payload");
@@ -18390,7 +18619,9 @@ exit 0
                         source: "registry".into(),
                     }],
                 }),
-                provider_request_payload: Some(serde_json::json!({"model":"gemini-3-flash-preview"})),
+                provider_request_payload: Some(
+                    serde_json::json!({"model":"gemini-3-flash-preview"}),
+                ),
                 selected_tool_catalog: Vec::new(),
                 hidden_tool_messages: Vec::new(),
                 emitted_artifacts: Vec::new(),
@@ -18403,8 +18634,8 @@ exit 0
                     channel: aria_core::GatewayChannel::Cli,
                     execution_contract: None,
                     retrieved_context: None,
-            working_set: None,
-            context_plan: None,
+                    working_set: None,
+                    context_plan: None,
                 },
                 rendered_prompt: "rendered".into(),
                 created_at_us: 1,
@@ -18485,8 +18716,8 @@ exit 0
                     channel: aria_core::GatewayChannel::Cli,
                     execution_contract: None,
                     retrieved_context: None,
-            working_set: None,
-            context_plan: None,
+                    working_set: None,
+                    context_plan: None,
                 },
                 rendered_prompt: "rendered".into(),
                 created_at_us: 1,
@@ -18568,8 +18799,8 @@ exit 0
                     channel: aria_core::GatewayChannel::Cli,
                     execution_contract: None,
                     retrieved_context: None,
-            working_set: None,
-            context_plan: None,
+                    working_set: None,
+                    context_plan: None,
                 },
                 rendered_prompt: "rendered".into(),
                 created_at_us: 1,
@@ -18947,7 +19178,10 @@ exit 0
 
         let mixed_policy =
             browser_read_retry_policy("Open https://example.com and take a screenshot.");
-        assert_eq!(mixed_policy.tool_choice, aria_core::ToolChoicePolicy::Required);
+        assert_eq!(
+            mixed_policy.tool_choice,
+            aria_core::ToolChoicePolicy::Required
+        );
         assert!(!mixed_policy.allow_parallel_tool_calls);
     }
 
@@ -19098,11 +19332,9 @@ exit 0
     #[test]
     fn heuristic_specific_tool_call_parses_set_reminder_requests() {
         let now = chrono::Utc::now().with_timezone(&chrono_tz::Asia::Kolkata);
-        let intent = classify_scheduling_intent(
-            "Set a reminder in 5 seconds to say SCHEDULE_OK",
-            now,
-        )
-        .expect("scheduling intent");
+        let intent =
+            classify_scheduling_intent("Set a reminder in 5 seconds to say SCHEDULE_OK", now)
+                .expect("scheduling intent");
         let call = heuristic_specific_tool_call(
             "Set a reminder in 5 seconds to say SCHEDULE_OK",
             "set_reminder",
@@ -19140,12 +19372,8 @@ exit 0
         assert_eq!(list.name, "list_agent_runs");
         assert_eq!(list.arguments, "{}");
 
-        let get = heuristic_specific_tool_call(
-            "get run run-123",
-            "get_agent_run",
-            None,
-        )
-        .expect("get run heuristic");
+        let get = heuristic_specific_tool_call("get run run-123", "get_agent_run", None)
+            .expect("get run heuristic");
         let get_args: serde_json::Value =
             serde_json::from_str(&get.arguments).expect("get run args");
         assert_eq!(get_args["run_id"], "run-123");
@@ -19370,10 +19598,8 @@ exit 0
 
     #[test]
     fn resolve_execution_contract_requires_file_artifact_for_file_write_requests() {
-        let contract = resolve_execution_contract(
-            "Save this yourself inside a hello1.js file",
-            None,
-        );
+        let contract =
+            resolve_execution_contract("Save this yourself inside a hello1.js file", None);
         assert_eq!(
             contract.kind,
             aria_core::ExecutionContractKind::ArtifactCreate
@@ -19382,23 +19608,17 @@ exit 0
             contract.required_artifact_kinds,
             vec![aria_core::ExecutionArtifactKind::File]
         );
-        assert!(
-            contract
-                .forbidden_completion_modes
-                .contains(&"plain_text_only".to_string())
-        );
+        assert!(contract
+            .forbidden_completion_modes
+            .contains(&"plain_text_only".to_string()));
     }
 
     #[test]
     fn execution_contract_requires_tool_capable_model_for_artifact_contracts() {
-        let schedule_contract = resolve_execution_contract(
-            "Set a reminder in 2 minutes to stretch",
-            None,
-        );
-        let file_contract = resolve_execution_contract(
-            "Create a hello.js file with console.log('hi')",
-            None,
-        );
+        let schedule_contract =
+            resolve_execution_contract("Set a reminder in 2 minutes to stretch", None);
+        let file_contract =
+            resolve_execution_contract("Create a hello.js file with console.log('hi')", None);
         let answer_contract = aria_core::ExecutionContract {
             kind: aria_core::ExecutionContractKind::AnswerOnly,
             allowed_tool_classes: Vec::new(),
@@ -19407,9 +19627,15 @@ exit 0
             fallback_mode: None,
             approval_required: false,
         };
-        assert!(execution_contract_requires_tool_capable_model(&schedule_contract));
-        assert!(execution_contract_requires_tool_capable_model(&file_contract));
-        assert!(!execution_contract_requires_tool_capable_model(&answer_contract));
+        assert!(execution_contract_requires_tool_capable_model(
+            &schedule_contract
+        ));
+        assert!(execution_contract_requires_tool_capable_model(
+            &file_contract
+        ));
+        assert!(!execution_contract_requires_tool_capable_model(
+            &answer_contract
+        ));
     }
 
     #[test]
@@ -19450,7 +19676,11 @@ exit 0
         assert!(record.arguments_json.contains("\"domain\":\"example.com\""));
         assert!(text.contains("Stored pending approval"));
         let approvals = RuntimeStore::for_sessions_dir(sessions.path())
-            .list_approvals(Some(req.session_id), Some("cli_user"), Some(aria_core::ApprovalStatus::Pending))
+            .list_approvals(
+                Some(req.session_id),
+                Some("cli_user"),
+                Some(aria_core::ApprovalStatus::Pending),
+            )
             .expect("list approvals");
         assert_eq!(approvals.len(), 1);
     }
@@ -19536,11 +19766,9 @@ exit 0
 
         assert!(rag.contains("Session Context:"));
         assert!(rag.contains("Martian"));
-        assert!(bundle
-            .blocks
-            .iter()
-            .any(|block| block.source_kind == aria_core::RetrievalSourceKind::SessionHistory
-                || block.source_kind == aria_core::RetrievalSourceKind::SessionMemory));
+        assert!(bundle.blocks.iter().any(|block| block.source_kind
+            == aria_core::RetrievalSourceKind::SessionHistory
+            || block.source_kind == aria_core::RetrievalSourceKind::SessionMemory));
         assert!(metrics.session_hits >= 1);
     }
 
@@ -19596,7 +19824,10 @@ exit 0
         let artifacts = infer_execution_artifacts(&[], "I will remind you in 2 minutes.");
         let err = validate_execution_contract(&contract, &artifacts)
             .expect_err("plain text should not satisfy scheduling contract");
-        assert_eq!(err, aria_core::ContractFailureReason::MissingRequiredArtifact);
+        assert_eq!(
+            err,
+            aria_core::ContractFailureReason::MissingRequiredArtifact
+        );
     }
 
     #[tokio::test]
@@ -19607,9 +19838,8 @@ exit 0
             .await
             .expect("first lock");
         let manager_clone = manager.clone();
-        let waiter = tokio::spawn(async move {
-            manager_clone.acquire("workspace:/shared", "run-b").await
-        });
+        let waiter =
+            tokio::spawn(async move { manager_clone.acquire("workspace:/shared", "run-b").await });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         let snapshot = manager.snapshot();
@@ -19717,7 +19947,10 @@ exit 0
         );
         pool.register_backend("primary", Box::new(ProviderFailingLLM));
         pool.register_backend("fallback", Box::new(OtherProviderSuccessLLM));
-        let _ = pool.query_with_fallback("hello", &[]).await.expect("fallback");
+        let _ = pool
+            .query_with_fallback("hello", &[])
+            .await
+            .expect("fallback");
 
         let json = inspect_provider_health_json(&pool).expect("provider health json");
         let entries = json.as_array().expect("array");

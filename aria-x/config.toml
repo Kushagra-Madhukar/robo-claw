@@ -1,4 +1,4 @@
-# RoboClaw Orchestrator Configuration
+# HiveClaw Orchestrator Configuration
 
 [vault]
 storage_path = "./vault.json"
@@ -23,8 +23,8 @@ adapter = "telegram"
 # Optional multi-adapter list; when present this overrides `adapter`.
 # adapters = ["cli", "telegram"]
 # Onboarding CLI examples:
-# cargo run -p roboclaw -- channels list
-# cargo run -p roboclaw -- channels add websocket
+# cargo run -p aria-x -- channels list
+# cargo run -p aria-x -- channels add websocket
 # Optional explicit cross-channel fanout:
 # [[gateway.fanout]]
 # source = "telegram"

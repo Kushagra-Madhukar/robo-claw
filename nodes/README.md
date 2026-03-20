@@ -1,6 +1,6 @@
-## RoboClaw Node Layout
+## HiveClaw Node Layout
 
-This folder contains example configurations for running RoboClaw in a multi-node
+This folder contains example configurations for running HiveClaw in a multi-node
 topology using the existing `aria-x` orchestrator binary.
 
 Each node is started by pointing `aria-x` at the appropriate config file:

@@ -1,4 +1,4 @@
-//! RoboClaw Orchestrator — the final binary that wires all crates together.
+//! HiveClaw Orchestrator — the final binary that wires all crates together.
 //!
 //! Reads TOML configuration, initializes all subsystems, and runs the
 //! ReAct agent loop with graceful SIGINT shutdown via a CLI gateway.

@@ -1,6 +1,6 @@
 # Architecture Reference Diagrams
 
-These diagrams describe the implemented RoboClaw architecture in this repository. They are reference views of the current system, not generic templates.
+These diagrams describe the implemented HiveClaw architecture in this repository. They are reference views of the current system, not generic templates.
 
 ## Contents
 
@@ -11,7 +11,7 @@ These diagrams describe the implemented RoboClaw architecture in this repository
 
 ## Scope
 
-- `roboclaw` gateway, runtime, scheduler, operator surfaces
+- `aria-x` gateway, runtime, scheduler, operator surfaces
 - `aria-intelligence` orchestration, contracts, providers, tool routing
 - `aria-ssmu` session memory, retrieval, dense and sparse search
 - `aria-skill-runtime`, `aria-mcp`, `aria-vault`, `aria-policy`, `aria-safety`

@@ -1,8 +1,8 @@
 [package]
-name = "roboclaw"
+name = "aria-x"
 version = "0.1.0"
 edition = "2021"
-description = "RoboClaw orchestrator binary — wires all crates into the final agent runtime"
+description = "HiveClaw orchestrator binary — wires all crates into the final agent runtime"
 
 [features]
 default = ["standard-runtime"]
@@ -12,7 +12,7 @@ mcp-runtime = ["dep:aria-mcp"]
 speech-runtime = []
 
 [[bin]]
-name = "roboclaw"
+name = "aria-x"
 path = "src/main.rs"
 
 [dependencies]

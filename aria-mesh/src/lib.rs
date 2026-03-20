@@ -1,9 +1,9 @@
 //! # aria-mesh
 //!
-//! L4 Mesh Transport layer for RoboClaw.
+//! L4 Mesh Transport layer for HiveClaw.
 //!
 //! Provides [`ZenohRouter`] — a Zenoh-based pub/sub wrapper implementing
-//! the RoboClaw topic hierarchy:
+//! the HiveClaw topic hierarchy:
 //!
 //! | Pattern | Direction | Purpose |
 //! |---------|-----------|---------|
@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 // Topic schema
 // ---------------------------------------------------------------------------
 
-/// Canonical RoboClaw Zenoh topic schema.
+/// Canonical HiveClaw Zenoh topic schema.
 ///
 /// All mesh communication must use these helpers rather than hand-rolled
 /// strings to ensure strict ACL enforcement and monitoring.
@@ -230,10 +230,10 @@ impl Default for MeshConfig {
     }
 }
 
-/// Zenoh-based pub/sub router for the RoboClaw L4 mesh transport layer.
+/// Zenoh-based pub/sub router for the HiveClaw L4 mesh transport layer.
 ///
 /// Wraps a [`zenoh::Session`] and provides topic-aware publish/subscribe
-/// methods following the RoboClaw key hierarchy.
+/// methods following the HiveClaw key hierarchy.
 pub struct ZenohRouter {
     config: MeshConfig,
     session: Arc<zenoh::Session>,

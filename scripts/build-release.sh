@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build RoboClaw production release bundle
+# Build HiveClaw production release bundle
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,7 +29,7 @@ mkdir -p "$OUT_DIR/$BUNDLE_NAME/workspace/sessions"
 
 # Create config.toml and config.production.toml (both use bundle-relative paths)
 cat > "$OUT_DIR/$BUNDLE_NAME/config.toml" << 'EOF'
-# RoboClaw Production Configuration
+# HiveClaw Production Configuration
 # Copy to config.toml and customize
 
 [llm]
