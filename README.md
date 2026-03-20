@@ -1,3 +1,9 @@
+<div align="center">
+
+<img src="docs/HiveClawTransparent.png" alt="HiveClaw logo" width="220" />
+
+</div>
+
 # HiveClaw
 
 ![Rust](https://img.shields.io/badge/Rust-Workspace-000000?logo=rust)
