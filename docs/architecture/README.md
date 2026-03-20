@@ -1,3 +1,9 @@
+<div align="center">
+
+<img src="../HiveClawFavicon.png" alt="HiveClaw logo" width="120" />
+
+</div>
+
 # Architecture Reference Diagrams
 
 These diagrams describe the implemented HiveClaw architecture in this repository. They are reference views of the current system, not generic templates.

@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/HiveClawTransparent.png" alt="HiveClaw logo" width="220" />
+<img src="docs/HiveClawFavicon.png" alt="HiveClaw logo" width="180" />
 
 </div>
 
