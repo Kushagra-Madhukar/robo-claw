@@ -1,0 +1,6 @@
+[[scenarios]]
+id = "repo-health-compare"
+task_fingerprint = "v1|agent=developer|mode=execution|text=summarize-repo-health|tools=search_web"
+min_samples_per_provider = 1
+required_providers = ["openrouter", "gemini"]
+require_fallback_visibility = false

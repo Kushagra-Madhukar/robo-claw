@@ -2,6 +2,7 @@ use super::*;
 
 /// Deterministic runtime mode for robotics execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RoboticsExecutionMode {
     Simulation,
     Hardware,
@@ -10,6 +11,7 @@ pub enum RoboticsExecutionMode {
 
 /// High-level robotics intent type emitted by planning layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RoboticsIntentKind {
     Halt,
     InspectActuator,
@@ -55,10 +57,93 @@ pub struct RoboticsSafetyEnvelope {
     pub allow_capture: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ros2BridgeProfile {
+    pub profile_id: String,
+    pub display_name: String,
+    pub namespace: String,
+    pub command_topic: String,
+    pub telemetry_topic: String,
+    #[serde(default)]
+    pub image_topic: Option<String>,
+    #[serde(default)]
+    pub service_prefix: Option<String>,
+    #[serde(default)]
+    pub requires_approval: bool,
+    #[serde(default)]
+    pub simulation_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ros2BridgeTarget {
+    pub profile_id: String,
+    pub robot_id: String,
+    #[serde(default)]
+    pub namespace_override: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Ros2BridgeDirective {
+    pub target: Ros2BridgeTarget,
+    pub command_topic: String,
+    pub telemetry_topic: String,
+    #[serde(default)]
+    pub image_topic: Option<String>,
+    #[serde(default)]
+    pub service_prefix: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RobotRuntimeRecord {
+    pub robot_id: String,
+    pub state: RobotStateSnapshot,
+    pub safety_envelope: RoboticsSafetyEnvelope,
+    pub execution_mode: RoboticsExecutionMode,
+    pub connection_kind: String,
+    #[serde(default)]
+    pub bridge_profile_id: Option<String>,
+    pub updated_at_us: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoboticsSimulationOutcome {
+    Simulated,
+    ApprovalRequired,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoboticsSimulationRecord {
+    pub simulation_id: String,
+    pub session_id: Option<Uuid>,
+    pub agent_id: String,
+    pub robot_id: String,
+    pub contract: RoboticsCommandContract,
+    pub state: RobotStateSnapshot,
+    pub safety_envelope: RoboticsSafetyEnvelope,
+    pub outcome: RoboticsSimulationOutcome,
+    #[serde(default)]
+    pub safety_events: Vec<RoboticsSafetyEvent>,
+    #[serde(default)]
+    pub ros2_profile_id: Option<String>,
+    #[serde(default)]
+    pub directive_json: Option<serde_json::Value>,
+    #[serde(default)]
+    pub rejection_reason: Option<String>,
+    pub created_at_us: u64,
+}
+
 /// Safety events that may be emitted over the robotics control plane.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RoboticsSafetyEvent {
     ConstraintViolation(ConstraintViolation),
+    ApprovalRequired {
+        robot_id: String,
+        reason: String,
+        timestamp_us: u64,
+    },
     DegradedLocalModeEntered {
         robot_id: String,
         reason: String,

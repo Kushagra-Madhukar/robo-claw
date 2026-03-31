@@ -87,6 +87,39 @@ impl RuntimeStore {
         Ok(out)
     }
 
+    pub fn list_skill_bindings_for_skill(
+        &self,
+        skill_id: &str,
+    ) -> Result<Vec<SkillBinding>, String> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM skill_bindings WHERE skill_id=?1 ORDER BY created_at_us ASC",
+            )
+            .map_err(|e| format!("prepare list skill bindings by skill failed: {}", e))?;
+        let rows = stmt
+            .query_map(params![skill_id], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("query skill bindings by skill failed: {}", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let payload = row.map_err(|e| format!("read skill binding row failed: {}", e))?;
+            out.push(
+                serde_json::from_str(&payload)
+                    .map_err(|e| format!("parse skill binding failed: {}", e))?,
+            );
+        }
+        Ok(out)
+    }
+
+    pub fn delete_skill_binding(&self, agent_id: &str, skill_id: &str) -> Result<usize, String> {
+        let conn = self.connect()?;
+        conn.execute(
+            "DELETE FROM skill_bindings WHERE agent_id=?1 AND skill_id=?2",
+            params![agent_id, skill_id],
+        )
+        .map_err(|e| format!("delete skill binding failed: {}", e))
+    }
+
     pub fn append_skill_activation(
         &self,
         activation: &SkillActivationRecord,
@@ -122,6 +155,30 @@ impl RuntimeStore {
         let rows = stmt
             .query_map(params![agent_id], |row| row.get::<_, String>(0))
             .map_err(|e| format!("query skill activations failed: {}", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let payload = row.map_err(|e| format!("read skill activation row failed: {}", e))?;
+            out.push(
+                serde_json::from_str(&payload)
+                    .map_err(|e| format!("parse skill activation failed: {}", e))?,
+            );
+        }
+        Ok(out)
+    }
+
+    pub fn list_skill_activations_for_skill(
+        &self,
+        skill_id: &str,
+    ) -> Result<Vec<SkillActivationRecord>, String> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM skill_activations WHERE skill_id=?1 ORDER BY created_at_us ASC",
+            )
+            .map_err(|e| format!("prepare list skill activations by skill failed: {}", e))?;
+        let rows = stmt
+            .query_map(params![skill_id], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("query skill activations by skill failed: {}", e))?;
         let mut out = Vec::new();
         for row in rows {
             let payload = row.map_err(|e| format!("read skill activation row failed: {}", e))?;
@@ -202,4 +259,5 @@ impl RuntimeStore {
         }
         Ok(out)
     }
+
 }

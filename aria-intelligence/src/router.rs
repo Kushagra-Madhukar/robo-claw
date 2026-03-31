@@ -246,6 +246,10 @@ pub struct AgentConfig {
     #[serde(default)]
     pub browser_action_scope: Option<aria_core::BrowserActionScope>,
     #[serde(default)]
+    pub computer_profile_allowlist: Vec<String>,
+    #[serde(default)]
+    pub computer_action_scope: Option<aria_core::ComputerActionScope>,
+    #[serde(default)]
     pub browser_session_scope: Option<aria_core::BrowserSessionScope>,
     #[serde(default)]
     pub crawl_scope: Option<aria_core::CrawlScope>,

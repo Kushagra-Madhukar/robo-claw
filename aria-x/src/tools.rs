@@ -106,6 +106,10 @@ struct WriteFileRequest {
 struct RunShellRequest {
     command: String,
     #[serde(default)]
+    backend_id: Option<String>,
+    #[serde(default)]
+    docker_image: Option<String>,
+    #[serde(default)]
     timeout_seconds: Option<u64>,
     #[serde(default)]
     max_output_bytes: Option<u64>,
@@ -115,6 +119,8 @@ struct RunShellRequest {
     memory_kb: Option<u64>,
     #[serde(default)]
     os_containment: Option<bool>,
+    #[serde(default)]
+    allow_network_egress: Option<bool>,
     #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
@@ -144,6 +150,12 @@ struct ScheduleMessageRequest {
 #[derive(Debug, Clone, serde::Deserialize)]
 struct RunIdRequest {
     run_id: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct TakeoverRunRequest {
+    run_id: String,
+    agent_id: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -631,6 +643,14 @@ struct BrowserDownloadRequest {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+struct ComputerSessionStartRequest {
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    target_window_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 struct CrawlRequest {
     url: String,
     #[serde(default)]
@@ -983,11 +1003,40 @@ impl ToolExecutor for NativeToolExecutor {
                     .unwrap_or(262_144)
                     .clamp(32_768, 1_048_576);
                 let os_containment = request.os_containment.unwrap_or(false);
+                let allow_network_egress = request.allow_network_egress.unwrap_or(false);
                 let cwd = request.cwd.as_deref();
-                let containment_backend = if os_containment {
-                    Some(shell_containment_backend_name().to_string())
-                } else {
-                    None
+                let backend_profiles = self
+                    .sessions_dir
+                    .as_deref()
+                    .map(ensure_default_execution_backend_profiles)
+                    .transpose()
+                    .map_err(OrchestratorError::ToolError)?
+                    .unwrap_or_else(default_execution_backend_profiles);
+                let selected_backend = select_execution_backend(
+                    &ExecutionBackendRequest {
+                        requested_backend_id: request.backend_id.clone(),
+                        contract_kind: None,
+                        required_artifact_kinds: vec![],
+                        needs_workspace_mount: cwd.is_some(),
+                        needs_browser: false,
+                        needs_desktop: false,
+                        requires_network_egress: allow_network_egress,
+                    },
+                    &backend_profiles,
+                )
+                .map_err(OrchestratorError::ToolError)?;
+                let execution_backend_id = Some(selected_backend.backend_id.clone());
+                let containment_backend = match selected_backend.kind {
+                    aria_core::ExecutionBackendKind::Local => {
+                        if os_containment {
+                            Some(shell_containment_backend_name().to_string())
+                        } else {
+                            None
+                        }
+                    }
+                    aria_core::ExecutionBackendKind::Docker => Some("docker".into()),
+                    aria_core::ExecutionBackendKind::Ssh => Some("ssh".into()),
+                    aria_core::ExecutionBackendKind::ManagedVm => Some("managed_vm".into()),
                 };
                 let started_at = std::time::Instant::now();
                 let created_at_us = chrono::Utc::now().timestamp_micros() as u64;
@@ -998,41 +1047,120 @@ impl ToolExecutor for NativeToolExecutor {
                 );
                 #[cfg(not(unix))]
                 let wrapped_command = command.to_string();
-                let mut cmd = if os_containment {
-                    match build_os_contained_shell_command(&wrapped_command, cwd) {
-                        Ok(cmd) => cmd,
-                        Err(err) => {
-                            self.append_shell_exec_audit(ShellExecutionAuditRecord {
-                                audit_id: format!("shell-{}", uuid::Uuid::new_v4()),
-                                session_id: self
-                                    .session_id
-                                    .map(uuid::Uuid::from_bytes)
-                                    .map(|id| id.to_string()),
-                                agent_id: self.invoking_agent_id.clone(),
-                                command: command.to_string(),
-                                cwd: cwd.map(|value| value.to_string()),
-                                os_containment_requested: os_containment,
-                                containment_backend,
-                                timeout_seconds,
-                                cpu_seconds,
-                                memory_kb,
-                                exit_code: None,
-                                timed_out: false,
-                                output_truncated: false,
-                                error: Some(format!("{}", err)),
-                                duration_ms: started_at.elapsed().as_millis() as u64,
-                                created_at_us,
-                            });
-                            return Err(err);
+                let mut cmd = match selected_backend.kind {
+                    aria_core::ExecutionBackendKind::Local if os_containment => {
+                        match build_os_contained_shell_command(&wrapped_command, cwd) {
+                            Ok(cmd) => cmd,
+                            Err(err) => {
+                                self.append_shell_exec_audit(ShellExecutionAuditRecord {
+                                    audit_id: format!("shell-{}", uuid::Uuid::new_v4()),
+                                    session_id: self
+                                        .session_id
+                                        .map(uuid::Uuid::from_bytes)
+                                        .map(|id| id.to_string()),
+                                    agent_id: self.invoking_agent_id.clone(),
+                                    execution_backend_id: execution_backend_id.clone(),
+                                    command: command.to_string(),
+                                    cwd: cwd.map(|value| value.to_string()),
+                                    os_containment_requested: os_containment,
+                                    containment_backend,
+                                    timeout_seconds,
+                                    cpu_seconds,
+                                    memory_kb,
+                                    exit_code: None,
+                                    timed_out: false,
+                                    output_truncated: false,
+                                    error: Some(format!("{}", err)),
+                                    duration_ms: started_at.elapsed().as_millis() as u64,
+                                    created_at_us,
+                                });
+                                return Err(err);
+                            }
                         }
                     }
-                } else {
-                    let mut cmd = tokio::process::Command::new("sh");
-                    cmd.arg("-c").arg(wrapped_command);
-                    if let Some(cwd) = cwd {
-                        cmd.current_dir(cwd);
+                    aria_core::ExecutionBackendKind::Local => {
+                        let mut cmd = tokio::process::Command::new("sh");
+                        cmd.arg("-c").arg(wrapped_command);
+                        if let Some(cwd) = cwd {
+                            cmd.current_dir(cwd);
+                        }
+                        cmd
                     }
-                    cmd
+                    aria_core::ExecutionBackendKind::Docker => {
+                        match build_docker_shell_command(
+                            &wrapped_command,
+                            cwd,
+                            request.docker_image.as_deref(),
+                            allow_network_egress,
+                        ) {
+                            Ok(cmd) => cmd,
+                            Err(err) => {
+                                self.append_shell_exec_audit(ShellExecutionAuditRecord {
+                                    audit_id: format!("shell-{}", uuid::Uuid::new_v4()),
+                                    session_id: self
+                                        .session_id
+                                        .map(uuid::Uuid::from_bytes)
+                                        .map(|id| id.to_string()),
+                                    agent_id: self.invoking_agent_id.clone(),
+                                    execution_backend_id: execution_backend_id.clone(),
+                                    command: command.to_string(),
+                                    cwd: cwd.map(|value| value.to_string()),
+                                    os_containment_requested: os_containment,
+                                    containment_backend,
+                                    timeout_seconds,
+                                    cpu_seconds,
+                                    memory_kb,
+                                    exit_code: None,
+                                    timed_out: false,
+                                    output_truncated: false,
+                                    error: Some(format!("{}", err)),
+                                    duration_ms: started_at.elapsed().as_millis() as u64,
+                                    created_at_us,
+                                });
+                                return Err(err);
+                            }
+                        }
+                    }
+                    aria_core::ExecutionBackendKind::Ssh => {
+                        match build_ssh_shell_command(
+                            &wrapped_command,
+                            cwd,
+                            &selected_backend,
+                        ) {
+                            Ok(cmd) => cmd,
+                            Err(err) => {
+                                self.append_shell_exec_audit(ShellExecutionAuditRecord {
+                                    audit_id: format!("shell-{}", uuid::Uuid::new_v4()),
+                                    session_id: self
+                                        .session_id
+                                        .map(uuid::Uuid::from_bytes)
+                                        .map(|id| id.to_string()),
+                                    agent_id: self.invoking_agent_id.clone(),
+                                    execution_backend_id: execution_backend_id.clone(),
+                                    command: command.to_string(),
+                                    cwd: cwd.map(|value| value.to_string()),
+                                    os_containment_requested: os_containment,
+                                    containment_backend,
+                                    timeout_seconds,
+                                    cpu_seconds,
+                                    memory_kb,
+                                    exit_code: None,
+                                    timed_out: false,
+                                    output_truncated: false,
+                                    error: Some(format!("{}", err)),
+                                    duration_ms: started_at.elapsed().as_millis() as u64,
+                                    created_at_us,
+                                });
+                                return Err(err);
+                            }
+                        }
+                    }
+                    aria_core::ExecutionBackendKind::ManagedVm => {
+                        return Err(OrchestratorError::ToolError(format!(
+                            "run_shell backend '{}' is a managed VM profile boundary and requires an external worker/runtime",
+                            selected_backend.backend_id
+                        )));
+                    }
                 };
                 let output = match tokio::time::timeout(Duration::from_secs(timeout_seconds), cmd.output()).await {
                     Err(_) => {
@@ -1043,6 +1171,7 @@ impl ToolExecutor for NativeToolExecutor {
                                 .map(uuid::Uuid::from_bytes)
                                 .map(|id| id.to_string()),
                             agent_id: self.invoking_agent_id.clone(),
+                            execution_backend_id: execution_backend_id.clone(),
                             command: command.to_string(),
                             cwd: cwd.map(|value| value.to_string()),
                             os_containment_requested: os_containment,
@@ -1070,6 +1199,7 @@ impl ToolExecutor for NativeToolExecutor {
                                 .map(uuid::Uuid::from_bytes)
                                 .map(|id| id.to_string()),
                             agent_id: self.invoking_agent_id.clone(),
+                            execution_backend_id: execution_backend_id.clone(),
                             command: command.to_string(),
                             cwd: cwd.map(|value| value.to_string()),
                             os_containment_requested: os_containment,
@@ -1119,6 +1249,7 @@ impl ToolExecutor for NativeToolExecutor {
                         .map(uuid::Uuid::from_bytes)
                         .map(|id| id.to_string()),
                     agent_id: self.invoking_agent_id.clone(),
+                    execution_backend_id,
                     command: command.to_string(),
                     cwd: cwd.map(|value| value.to_string()),
                     os_containment_requested: os_containment,
@@ -1425,6 +1556,8 @@ impl ToolExecutor for NativeToolExecutor {
                 let run = AgentRunRecord {
                     run_id: run_id.clone(),
                     parent_run_id,
+                    origin_kind: Some(aria_core::AgentRunOriginKind::Spawned),
+                    lineage_run_id: None,
                     session_id,
                     user_id,
                     requested_by_agent: self.invoking_agent_id.clone(),
@@ -1452,6 +1585,8 @@ impl ToolExecutor for NativeToolExecutor {
                             request.agent_id
                         ),
                         created_at_us: now_us,
+                        related_run_id: request.parent_run_id.clone(),
+                        actor_agent_id: self.invoking_agent_id.clone(),
                     })
                     .map_err(OrchestratorError::ToolError)?;
                 Ok(ToolExecutionResult::structured(
@@ -1505,23 +1640,29 @@ impl ToolExecutor for NativeToolExecutor {
                     self.invoking_agent_id.as_deref().unwrap_or("user")
                 );
                 let updated = store
-                    .cancel_agent_run(run_id, &summary, now_us)
-                    .map_err(OrchestratorError::ToolError)?
-                    .ok_or_else(|| {
-                        OrchestratorError::ToolError(format!(
-                            "cancel_agent_run target '{}' not found",
-                            run_id
-                        ))
-                    })?;
+                    .cancel_agent_run_tree(run_id, &summary, now_us)
+                    .map_err(OrchestratorError::ToolError)?;
+                if updated.is_empty() {
+                    return Err(OrchestratorError::ToolError(format!(
+                        "cancel_agent_run target '{}' not found",
+                        run_id
+                    )));
+                }
+                let root = updated
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| OrchestratorError::ToolError("cancel_agent_run had no root update".into()))?;
                 Ok(ToolExecutionResult::structured(
                     format!(
-                        "Cancelled child run '{}' with status '{:?}'.",
-                        run_id, updated.status
+                        "Cancelled run tree rooted at '{}' ({} run(s) updated).",
+                        run_id,
+                        updated.len()
                     ),
                     "agent_run",
                     serde_json::json!({
                         "run_id": run_id,
-                        "status": format!("{:?}", updated.status).to_ascii_lowercase(),
+                        "status": format!("{:?}", root.status).to_ascii_lowercase(),
+                        "updated_run_count": updated.len(),
                     }),
                 ))
             }
@@ -1549,38 +1690,15 @@ impl ToolExecutor for NativeToolExecutor {
                     }
                 }
                 let now_us = chrono::Utc::now().timestamp_micros() as u64;
-                let new_run_id = format!("run-{}", uuid::Uuid::new_v4());
-                let retried = AgentRunRecord {
-                    run_id: new_run_id.clone(),
-                    parent_run_id: existing
-                        .parent_run_id
-                        .clone()
-                        .or_else(|| Some(existing.run_id.clone())),
-                    session_id: existing.session_id,
-                    user_id: existing.user_id.clone(),
-                    requested_by_agent: self.invoking_agent_id.clone(),
-                    agent_id: existing.agent_id.clone(),
-                    status: AgentRunStatus::Queued,
-                    request_text: existing.request_text.clone(),
-                    inbox_on_completion: existing.inbox_on_completion,
-                    max_runtime_seconds: existing.max_runtime_seconds,
-                    created_at_us: now_us,
-                    started_at_us: None,
-                    finished_at_us: None,
-                    result: None,
-                };
-                store
-                    .upsert_agent_run(&retried, now_us)
-                    .map_err(OrchestratorError::ToolError)?;
-                store
-                    .append_agent_run_event(&AgentRunEvent {
-                        event_id: format!("evt-{}", uuid::Uuid::new_v4()),
-                        run_id: retried.run_id.clone(),
-                        kind: AgentRunEventKind::Queued,
-                        summary: format!("Run retried from '{}'", existing.run_id),
-                        created_at_us: now_us,
-                    })
-                    .map_err(OrchestratorError::ToolError)?;
+                let retried = store
+                    .retry_agent_run(run_id, self.invoking_agent_id.as_deref(), now_us)
+                    .map_err(OrchestratorError::ToolError)?
+                    .ok_or_else(|| {
+                        OrchestratorError::ToolError(format!(
+                            "retry_agent_run target '{}' not found",
+                            run_id
+                        ))
+                    })?;
                 Ok(ToolExecutionResult::structured(
                     format!(
                         "Queued retry run '{}' from '{}'.",
@@ -1591,6 +1709,71 @@ impl ToolExecutor for NativeToolExecutor {
                         "run_id": retried.run_id,
                         "status": "queued",
                         "retried_from": existing.run_id,
+                    }),
+                ))
+            }
+            "takeover_agent_run" => {
+                let request: TakeoverRunRequest = decode_tool_args(call)?;
+                let run_id = request.run_id.trim();
+                let agent_id = request.agent_id.trim();
+                if run_id.is_empty() {
+                    return Err(OrchestratorError::ToolError("Missing 'run_id'".into()));
+                }
+                if agent_id.is_empty() {
+                    return Err(OrchestratorError::ToolError("Missing 'agent_id'".into()));
+                }
+                let sessions_dir = self.sessions_dir.as_ref().ok_or_else(|| {
+                    OrchestratorError::ToolError(
+                        "takeover_agent_run requires runtime persistence (sessions_dir)".into(),
+                    )
+                })?;
+                let store = RuntimeStore::for_sessions_dir(&sessions_dir);
+                let existing = store
+                    .read_agent_run(run_id)
+                    .map_err(OrchestratorError::ToolError)?;
+                if let Some(user_id) = &self.user_id {
+                    if &existing.user_id != user_id {
+                        return Err(OrchestratorError::ToolError(format!(
+                            "takeover_agent_run not permitted for run '{}'",
+                            run_id
+                        )));
+                    }
+                }
+                if let Some(invoking_agent_id) = &self.invoking_agent_id {
+                    if existing.requested_by_agent.as_deref() != Some(invoking_agent_id.as_str()) {
+                        return Err(OrchestratorError::ToolError(format!(
+                            "takeover_agent_run not permitted for run '{}' by agent '{}'",
+                            run_id, invoking_agent_id
+                        )));
+                    }
+                }
+
+                let now_us = chrono::Utc::now().timestamp_micros() as u64;
+                let takeover = store
+                    .take_over_agent_run(
+                        run_id,
+                        agent_id,
+                        self.invoking_agent_id.as_deref(),
+                        now_us,
+                    )
+                    .map_err(OrchestratorError::ToolError)?
+                    .ok_or_else(|| {
+                        OrchestratorError::ToolError(format!(
+                            "takeover_agent_run target '{}' not found",
+                            run_id
+                        ))
+                    })?;
+                Ok(ToolExecutionResult::structured(
+                    format!(
+                        "Queued takeover run '{}' from '{}' for agent '{}'.",
+                        takeover.run_id, existing.run_id, takeover.agent_id
+                    ),
+                    "agent_run",
+                    serde_json::json!({
+                        "run_id": takeover.run_id,
+                        "status": "queued",
+                        "takeover_of": existing.run_id,
+                        "agent_id": takeover.agent_id,
                     }),
                 ))
             }
@@ -1642,6 +1825,33 @@ impl ToolExecutor for NativeToolExecutor {
                     format!("Fetched run '{}' ({:?}).", run.run_id, run.status),
                     "agent_run",
                     serde_json::to_value(run).unwrap_or_else(|_| serde_json::json!({})),
+                ))
+            }
+            "get_agent_run_tree" => {
+                let request: RunIdRequest = decode_tool_args(call)?;
+                let run_id = request.run_id.trim();
+                if run_id.is_empty() {
+                    return Err(OrchestratorError::ToolError("Missing 'run_id'".into()));
+                }
+                let sessions_dir = self.sessions_dir.as_ref().ok_or_else(|| {
+                    OrchestratorError::ToolError(
+                        "get_agent_run_tree requires runtime persistence (sessions_dir)".into(),
+                    )
+                })?;
+                let store = RuntimeStore::for_sessions_dir(&sessions_dir);
+                let run = store
+                    .read_agent_run(run_id)
+                    .map_err(OrchestratorError::ToolError)?;
+                let tree = build_agent_run_tree_payload(
+                    &store,
+                    uuid::Uuid::from_bytes(run.session_id),
+                    run_id,
+                )
+                .map_err(OrchestratorError::ToolError)?;
+                Ok(ToolExecutionResult::structured(
+                    format!("Fetched run tree rooted at '{}'.", run_id),
+                    "agent_run_tree",
+                    tree,
                 ))
             }
             "get_agent_run_events" => {
@@ -1756,10 +1966,15 @@ impl ToolExecutor for NativeToolExecutor {
                 if skill_dir.is_empty() {
                     return Err(OrchestratorError::ToolError("Missing 'skill_dir'".into()));
                 }
-                let manifest =
+                let mut manifest =
                     aria_skill_runtime::load_skill_manifest_from_dir(Path::new(skill_dir))
                         .map_err(|e| OrchestratorError::ToolError(e.to_string()))?;
                 let now_us = chrono::Utc::now().timestamp_micros() as u64;
+                manifest.provenance = Some(skill_provenance_from_install(
+                    aria_core::SkillProvenanceKind::Local,
+                    Some(skill_dir.to_string()),
+                    now_us,
+                ));
                 RuntimeStore::for_sessions_dir(&sessions_dir)
                     .upsert_skill_package(&manifest, now_us)
                     .map_err(OrchestratorError::ToolError)?;
@@ -1974,7 +2189,7 @@ impl ToolExecutor for NativeToolExecutor {
                     &signature,
                     expected_public_key_hex,
                 )?;
-                let manifest =
+                let mut manifest =
                     aria_skill_runtime::load_skill_manifest_from_dir(skill_dir_path)
                         .map_err(|e| OrchestratorError::ToolError(e.to_string()))?;
                 if signature.skill_id != manifest.skill_id || signature.version != manifest.version {
@@ -1984,6 +2199,11 @@ impl ToolExecutor for NativeToolExecutor {
                     ));
                 }
                 let now_us = chrono::Utc::now().timestamp_micros() as u64;
+                manifest.provenance = Some(skill_provenance_from_install(
+                    aria_core::SkillProvenanceKind::Imported,
+                    Some(skill_dir.to_string()),
+                    now_us,
+                ));
                 let store = RuntimeStore::for_sessions_dir(&sessions_dir);
                 store
                     .upsert_skill_package(&manifest, now_us)
@@ -2023,7 +2243,7 @@ impl ToolExecutor for NativeToolExecutor {
                         "install_skill requires runtime persistence (sessions_dir)".into(),
                     )
                 })?;
-                let manifest = if let Some(manifest_toml) = request.manifest_toml.as_deref() {
+                let mut manifest = if let Some(manifest_toml) = request.manifest_toml.as_deref() {
                         aria_skill_runtime::parse_skill_manifest_toml(manifest_toml)
                             .map_err(|e| OrchestratorError::ToolError(e.to_string()))?
                     } else if let Some(manifest) = request.manifest {
@@ -2034,6 +2254,11 @@ impl ToolExecutor for NativeToolExecutor {
                         ));
                     };
                 let now_us = chrono::Utc::now().timestamp_micros() as u64;
+                manifest.provenance = Some(skill_provenance_from_install(
+                    aria_core::SkillProvenanceKind::Imported,
+                    Some("inline_manifest".into()),
+                    now_us,
+                ));
                 RuntimeStore::for_sessions_dir(&sessions_dir)
                     .upsert_skill_package(&manifest, now_us)
                     .map_err(OrchestratorError::ToolError)?;
@@ -4996,6 +5221,154 @@ impl ToolExecutor for NativeToolExecutor {
                     },
                 ))
             }
+            "computer_profile_list" => {
+                let (session_id, agent_id) = self.session_and_agent_required("computer_profile_list")?;
+                let sessions_dir = self.sessions_dir_required("computer_profile_list")?;
+                let profiles = ensure_default_computer_profiles(&sessions_dir)
+                    .map_err(OrchestratorError::ToolError)?;
+                let sessions = RuntimeStore::for_sessions_dir(&sessions_dir)
+                    .list_computer_sessions(Some(session_id), Some(&agent_id))
+                    .map_err(OrchestratorError::ToolError)?;
+                Ok(ToolExecutionResult::structured(
+                    format!("Listed {} computer execution profiles.", profiles.len()),
+                    "computer_profiles",
+                    serde_json::json!({
+                        "profiles": profiles,
+                        "active_sessions": sessions,
+                    }),
+                ))
+            }
+            "computer_session_start" => {
+                let request: ComputerSessionStartRequest = decode_tool_args(call)?;
+                let (session_id, agent_id) = self.session_and_agent_required("computer_session_start")?;
+                let sessions_dir = self.sessions_dir_required("computer_session_start")?;
+                let profile = resolve_computer_profile(&sessions_dir, request.profile_id.as_deref())
+                    .map_err(OrchestratorError::ToolError)?;
+                let session = resolve_or_create_computer_session(
+                    &sessions_dir,
+                    session_id,
+                    &agent_id,
+                    &aria_core::ComputerActionRequest {
+                        computer_session_id: None,
+                        profile_id: Some(profile.profile_id.clone()),
+                        target_window_id: request.target_window_id.clone(),
+                        action: aria_core::ComputerActionKind::WindowFocus,
+                        x: None,
+                        y: None,
+                        button: None,
+                        text: None,
+                        key: None,
+                    },
+                    &profile,
+                )
+                .map_err(OrchestratorError::ToolError)?;
+                Ok(ToolExecutionResult::structured(
+                    format!(
+                        "Prepared computer session '{}' on profile '{}'.",
+                        session.computer_session_id, session.profile_id
+                    ),
+                    "computer_session",
+                    serde_json::json!({
+                        "session": session,
+                        "profile": profile,
+                    }),
+                ))
+            }
+            "computer_session_list" => {
+                let (session_id, agent_id) = self.session_and_agent_required("computer_session_list")?;
+                let sessions_dir = self.sessions_dir_required("computer_session_list")?;
+                let sessions = RuntimeStore::for_sessions_dir(&sessions_dir)
+                    .list_computer_sessions(Some(session_id), Some(&agent_id))
+                    .map_err(OrchestratorError::ToolError)?;
+                Ok(ToolExecutionResult::structured(
+                    format!("Listed {} computer sessions.", sessions.len()),
+                    "computer_sessions",
+                    serde_json::json!({ "sessions": sessions }),
+                ))
+            }
+            "computer_capture" | "computer_screenshot" => {
+                let mut request: aria_core::ComputerActionRequest = decode_tool_args(call)?;
+                request.action = aria_core::ComputerActionKind::CaptureScreenshot;
+                let (session_id, agent_id) = self.session_and_agent_required(&call.name)?;
+                let sessions_dir = self.sessions_dir_required(&call.name)?;
+                let profile = resolve_computer_profile(&sessions_dir, request.profile_id.as_deref())
+                    .map_err(OrchestratorError::ToolError)?;
+                let session = resolve_or_create_computer_session(
+                    &sessions_dir,
+                    session_id,
+                    &agent_id,
+                    &request,
+                    &profile,
+                )
+                .map_err(OrchestratorError::ToolError)?;
+                let surface = resolve_interaction_surface(SurfaceSelectionInput {
+                    explicit_surface: Some(aria_core::ComputerSurfaceKind::ComputerRuntime),
+                    task_class: infer_computer_task_class(request.action),
+                    browser_runtime_available: true,
+                    chrome_devtools_available: true,
+                    computer_runtime_available: true,
+                })
+                .map_err(OrchestratorError::ToolError)?;
+                let result = execute_local_computer_action(
+                    &sessions_dir,
+                    session_id,
+                    &agent_id,
+                    &request,
+                    &profile,
+                    &session,
+                    surface,
+                )
+                .map_err(OrchestratorError::ToolError)?;
+                Ok(ToolExecutionResult::structured(
+                    format!(
+                        "Captured computer screenshot on profile '{}' via '{}'.",
+                        result.profile.profile_id, result.surface.reason
+                    ),
+                    "computer_artifact",
+                    serde_json::json!(result),
+                ))
+            }
+            "computer_act" => {
+                let request: aria_core::ComputerActionRequest = decode_tool_args(call)?;
+                let (session_id, agent_id) = self.session_and_agent_required("computer_act")?;
+                let sessions_dir = self.sessions_dir_required("computer_act")?;
+                let profile = resolve_computer_profile(&sessions_dir, request.profile_id.as_deref())
+                    .map_err(OrchestratorError::ToolError)?;
+                let session = resolve_or_create_computer_session(
+                    &sessions_dir,
+                    session_id,
+                    &agent_id,
+                    &request,
+                    &profile,
+                )
+                .map_err(OrchestratorError::ToolError)?;
+                let surface = resolve_interaction_surface(SurfaceSelectionInput {
+                    explicit_surface: Some(aria_core::ComputerSurfaceKind::ComputerRuntime),
+                    task_class: infer_computer_task_class(request.action),
+                    browser_runtime_available: true,
+                    chrome_devtools_available: true,
+                    computer_runtime_available: true,
+                })
+                .map_err(OrchestratorError::ToolError)?;
+                let result = execute_local_computer_action(
+                    &sessions_dir,
+                    session_id,
+                    &agent_id,
+                    &request,
+                    &profile,
+                    &session,
+                    surface,
+                )
+                .map_err(OrchestratorError::ToolError)?;
+                Ok(ToolExecutionResult::structured(
+                    format!(
+                        "Executed computer action '{:?}' on profile '{}'.",
+                        result.action.action, result.profile.profile_id
+                    ),
+                    "computer_action",
+                    serde_json::json!(result),
+                ))
+            }
             "fetch_url" => {
                 let request: UrlRequest = decode_tool_args(call)?;
                 let url = &request.url;
@@ -5676,8 +6049,10 @@ impl ToolExecutor for MultiplexToolExecutor {
             | "spawn_agent"
             | "cancel_agent_run"
             | "retry_agent_run"
+            | "takeover_agent_run"
             | "list_agent_runs"
             | "get_agent_run"
+            | "get_agent_run_tree"
             | "get_agent_run_events"
             | "get_agent_mailbox"
             | "scaffold_skill"
@@ -6303,6 +6678,129 @@ fn build_os_contained_shell_command(
             "run_shell os_containment is not supported on this OS".into(),
         ))
     }
+}
+
+fn docker_shell_command_parts(
+    command: &str,
+    cwd: Option<&str>,
+    image: Option<&str>,
+    allow_network_egress: bool,
+) -> Result<(String, Vec<String>), OrchestratorError> {
+    let cwd = cwd.ok_or_else(|| {
+        OrchestratorError::ToolError(
+            "run_shell docker backend requires a scoped 'cwd'".into(),
+        )
+    })?;
+    let image = image.unwrap_or(default_docker_image());
+    let network_mode = if allow_network_egress { "bridge" } else { "none" };
+    let args = vec![
+        "run".into(),
+        "--rm".into(),
+        "--init".into(),
+        "--network".into(),
+        network_mode.into(),
+        "-v".into(),
+        format!("{}:/workspace", cwd),
+        "-w".into(),
+        "/workspace".into(),
+        image.into(),
+        "sh".into(),
+        "-lc".into(),
+        command.into(),
+    ];
+    Ok(("docker".into(), args))
+}
+
+fn build_docker_shell_command(
+    command: &str,
+    cwd: Option<&str>,
+    image: Option<&str>,
+    allow_network_egress: bool,
+) -> Result<tokio::process::Command, OrchestratorError> {
+    if !command_exists_on_path("docker") {
+        return Err(OrchestratorError::ToolError(
+            "run_shell docker backend requested but 'docker' is not installed".into(),
+        ));
+    }
+    let (program, args) =
+        docker_shell_command_parts(command, cwd, image, allow_network_egress)?;
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
+    Ok(cmd)
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn resolve_remote_ssh_cwd(local_cwd: Option<&str>, remote_workspace_root: Option<&str>) -> Option<String> {
+    let cwd = local_cwd?;
+    let cwd_path = std::path::Path::new(cwd);
+    match (remote_workspace_root, std::env::current_dir().ok()) {
+        (Some(remote_root), Some(current_dir)) if cwd_path.is_absolute() => cwd_path
+            .strip_prefix(&current_dir)
+            .ok()
+            .map(|relative| {
+                let relative = relative.to_string_lossy().trim_matches('/').to_string();
+                if relative.is_empty() {
+                    remote_root.trim_end_matches('/').to_string()
+                } else {
+                    format!("{}/{}", remote_root.trim_end_matches('/'), relative)
+                }
+            })
+            .or_else(|| Some(cwd.to_string())),
+        (Some(remote_root), _) if !cwd_path.is_absolute() => Some(format!(
+            "{}/{}",
+            remote_root.trim_end_matches('/'),
+            cwd.trim_matches('/')
+        )),
+        _ => Some(cwd.to_string()),
+    }
+}
+
+fn ssh_shell_command_parts(
+    command: &str,
+    cwd: Option<&str>,
+    profile: &aria_core::ExecutionBackendProfile,
+) -> Result<(String, Vec<String>), OrchestratorError> {
+    if !command_exists_on_path("ssh") {
+        return Err(OrchestratorError::ToolError(
+            "run_shell ssh backend requested but 'ssh' is not installed".into(),
+        ));
+    }
+    let Some(aria_core::ExecutionBackendConfig::Ssh(config)) = profile.config.as_ref() else {
+        return Err(OrchestratorError::ToolError(format!(
+            "run_shell ssh backend '{}' is missing ssh configuration",
+            profile.backend_id
+        )));
+    };
+    let remote_command = if let Some(remote_cwd) =
+        resolve_remote_ssh_cwd(cwd, config.remote_workspace_root.as_deref())
+    {
+        format!("cd {} && {}", shell_single_quote(&remote_cwd), command)
+    } else {
+        command.to_string()
+    };
+    let cfg = aria_intelligence::SshExecutionBackendConfig {
+        host: config.host.clone(),
+        port: config.port,
+        user: config.user.clone(),
+        identity_file: config.identity_file.clone(),
+        remote_workspace_root: config.remote_workspace_root.clone(),
+        known_hosts_policy: config.known_hosts_policy.clone(),
+    };
+    Ok(("ssh".into(), cfg.build_command_args(&remote_command)))
+}
+
+fn build_ssh_shell_command(
+    command: &str,
+    cwd: Option<&str>,
+    profile: &aria_core::ExecutionBackendProfile,
+) -> Result<tokio::process::Command, OrchestratorError> {
+    let (program, args) = ssh_shell_command_parts(command, cwd, profile)?;
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
+    Ok(cmd)
 }
 
 fn browser_bridge_containment_requested() -> bool {
@@ -7083,6 +7581,40 @@ fn resolve_browser_session_id_or_current(
         .ok_or_else(|| OrchestratorError::ToolError("no active browser session found".into()))
 }
 
+fn extract_computer_action_request(
+    call: &ToolCall,
+) -> Result<Option<aria_core::ComputerActionRequest>, OrchestratorError> {
+    if !matches!(
+        call.name.as_str(),
+        "computer_act" | "computer_capture" | "computer_screenshot"
+    ) {
+        return Ok(None);
+    }
+    let mut request = decode_tool_args::<aria_core::ComputerActionRequest>(call)?;
+    if matches!(call.name.as_str(), "computer_capture" | "computer_screenshot") {
+        request.action = aria_core::ComputerActionKind::CaptureScreenshot;
+    }
+    Ok(Some(request))
+}
+
+fn extract_computer_profile_target(call: &ToolCall) -> Result<Option<String>, OrchestratorError> {
+    match call.name.as_str() {
+        "computer_session_start" => {
+            let request: ComputerSessionStartRequest = decode_tool_args(call)?;
+            Ok(request
+                .profile_id
+                .as_deref()
+                .map(|value| required_trimmed(value, "profile_id"))
+                .transpose()?)
+        }
+        "computer_act" | "computer_capture" | "computer_screenshot" => Ok(extract_computer_action_request(call)?
+            .and_then(|request| request.profile_id)
+            .map(|profile_id| profile_id.trim().to_string())
+            .filter(|value| !value.is_empty())),
+        _ => Ok(None),
+    }
+}
+
 fn resolve_domain_access_decision(
     sessions_dir: Option<&Path>,
     profile: &AgentCapabilityProfile,
@@ -7232,6 +7764,49 @@ fn validate_web_request(
     Ok(())
 }
 
+fn validate_computer_platform_request(
+    capability_profile: Option<&AgentCapabilityProfile>,
+    call: &ToolCall,
+    sessions_dir: Option<&Path>,
+    session_id: Option<aria_core::Uuid>,
+) -> Result<(), OrchestratorError> {
+    let Some(request) = extract_computer_action_request(call)? else {
+        if let Some(profile_id) = extract_computer_profile_target(call)? {
+            if let (Some(profile), Some(sessions_dir)) = (capability_profile, sessions_dir) {
+                let computer_profile = resolve_computer_profile(sessions_dir, Some(&profile_id))
+                    .map_err(OrchestratorError::ToolError)?;
+                validate_computer_profile_request(
+                    Some(profile),
+                    &computer_profile,
+                    Some(sessions_dir),
+                    session_id,
+                )
+                .map_err(OrchestratorError::ToolError)?;
+            }
+        }
+        return Ok(());
+    };
+    let Some(sessions_dir) = sessions_dir else {
+        return Ok(());
+    };
+    let profile = resolve_computer_profile(sessions_dir, request.profile_id.as_deref())
+        .map_err(OrchestratorError::ToolError)?;
+    validate_computer_profile_request(capability_profile, &profile, Some(sessions_dir), session_id)
+        .map_err(OrchestratorError::ToolError)?;
+    validate_computer_action_request(
+        capability_profile,
+        &request,
+        &profile,
+        Some(sessions_dir),
+        session_id,
+    )
+    .map_err(OrchestratorError::ToolError)?;
+    if computer_action_requires_approval(&request) {
+        return Err(aria_intelligence::approval_required_error(&call.name));
+    }
+    Ok(())
+}
+
 fn build_policy_eval_context(
     principal: &str,
     channel: GatewayChannel,
@@ -7244,6 +7819,8 @@ fn build_policy_eval_context(
         "domain/",
         "browser_profile/",
         "browser_action/",
+        "computer_profile/",
+        "computer_action/",
         "crawl_scope/",
     ] {
         if !whitelist.iter().any(|existing| existing == prefix) {
@@ -7353,6 +7930,41 @@ fn validate_cedar_web_platform_request(
             "crawl_scope_access",
             &format!("crawl_scope_{:?}", scope).to_ascii_lowercase(),
             &format!("crawl_scope/{:?}", scope).to_ascii_lowercase(),
+            &ctx,
+            &call.name,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_cedar_computer_request(
+    cedar: &aria_policy::CedarEvaluator,
+    principal: &str,
+    channel: GatewayChannel,
+    capability_profile: Option<&AgentCapabilityProfile>,
+    call: &ToolCall,
+    whitelist: &[String],
+    forbid: &[String],
+) -> Result<(), OrchestratorError> {
+    let ctx = build_policy_eval_context(principal, channel, capability_profile, whitelist, forbid);
+    if let Some(profile_id) = extract_computer_profile_target(call)? {
+        evaluate_cedar_decision(
+            cedar,
+            principal,
+            "computer_profile_access",
+            &format!("computer_profile_{}", profile_id.replace(['.', '-', '/', ':'], "_")),
+            &format!("computer_profile/{}", profile_id),
+            &ctx,
+            &call.name,
+        )?;
+    }
+    if let Some(request) = extract_computer_action_request(call)? {
+        evaluate_cedar_decision(
+            cedar,
+            principal,
+            "computer_action_access",
+            &format!("computer_action_{:?}", request.action).to_ascii_lowercase(),
+            &format!("computer_action/{:?}", request.action).to_ascii_lowercase(),
             &ctx,
             &call.name,
         )?;
@@ -7800,6 +8412,8 @@ fn native_mcp_profile(
         web_domain_blocklist: vec![],
         browser_profile_allowlist: vec![],
         browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
         browser_session_scope: None,
         crawl_scope: None,
         web_approval_policy: None,
@@ -7810,7 +8424,7 @@ fn native_mcp_profile(
     }
 }
 
-fn parse_skill_activation_policy(value: &str) -> Result<SkillActivationPolicy, OrchestratorError> {
+pub(crate) fn parse_skill_activation_policy(value: &str) -> Result<SkillActivationPolicy, OrchestratorError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "manual" => Ok(SkillActivationPolicy::Manual),
         "auto_suggest" | "autosuggest" => Ok(SkillActivationPolicy::AutoSuggest),
@@ -7834,7 +8448,7 @@ fn parse_semver_triplet(value: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-fn version_satisfies_requirement(installed: &str, requirement: &str) -> bool {
+pub(crate) fn version_satisfies_requirement(installed: &str, requirement: &str) -> bool {
     let Some((maj, min, pat)) = parse_semver_triplet(installed) else {
         return false;
     };
@@ -7857,8 +8471,20 @@ fn version_satisfies_requirement(installed: &str, requirement: &str) -> bool {
     false
 }
 
+pub(crate) fn skill_provenance_from_install(
+    kind: aria_core::SkillProvenanceKind,
+    source_ref: Option<String>,
+    now_us: u64,
+) -> aria_core::SkillProvenance {
+    aria_core::SkillProvenance {
+        kind,
+        source_ref,
+        imported_at_us: Some(now_us),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct SkillManifestSignature {
+pub(crate) struct SkillManifestSignature {
     algorithm: String,
     skill_id: String,
     version: String,
@@ -7867,7 +8493,7 @@ struct SkillManifestSignature {
     signature_hex: String,
 }
 
-fn parse_signing_key_hex(value: &str) -> Result<SigningKey, OrchestratorError> {
+pub(crate) fn parse_signing_key_hex(value: &str) -> Result<SigningKey, OrchestratorError> {
     let key_bytes = hex::decode(value.trim())
         .map_err(|e| OrchestratorError::ToolError(format!("invalid signing_key_hex: {}", e)))?;
     let key_bytes: [u8; 32] = key_bytes
@@ -7876,7 +8502,7 @@ fn parse_signing_key_hex(value: &str) -> Result<SigningKey, OrchestratorError> {
     Ok(SigningKey::from_bytes(&key_bytes))
 }
 
-fn sign_skill_manifest_bytes(
+pub(crate) fn sign_skill_manifest_bytes(
     manifest: &SkillPackageManifest,
     manifest_bytes: &[u8],
     signing_key: &SigningKey,
@@ -7893,7 +8519,7 @@ fn sign_skill_manifest_bytes(
     }
 }
 
-fn verify_signed_skill_manifest(
+pub(crate) fn verify_signed_skill_manifest(
     manifest_bytes: &[u8],
     signature: &SkillManifestSignature,
     expected_public_key_hex: Option<&str>,
@@ -8829,6 +9455,12 @@ impl<T: ToolExecutor> ToolExecutor for PolicyCheckedExecutor<T> {
             self.sessions_dir.as_deref(),
             self.session_id,
         )?;
+        validate_computer_platform_request(
+            self.capability_profile.as_ref(),
+            call,
+            self.sessions_dir.as_deref(),
+            self.session_id,
+        )?;
         validate_web_request(
             self.capability_profile.as_ref(),
             call,
@@ -8836,6 +9468,15 @@ impl<T: ToolExecutor> ToolExecutor for PolicyCheckedExecutor<T> {
             self.session_id,
         )?;
         validate_cedar_web_platform_request(
+            &self.cedar,
+            &self.principal,
+            self.channel,
+            self.capability_profile.as_ref(),
+            call,
+            &self.whitelist,
+            &self.forbid,
+        )?;
+        validate_cedar_computer_request(
             &self.cedar,
             &self.principal,
             self.channel,
@@ -8960,6 +9601,8 @@ fn build_capability_profile(
         web_domain_blocklist: vec![],
         browser_profile_allowlist: vec![],
         browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
         browser_session_scope: None,
         crawl_scope: None,
         web_approval_policy: None,
@@ -9304,6 +9947,8 @@ fn capability_profile_from_agent_config(
         && agent.web_domain_blocklist.is_empty()
         && agent.browser_profile_allowlist.is_empty()
         && agent.browser_action_scope.is_none()
+        && agent.computer_profile_allowlist.is_empty()
+        && agent.computer_action_scope.is_none()
         && agent.browser_session_scope.is_none()
         && agent.crawl_scope.is_none()
         && agent.web_approval_policy.is_none()
@@ -9329,6 +9974,8 @@ fn capability_profile_from_agent_config(
         web_domain_blocklist: agent.web_domain_blocklist.clone(),
         browser_profile_allowlist: agent.browser_profile_allowlist.clone(),
         browser_action_scope: agent.browser_action_scope,
+        computer_profile_allowlist: agent.computer_profile_allowlist.clone(),
+        computer_action_scope: agent.computer_action_scope,
         browser_session_scope: agent.browser_session_scope,
         crawl_scope: agent.crawl_scope,
         web_approval_policy: agent.web_approval_policy,
@@ -9570,19 +10217,27 @@ pub type AsyncHookFn = Box<
             &AgentRequest,
             Arc<VectorStore>,
             Arc<aria_ssmu::CapabilityIndex>,
-        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+        ) -> Pin<Box<dyn Future<Output = Result<PromptHookAsset, String>> + Send>>
         + Send
         + Sync,
 >;
 
+#[derive(Debug, Clone)]
+pub struct PromptHookAsset {
+    pub label: String,
+    pub content: String,
+}
+
 pub struct HookRegistry {
     pub message_pre: Vec<AsyncHookFn>,
+    lifecycle: aria_intelligence::LifecycleHookRegistry,
 }
 
 impl HookRegistry {
     pub fn new() -> Self {
         Self {
             message_pre: Vec::new(),
+            lifecycle: aria_intelligence::LifecycleHookRegistry::new(),
         }
     }
 
@@ -9595,17 +10250,52 @@ impl HookRegistry {
         req: &AgentRequest,
         vector_store: &Arc<VectorStore>,
         capability_index: &Arc<aria_ssmu::CapabilityIndex>,
-    ) -> String {
-        let mut contexts = Vec::new();
+    ) -> Vec<aria_core::ContextBlock> {
+        let mut blocks = Vec::new();
         for hook in &self.message_pre {
-            if let Ok(ctx) = hook(req, vector_store.clone(), capability_index.clone()).await {
-                if !ctx.is_empty() {
-                    contexts.push(ctx);
+            if let Ok(asset) = hook(req, vector_store.clone(), capability_index.clone()).await {
+                let content = asset.content.trim();
+                if !content.is_empty() {
+                    let label = if asset.label.trim().is_empty() {
+                        "legacy_hook_context".to_string()
+                    } else {
+                        asset.label.trim().to_string()
+                    };
+                    let content = truncate_to_token_budget(content, 512);
+                    blocks.push(aria_core::ContextBlock {
+                        kind: aria_core::ContextBlockKind::PromptAsset,
+                        label,
+                        token_estimate: estimate_token_count(&content) as u32,
+                        content,
+                    });
                 }
             }
         }
-        contexts.join("\n\n")
+        blocks
     }
+
+    pub fn lifecycle(&self) -> &aria_intelligence::LifecycleHookRegistry {
+        &self.lifecycle
+    }
+
+    pub fn lifecycle_mut(&mut self) -> &mut aria_intelligence::LifecycleHookRegistry {
+        &mut self.lifecycle
+    }
+}
+
+fn hook_effect_context_blocks(
+    effects: Vec<aria_intelligence::LifecycleHookEffect>,
+) -> Vec<aria_core::ContextBlock> {
+    let mut blocks = Vec::new();
+    for effect in effects {
+        match effect {
+            aria_intelligence::LifecycleHookEffect::ContextBlock(block) => blocks.push(block),
+            aria_intelligence::LifecycleHookEffect::AuditNote(note) => {
+                tracing::debug!(hook_audit = %note, "Lifecycle hook audit note");
+            }
+        }
+    }
+    blocks
 }
 
 fn scheduled_session_id(job_id: &str) -> [u8; 16] {
@@ -12080,6 +12770,8 @@ where
         kind: AgentRunEventKind::Started,
         summary: format!("started child agent '{}'", run.agent_id),
         created_at_us: started_at_us,
+        related_run_id: run.lineage_run_id.clone(),
+        actor_agent_id: run.requested_by_agent.clone(),
     })?;
 
     let timeout_seconds = run.max_runtime_seconds.unwrap_or(600);
@@ -12160,6 +12852,8 @@ where
         },
         summary,
         created_at_us: finished_at_us,
+        related_run_id: run.lineage_run_id.clone(),
+        actor_agent_id: run.requested_by_agent.clone(),
     })?;
 
     if run.inbox_on_completion {
@@ -12179,10 +12873,118 @@ where
             kind: AgentRunEventKind::InboxNotification,
             summary: "queued inbox notification for parent run".into(),
             created_at_us: finished_at_us,
+            related_run_id: run.lineage_run_id.clone(),
+            actor_agent_id: run.requested_by_agent.clone(),
         })?;
     }
 
     Ok(Some(run))
+}
+
+fn build_agent_run_tree_payload(
+    store: &RuntimeStore,
+    session_id: uuid::Uuid,
+    root_run_id: &str,
+) -> Result<serde_json::Value, String> {
+    let runs = store.list_agent_runs_for_session(session_id)?;
+    let run_index: std::collections::BTreeMap<String, AgentRunRecord> = runs
+        .iter()
+        .cloned()
+        .map(|run| (run.run_id.clone(), run))
+        .collect();
+    let mut children_by_parent: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut continuations_by_source: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for run in &runs {
+        if let Some(parent_run_id) = run.parent_run_id.clone() {
+            children_by_parent
+                .entry(parent_run_id)
+                .or_default()
+                .push(run.run_id.clone());
+        }
+        if let Some(lineage_run_id) = run.lineage_run_id.clone() {
+            continuations_by_source
+                .entry(lineage_run_id)
+                .or_default()
+                .push(run.run_id.clone());
+        }
+    }
+
+    fn build_node(
+        store: &RuntimeStore,
+        run_id: &str,
+        run_index: &std::collections::BTreeMap<String, AgentRunRecord>,
+        children_by_parent: &std::collections::BTreeMap<String, Vec<String>>,
+        continuations_by_source: &std::collections::BTreeMap<String, Vec<String>>,
+        visited: &mut std::collections::BTreeSet<String>,
+    ) -> Result<serde_json::Value, String> {
+        if !visited.insert(run_id.to_string()) {
+            return Ok(serde_json::json!({
+                "run_id": run_id,
+                "cycle_detected": true,
+            }));
+        }
+        let run = run_index
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| format!("run '{}' not found in session tree", run_id))?;
+        let events = store.list_agent_run_events(run_id)?;
+        let mailbox = store.list_agent_mailbox_messages(run_id)?;
+        let children = children_by_parent
+            .get(run_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|child_run_id| {
+                build_node(
+                    store,
+                    &child_run_id,
+                    run_index,
+                    children_by_parent,
+                    continuations_by_source,
+                    visited,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let continuations = continuations_by_source
+            .get(run_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|continuation_run_id| {
+                build_node(
+                    store,
+                    &continuation_run_id,
+                    run_index,
+                    children_by_parent,
+                    continuations_by_source,
+                    visited,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(serde_json::json!({
+            "run": run,
+            "events": events,
+            "mailbox": mailbox,
+            "children": children,
+            "continuations": continuations,
+        }))
+    }
+
+    let mut visited = std::collections::BTreeSet::new();
+    Ok(serde_json::json!({
+        "session_id": session_id.to_string(),
+        "root_run_id": root_run_id,
+        "root": build_node(
+            store,
+            root_run_id,
+            &run_index,
+            &children_by_parent,
+            &continuations_by_source,
+            &mut visited,
+        )?,
+    }))
 }
 
 fn resolve_agent_for_request<E: EmbeddingModel>(
@@ -12480,6 +13282,17 @@ fn contextual_runtime_tool_names_for_request(
         }
     }
 
+    let computer_request = request_is_computer_action_like(&lower);
+    if computer_request && matches!(agent_id, "omni" | "developer") {
+        tools.extend([
+            "computer_profile_list",
+            "computer_session_start",
+            "computer_session_list",
+            "computer_capture",
+            "computer_act",
+        ]);
+    }
+
     let mcp_request = [
         "mcp server",
         "register mcp",
@@ -12599,6 +13412,28 @@ fn request_is_mcp_operation_like(request_text: &str) -> bool {
         "read mcp resource",
         "chrome devtools mcp",
         "devtools mcp",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn request_is_computer_action_like(request_text: &str) -> bool {
+    let lower = request_text.to_ascii_lowercase();
+    [
+        "computer_act",
+        "computer runtime",
+        "desktop action",
+        "move the mouse",
+        "move mouse",
+        "click on the screen",
+        "click the desktop",
+        "type on the desktop",
+        "desktop screenshot",
+        "clipboard",
+        "copy this to clipboard",
+        "paste this on screen",
+        "press key",
+        "key press",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
@@ -13151,7 +13986,7 @@ fn heuristic_specific_tool_call(
             name: tool_name.to_string(),
             arguments: "{}".into(),
 }),
-        "get_agent_run" | "get_agent_run_events" | "get_agent_mailbox" => {
+        "get_agent_run" | "get_agent_run_tree" | "get_agent_run_events" | "get_agent_mailbox" => {
             let run_id = extract_named_value(request_text, "run_id")
                 .or_else(|| extract_after_phrase(request_text, "run "))?;
             Some(ToolCall {
@@ -13723,6 +14558,54 @@ fn synthesize_remote_tools() -> Vec<CachedTool> {
 }
 
 fn active_tool_catalog_entry(tool: &CachedTool) -> aria_core::ToolCatalogEntry {
+    if tool.name == "computer_act" {
+        return aria_core::ToolCatalogEntry {
+            tool_id: "tool.native.computer_act".into(),
+            public_name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters_json_schema: tool.parameters_schema.clone(),
+            execution_kind: aria_core::ToolExecutionKind::Native,
+            provider_kind: aria_core::ToolProviderKind::Native,
+            runner_class: aria_core::ToolRunnerClass::Native,
+            origin: aria_core::ToolOrigin {
+                provider_kind: aria_core::ToolProviderKind::Native,
+                provider_id: "native".into(),
+                origin_id: Some(tool.name.clone()),
+                display_name: Some("Local computer runtime".into()),
+            },
+            artifact_kind: Some("computer_action".into()),
+            requires_approval: aria_core::ToolApprovalClass::HighRisk,
+            side_effect_level: aria_core::ToolSideEffectLevel::StateChanging,
+            streaming_safe: tool.streaming_safe,
+            parallel_safe: false,
+            modalities: tool.modalities.clone(),
+            capability_requirements: vec!["computer_runtime".into()],
+        };
+    }
+    if matches!(tool.name.as_str(), "computer_capture" | "computer_screenshot") {
+        return aria_core::ToolCatalogEntry {
+            tool_id: format!("tool.native.{}", tool.name),
+            public_name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters_json_schema: tool.parameters_schema.clone(),
+            execution_kind: aria_core::ToolExecutionKind::Native,
+            provider_kind: aria_core::ToolProviderKind::Native,
+            runner_class: aria_core::ToolRunnerClass::Native,
+            origin: aria_core::ToolOrigin {
+                provider_kind: aria_core::ToolProviderKind::Native,
+                provider_id: "native".into(),
+                origin_id: Some(tool.name.clone()),
+                display_name: Some("Local computer runtime".into()),
+            },
+            artifact_kind: Some("computer_artifact".into()),
+            requires_approval: aria_core::ToolApprovalClass::LowRisk,
+            side_effect_level: aria_core::ToolSideEffectLevel::ReadOnly,
+            streaming_safe: tool.streaming_safe,
+            parallel_safe: false,
+            modalities: tool.modalities.clone(),
+            capability_requirements: vec!["computer_runtime".into()],
+        };
+    }
     if let Some((server_id, tool_name)) = decode_mcp_tool_alias(&tool.name) {
         return aria_core::ToolCatalogEntry {
             tool_id: format!("tool.mcp.{}.{}", server_id, tool_name),
@@ -13974,6 +14857,10 @@ impl aria_intelligence::ToolProvider for WasmToolProvider<'_> {
     fn list_tools(&self) -> Vec<aria_core::ToolCatalogEntry> {
         Vec::new()
     }
+
+    fn list_prompt_assets(&self) -> Vec<aria_core::PromptAssetEntry> {
+        synthesize_bound_skill_prompt_assets(self.store, self.agent_id).unwrap_or_default()
+    }
 }
 
 fn build_runtime_tool_provider_catalog(
@@ -14089,6 +14976,212 @@ fn synthesize_bound_mcp_prompt_assets(
         });
     }
     Ok(out)
+}
+
+pub(crate) fn synthesize_bound_skill_prompt_assets(
+    store: &RuntimeStore,
+    agent_id: &str,
+) -> Result<Vec<aria_core::PromptAssetEntry>, String> {
+    let manifests = store.list_skill_packages()?;
+    let bindings = store.list_skill_bindings_for_agent(agent_id)?;
+    let bound_skill_ids = bindings
+        .into_iter()
+        .map(|binding| binding.skill_id)
+        .collect::<std::collections::HashSet<_>>();
+    let mut out = Vec::new();
+    for manifest in manifests {
+        if !manifest.enabled || !bound_skill_ids.contains(&manifest.skill_id) {
+            continue;
+        }
+        out.push(aria_core::PromptAssetEntry {
+            asset_id: format!("skill.{}", manifest.skill_id),
+            public_name: manifest.name.clone(),
+            description: manifest.description.clone(),
+            origin: aria_core::ToolOrigin {
+                provider_kind: aria_core::ToolProviderKind::WasmSkill,
+                provider_id: format!("agent:{}", agent_id),
+                origin_id: Some(manifest.skill_id.clone()),
+                display_name: None,
+            },
+            arguments_json_schema: manifest.config_schema.clone(),
+        });
+    }
+    out.sort_by(|lhs, rhs| lhs.public_name.cmp(&rhs.public_name));
+    Ok(out)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SkillPromptContextSelection {
+    pub(crate) selected_blocks: Vec<aria_core::ContextBlock>,
+    pub(crate) deferred_labels: Vec<String>,
+}
+
+fn resolve_skill_entry_document_path(
+    manifest: &aria_core::SkillPackageManifest,
+) -> Option<PathBuf> {
+    let provenance = manifest.provenance.as_ref()?;
+    let source_ref = provenance.source_ref.as_ref()?;
+    let source_path = PathBuf::from(source_ref);
+    if source_path.is_dir() {
+        return Some(source_path.join(&manifest.entry_document));
+    }
+    if source_path.is_file() {
+        return source_path.parent().map(|parent| parent.join(&manifest.entry_document));
+    }
+    None
+}
+
+fn split_markdown_frontmatter(markdown: &str) -> (&str, &str) {
+    let trimmed = markdown.trim_start();
+    let Some(rest) = trimmed.strip_prefix("---\n") else {
+        return ("", markdown);
+    };
+    if let Some(idx) = rest.find("\n---\n") {
+        let frontmatter = &rest[..idx];
+        let body = &rest[idx + 5..];
+        (frontmatter, body)
+    } else {
+        ("", markdown)
+    }
+}
+
+fn score_skill_prompt_relevance(
+    request_text: &str,
+    manifest: &aria_core::SkillPackageManifest,
+    binding: &aria_core::SkillBinding,
+    active: bool,
+    visible_tools: &[CachedTool],
+) -> (f32, Vec<String>) {
+    let lower = request_text.to_ascii_lowercase();
+    let mut score = 0.0f32;
+    let mut reasons = Vec::new();
+    if active {
+        score += 3.0;
+        reasons.push("active activation".into());
+    }
+    match binding.activation_policy {
+        aria_core::SkillActivationPolicy::AutoLoadLowRisk => {
+            score += 2.0;
+            reasons.push("auto-load policy".into());
+        }
+        aria_core::SkillActivationPolicy::AutoSuggest => {
+            score += 0.8;
+            reasons.push("auto-suggest policy".into());
+        }
+        aria_core::SkillActivationPolicy::ApprovalRequired => {
+            score += 0.2;
+            reasons.push("approval-gated policy".into());
+        }
+        aria_core::SkillActivationPolicy::Manual => {}
+    }
+    for needle in std::iter::once(manifest.skill_id.as_str())
+        .chain(std::iter::once(manifest.name.as_str()))
+        .chain(std::iter::once(manifest.description.as_str()))
+        .chain(manifest.retrieval_hints.iter().map(String::as_str))
+    {
+        let token = needle.to_ascii_lowercase();
+        if !token.is_empty() && lower.contains(&token) {
+            score += 1.1;
+            reasons.push(format!("request matched '{}'", needle));
+        }
+    }
+    for tool_name in &manifest.tool_names {
+        let tool_lower = tool_name.to_ascii_lowercase();
+        if lower.contains(&tool_lower)
+            || visible_tools
+                .iter()
+                .any(|tool| tool.name.eq_ignore_ascii_case(tool_name))
+        {
+            score += 0.9;
+            reasons.push(format!("tool overlap '{}'", tool_name));
+        }
+    }
+    (score, reasons)
+}
+
+pub(crate) fn synthesize_skill_prompt_context(
+    store: &RuntimeStore,
+    agent_id: &str,
+    request_text: &str,
+    visible_tools: &[CachedTool],
+) -> Result<SkillPromptContextSelection, String> {
+    let manifests = store.list_skill_packages()?;
+    let bindings = store.list_skill_bindings_for_agent(agent_id)?;
+    let activations = store.list_skill_activations_for_agent(agent_id)?;
+    let manifest_by_id = manifests
+        .into_iter()
+        .map(|manifest| (manifest.skill_id.clone(), manifest))
+        .collect::<std::collections::HashMap<_, _>>();
+    let active_skill_ids = activations
+        .into_iter()
+        .filter(|activation| activation.active)
+        .map(|activation| activation.skill_id)
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut selected_blocks = Vec::new();
+    let mut deferred_labels = Vec::new();
+
+    for binding in bindings {
+        let Some(manifest) = manifest_by_id.get(&binding.skill_id) else {
+            deferred_labels.push(format!("{} (missing package)", binding.skill_id));
+            continue;
+        };
+        if !manifest.enabled {
+            deferred_labels.push(format!("{} (disabled)", manifest.skill_id));
+            continue;
+        }
+        let active = active_skill_ids.contains(&binding.skill_id);
+        let (score, reasons) =
+            score_skill_prompt_relevance(request_text, manifest, &binding, active, visible_tools);
+        let should_include = active || score >= 2.0;
+        if !should_include {
+            deferred_labels.push(format!("{} (deferred)", manifest.skill_id));
+            continue;
+        }
+
+        let mut content = format!(
+            "Skill: {}\nSkill ID: {}\nDescription: {}\nActivation policy: {}\n",
+            manifest.name,
+            manifest.skill_id,
+            manifest.description,
+            format!("{:?}", binding.activation_policy).to_ascii_lowercase()
+        );
+        if !reasons.is_empty() {
+            content.push_str(&format!("Why included: {}\n", reasons.join(", ")));
+        }
+        if let Some(entry_path) = resolve_skill_entry_document_path(manifest) {
+            match std::fs::read_to_string(&entry_path) {
+                Ok(markdown) => {
+                    let (_, body) = split_markdown_frontmatter(&markdown);
+                    let trimmed = truncate_to_token_budget(body, 256);
+                    if !trimmed.trim().is_empty() {
+                        content.push_str("\nInstructions:\n");
+                        content.push_str(&trimmed);
+                    }
+                }
+                Err(_) => deferred_labels.push(format!(
+                    "{} (entry document unavailable)",
+                    manifest.skill_id
+                )),
+            }
+        } else {
+            deferred_labels.push(format!("{} (entry path unresolved)", manifest.skill_id));
+        }
+        selected_blocks.push(aria_core::ContextBlock {
+            kind: aria_core::ContextBlockKind::PromptAsset,
+            label: format!("skill:{}", manifest.skill_id),
+            token_estimate: estimate_token_count(&content) as u32,
+            content,
+        });
+    }
+
+    selected_blocks.sort_by(|lhs, rhs| lhs.label.cmp(&rhs.label));
+    deferred_labels.sort();
+    deferred_labels.dedup();
+    Ok(SkillPromptContextSelection {
+        selected_blocks,
+        deferred_labels,
+    })
 }
 
 fn synthesize_bound_mcp_resource_entries(
@@ -14212,6 +15305,9 @@ fn execution_artifact_kind_for_tool(tool_name: &str) -> Option<aria_core::Execut
     }
     if tool_name.starts_with("browser_") || tool_name.starts_with("crawl_") || tool_name.starts_with("watch_") {
         return Some(aria_core::ExecutionArtifactKind::Browser);
+    }
+    if tool_name.starts_with("computer_") {
+        return Some(aria_core::ExecutionArtifactKind::Computer);
     }
     if matches!(
         tool_name,
@@ -14426,6 +15522,16 @@ fn effective_tool_runtime_policy_for_request(
     if request_is_browser_read_like(request_text) {
         return Some(browser_read_retry_policy(request_text));
     }
+    if request_is_computer_action_like(request_text) {
+        return Some(aria_core::ToolRuntimePolicy {
+            tool_choice: if request_text.to_ascii_lowercase().contains("screenshot") {
+                aria_core::ToolChoicePolicy::Specific("computer_capture".to_string())
+            } else {
+                aria_core::ToolChoicePolicy::Specific("computer_act".to_string())
+            },
+            allow_parallel_tool_calls: false,
+        });
+    }
     scheduling_intent.map(|_| aria_core::ToolRuntimePolicy {
         tool_choice: aria_core::ToolChoicePolicy::Required,
         allow_parallel_tool_calls: false,
@@ -14489,7 +15595,7 @@ async fn process_request(
     tx_cron: &tokio::sync::mpsc::Sender<aria_intelligence::CronCommand>,
     provider_registry: &Arc<tokio::sync::Mutex<ProviderRegistry>>,
     session_tool_caches: &SessionToolCacheStore,
-    _hooks: &HookRegistry,
+    hooks: &HookRegistry,
     session_locks: &dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     _embed_semaphore: &Arc<tokio::sync::Semaphore>,
     max_rounds: usize,
@@ -14530,6 +15636,29 @@ async fn process_request(
         request_text = %request_text,
         "Request received"
     );
+
+    if let Err(err) = hooks
+        .lifecycle()
+        .execute(
+            aria_intelligence::LifecycleHookPhase::SessionStart,
+            aria_intelligence::LifecycleHookEvent {
+                request_id: Some(req.request_id),
+                session_id: Some(req.session_id),
+                agent_id: None,
+                channel: Some(req.channel),
+                tool_name: None,
+                run_id: None,
+                payload: serde_json::json!({
+                    "user_id": req.user_id,
+                    "request_text": request_text,
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        warn!(session_id = %session_uuid, error = %err, "session_start lifecycle hook failed");
+    }
 
     match firewall.scan_ingress(&request_text) {
         aria_safety::ScanResult::Alert(alerts) => {
@@ -15063,6 +16192,12 @@ async fn process_request(
             let _ = index_control_documents_for_workspace(&store, path, now_us);
         }
     }
+    let working_set = build_working_set_for_session(
+        &store,
+        session_uuid,
+        effective_req.channel,
+        &session_history,
+    );
 
     let query_embedding = embedder.embed(&request_text);
     let rag_started = std::time::Instant::now();
@@ -15083,11 +16218,23 @@ async fn process_request(
     let control_doc_context_raw =
         build_control_document_context(&store, &whitelist, capability_profile.as_ref())
             .unwrap_or_default();
+    let rule_resolution =
+        build_rule_resolution(&whitelist, &request_text, Some(&working_set), now_us)
+            .unwrap_or_default();
+    let rule_context_raw = build_rule_context(&rule_resolution);
     let control_doc_context =
         truncate_to_token_budget(&control_doc_context_raw, prompt_budget.control_tokens);
+    let rule_context =
+        truncate_to_token_budget(&rule_context_raw, prompt_budget.control_tokens / 2);
     let sub_agent_context_raw =
         build_sub_agent_result_context(&store, session_uuid).unwrap_or_default();
     let mut rag_context = retrieval_context.clone();
+    if !rule_context.is_empty() {
+        if !rag_context.is_empty() {
+            rag_context.push_str("\n\n");
+        }
+        rag_context.push_str(&rule_context);
+    }
     if !control_doc_context.is_empty() {
         if !rag_context.is_empty() {
             rag_context.push_str("\n\n");
@@ -15106,13 +16253,6 @@ async fn process_request(
         rag_context_len = rag_context.len(),
         "process_request: RAG context built"
     );
-    let working_set = build_working_set_for_session(
-        &store,
-        session_uuid,
-        effective_req.channel,
-        &session_history,
-    );
-
     let user_msg = aria_ssmu::Message {
         role: "user".into(),
         content: request_text.clone(),
@@ -15187,6 +16327,19 @@ async fn process_request(
             prompt_tools.push(tool);
         }
     }
+    let skill_prompt_selection = synthesize_skill_prompt_context(
+        &store,
+        &agent,
+        &request_text,
+        &prompt_tools,
+    )
+    .unwrap_or_else(|err| {
+        warn!(session_id = %session_uuid, error = %err, "skill prompt-asset synthesis failed");
+        SkillPromptContextSelection {
+            selected_blocks: Vec::new(),
+            deferred_labels: Vec::new(),
+        }
+    });
     let learning_rollout_ctx = build_learning_rollout_prompt_context(&promoted_learning_candidates);
     let final_system_prompt = format!(
         "{}{}{}{}{}",
@@ -15223,6 +16376,10 @@ async fn process_request(
             "[Control document context redacted by firewall]".to_string()
         }
         aria_safety::ScanResult::Clean => control_doc_context.clone(),
+    };
+    let rule_context_for_pack = match firewall.scan_egress(&rule_context) {
+        aria_safety::ScanResult::Alert(_) => "[Rule context redacted by firewall]".to_string(),
+        aria_safety::ScanResult::Clean => rule_context.clone(),
     };
     let sub_agent_context_for_pack = match firewall.scan_egress(&sub_agent_context) {
         aria_safety::ScanResult::Alert(_) => {
@@ -15276,6 +16433,14 @@ async fn process_request(
             content: control_doc_context_for_pack.clone(),
         });
     }
+    if !rule_context_for_pack.trim().is_empty() {
+        context_blocks.push(aria_core::ContextBlock {
+            kind: aria_core::ContextBlockKind::RuleContext,
+            label: "active_rules".into(),
+            token_estimate: estimate_token_count(&rule_context_for_pack) as u32,
+            content: rule_context_for_pack.clone(),
+        });
+    }
     if !sub_agent_context_for_pack.trim().is_empty() {
         context_blocks.push(aria_core::ContextBlock {
             kind: aria_core::ContextBlockKind::SubAgentResult,
@@ -15316,6 +16481,21 @@ async fn process_request(
             content,
         });
     }
+    context_blocks.extend(skill_prompt_selection.selected_blocks.clone());
+    if !skill_prompt_selection.deferred_labels.is_empty() {
+        let content = skill_prompt_selection
+            .deferred_labels
+            .iter()
+            .map(|label| format!("- {}", label))
+            .collect::<Vec<_>>()
+            .join("\n");
+        context_blocks.push(aria_core::ContextBlock {
+            kind: aria_core::ContextBlockKind::PromptAsset,
+            label: "deferred_skill_assets".into(),
+            token_estimate: estimate_token_count(&content) as u32,
+            content,
+        });
+    }
     if !bound_resource_entries.is_empty() {
         let content = bound_resource_entries
             .iter()
@@ -15328,6 +16508,34 @@ async fn process_request(
             token_estimate: estimate_token_count(&content) as u32,
             content,
         });
+    }
+    context_blocks.extend(
+        hooks.execute_message_pre(req, vector_store, capability_index)
+            .await,
+    );
+    match hooks
+        .lifecycle()
+        .execute(
+            aria_intelligence::LifecycleHookPhase::PromptSubmit,
+            aria_intelligence::LifecycleHookEvent {
+                request_id: Some(req.request_id),
+                session_id: Some(req.session_id),
+                agent_id: Some(agent.clone()),
+                channel: Some(req.channel),
+                tool_name: None,
+                run_id: None,
+                payload: serde_json::json!({
+                    "user_id": req.user_id,
+                    "request_text": request_text,
+                    "visible_tools": prompt_tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Ok(effects) => context_blocks.extend(hook_effect_context_blocks(effects)),
+        Err(err) => warn!(session_id = %session_uuid, error = %err, "prompt_submit lifecycle hook failed"),
     }
     let inspection_pack = aria_intelligence::ContextPlanner::plan(
         aria_intelligence::ContextPlannerInput {
@@ -16113,6 +17321,163 @@ mod phase8_tests {
         assert!(ctx.contains("hello_joker.js"));
         assert!(ctx.contains("hello.js"));
         assert!(ctx.contains("recent_artifacts"));
+    }
+
+    #[test]
+    fn docker_shell_command_parts_disable_network_by_default() {
+        let (program, args) = docker_shell_command_parts(
+            "echo hello",
+            Some("/tmp/workspace"),
+            Some("alpine:3.20"),
+            false,
+        )
+        .expect("docker command parts");
+        assert_eq!(program, "docker");
+        assert!(args.windows(2).any(|pair| pair == ["--network", "none"]));
+        assert!(args.iter().any(|arg| arg == "alpine:3.20"));
+        assert!(args.iter().any(|arg| arg == "/workspace"));
+    }
+
+    #[test]
+    fn docker_shell_command_parts_require_scoped_cwd() {
+        let err =
+            docker_shell_command_parts("echo hello", None, None, false).expect_err("missing cwd");
+        assert!(format!("{}", err).contains("requires a scoped 'cwd'"));
+    }
+
+    #[test]
+    fn ssh_shell_command_parts_require_ssh_profile_config() {
+        let err = ssh_shell_command_parts(
+            "echo hello",
+            Some("/tmp/workspace"),
+            &aria_core::ExecutionBackendProfile {
+                backend_id: "ssh-missing".into(),
+                display_name: "SSH Missing".into(),
+                kind: aria_core::ExecutionBackendKind::Ssh,
+                config: None,
+                is_default: false,
+                requires_approval: true,
+                supports_workspace_mount: true,
+                supports_browser: false,
+                supports_desktop: false,
+                supports_artifact_return: true,
+                supports_network_egress: true,
+                trust_level: aria_core::ExecutionBackendTrustLevel::RemoteBounded,
+            },
+        )
+        .expect_err("missing ssh profile config should fail");
+        assert!(format!("{}", err).contains("missing ssh configuration"));
+    }
+
+    #[test]
+    fn ssh_shell_command_parts_build_destination_and_known_hosts_flags() {
+        let (program, args) = ssh_shell_command_parts(
+            "echo hello",
+            Some("crate-a"),
+            &aria_core::ExecutionBackendProfile {
+                backend_id: "ssh-build".into(),
+                display_name: "SSH Build".into(),
+                kind: aria_core::ExecutionBackendKind::Ssh,
+                config: Some(aria_core::ExecutionBackendConfig::Ssh(
+                    aria_core::ExecutionBackendSshConfig {
+                        host: "example.internal".into(),
+                        port: 2222,
+                        user: Some("builder".into()),
+                        identity_file: Some("/tmp/test_ed25519".into()),
+                        remote_workspace_root: Some("/srv/workspaces".into()),
+                        known_hosts_policy:
+                            aria_core::ExecutionBackendKnownHostsPolicy::AcceptNew,
+                    },
+                )),
+                is_default: false,
+                requires_approval: true,
+                supports_workspace_mount: true,
+                supports_browser: false,
+                supports_desktop: false,
+                supports_artifact_return: true,
+                supports_network_egress: true,
+                trust_level: aria_core::ExecutionBackendTrustLevel::RemoteBounded,
+            },
+        )
+        .expect("ssh command parts");
+        assert_eq!(program, "ssh");
+        assert!(args.windows(2).any(|pair| pair == ["-p", "2222"]));
+        assert!(args.windows(2).any(|pair| pair == ["-i", "/tmp/test_ed25519"]));
+        assert!(args.windows(2).any(|pair| pair == ["-o", "StrictHostKeyChecking=accept-new"]));
+        assert!(args.iter().any(|arg| arg == "builder@example.internal"));
+        assert!(args
+            .last()
+            .expect("remote command")
+            .contains("cd '/srv/workspaces/crate-a' && echo hello"));
+    }
+
+    #[tokio::test]
+    async fn legacy_message_pre_hooks_are_wrapped_as_prompt_assets() {
+        let mut hooks = HookRegistry::new();
+        hooks.register_message_pre(Box::new(|_, _, _| {
+            Box::pin(async {
+                Ok(PromptHookAsset {
+                    label: "custom_context".into(),
+                    content: "important bounded context".into(),
+                })
+            })
+        }));
+
+        let req = aria_core::AgentRequest {
+            request_id: *uuid::Uuid::new_v4().as_bytes(),
+            session_id: *uuid::Uuid::new_v4().as_bytes(),
+            channel: aria_core::GatewayChannel::Cli,
+            user_id: "test-user".into(),
+            content: aria_core::MessageContent::Text("hello".into()),
+            tool_runtime_policy: None,
+            timestamp_us: 0,
+        };
+        let vector_store = Arc::new(VectorStore::new());
+        let capability_index = Arc::new(aria_ssmu::CapabilityIndex::new(8));
+
+        let blocks = hooks
+            .execute_message_pre(&req, &vector_store, &capability_index)
+            .await;
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].kind, aria_core::ContextBlockKind::PromptAsset);
+        assert_eq!(blocks[0].label, "custom_context");
+        assert_eq!(blocks[0].content, "important bounded context");
+        assert!(blocks[0].token_estimate > 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_message_pre_hook_errors_and_empty_assets_are_ignored() {
+        let mut hooks = HookRegistry::new();
+        hooks.register_message_pre(Box::new(|_, _, _| {
+            Box::pin(async { Err("hook failed".into()) })
+        }));
+        hooks.register_message_pre(Box::new(|_, _, _| {
+            Box::pin(async {
+                Ok(PromptHookAsset {
+                    label: "".into(),
+                    content: "   ".into(),
+                })
+            })
+        }));
+
+        let req = aria_core::AgentRequest {
+            request_id: *uuid::Uuid::new_v4().as_bytes(),
+            session_id: *uuid::Uuid::new_v4().as_bytes(),
+            channel: aria_core::GatewayChannel::Cli,
+            user_id: "test-user".into(),
+            content: aria_core::MessageContent::Text("hello".into()),
+            tool_runtime_policy: None,
+            timestamp_us: 0,
+        };
+        let vector_store = Arc::new(VectorStore::new());
+        let capability_index = Arc::new(aria_ssmu::CapabilityIndex::new(8));
+
+        let blocks = hooks
+            .execute_message_pre(&req, &vector_store, &capability_index)
+            .await;
+
+        assert!(blocks.is_empty());
     }
 
     #[cfg(feature = "mcp-runtime")]

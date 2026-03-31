@@ -450,6 +450,8 @@ mod tests {
         let run = AgentRunRecord {
             run_id: "run-1".into(),
             parent_run_id: Some("parent-1".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
             session_id: *session_id.as_bytes(),
             user_id: "u1".into(),
             requested_by_agent: Some("omni".into()),
@@ -479,6 +481,8 @@ mod tests {
             kind: AgentRunEventKind::Queued,
             summary: "queued".into(),
             created_at_us: 11,
+            related_run_id: None,
+            actor_agent_id: None,
         };
         store
             .append_agent_run_event(&event)
@@ -517,6 +521,8 @@ mod tests {
         let first = AgentRunRecord {
             run_id: "run-1".into(),
             parent_run_id: Some("parent".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
             session_id: *uuid::Uuid::new_v4().as_bytes(),
             user_id: "u1".into(),
             requested_by_agent: Some("omni".into()),
@@ -533,6 +539,8 @@ mod tests {
         let second = AgentRunRecord {
             run_id: "run-2".into(),
             parent_run_id: Some("parent".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
             session_id: *uuid::Uuid::new_v4().as_bytes(),
             user_id: "u1".into(),
             requested_by_agent: Some("omni".into()),
@@ -584,6 +592,8 @@ mod tests {
                     &AgentRunRecord {
                         run_id: run_id.into(),
                         parent_run_id: Some("parent-1".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
                         session_id,
                         user_id: "u1".into(),
                         requested_by_agent: Some("omni".into()),
@@ -631,6 +641,122 @@ mod tests {
     }
 
     #[test]
+    fn runtime_store_cancel_agent_run_tree_cascades_to_descendants() {
+        let (_dir, store) = temp_store();
+        let session_id = *uuid::Uuid::new_v4().as_bytes();
+        for (run_id, parent_run_id, agent_id) in [
+            ("run-root", Some("session:root"), "planner"),
+            ("run-child", Some("run-root"), "researcher"),
+            ("run-leaf", Some("run-child"), "writer"),
+        ] {
+            store
+                .upsert_agent_run(
+                    &AgentRunRecord {
+                        run_id: run_id.into(),
+                        parent_run_id: parent_run_id.map(str::to_string),
+                        origin_kind: None,
+                        lineage_run_id: None,
+                        session_id,
+                        user_id: "u1".into(),
+                        requested_by_agent: Some("omni".into()),
+                        agent_id: agent_id.into(),
+                        status: AgentRunStatus::Running,
+                        request_text: format!("task {}", run_id),
+                        inbox_on_completion: true,
+                        max_runtime_seconds: Some(60),
+                        created_at_us: 1,
+                        started_at_us: Some(2),
+                        finished_at_us: None,
+                        result: None,
+                    },
+                    2,
+                )
+                .expect("upsert run");
+        }
+
+        let updated = store
+            .cancel_agent_run_tree("run-root", "cancelled by operator", 10)
+            .expect("cancel run tree");
+        assert_eq!(updated.len(), 3);
+        for run_id in ["run-root", "run-child", "run-leaf"] {
+            let run = store.read_agent_run(run_id).expect("read cancelled run");
+            assert_eq!(run.status, AgentRunStatus::Cancelled);
+            let events = store
+                .list_agent_run_events(run_id)
+                .expect("list cancellation events");
+            assert!(events.iter().any(|event| event.kind == AgentRunEventKind::Cancelled));
+            let mailbox = store
+                .list_agent_mailbox_messages(run_id)
+                .expect("list mailbox");
+            assert_eq!(mailbox.len(), 1);
+            assert!(mailbox[0].body.contains("cancelled"));
+        }
+    }
+
+    #[test]
+    fn runtime_store_retry_and_takeover_preserve_lineage_and_transitions() {
+        let (_dir, store) = temp_store();
+        let session_id = uuid::Uuid::new_v4();
+        store
+            .upsert_agent_run(
+                &AgentRunRecord {
+                    run_id: "run-source".into(),
+                    parent_run_id: Some("run-parent".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
+                    session_id: *session_id.as_bytes(),
+                    user_id: "u1".into(),
+                    requested_by_agent: Some("omni".into()),
+                    agent_id: "researcher".into(),
+                    status: AgentRunStatus::Failed,
+                    request_text: "investigate".into(),
+                    inbox_on_completion: true,
+                    max_runtime_seconds: Some(60),
+                    created_at_us: 1,
+                    started_at_us: Some(2),
+                    finished_at_us: Some(3),
+                    result: Some(aria_core::AgentRunResult {
+                        response_summary: None,
+                        error: Some("boom".into()),
+                        completed_at_us: Some(3),
+                    }),
+                },
+                3,
+            )
+            .expect("upsert source run");
+
+        let retried = store
+            .retry_agent_run("run-source", Some("omni"), 4)
+            .expect("retry source")
+            .expect("retry created");
+        assert_eq!(retried.origin_kind, Some(aria_core::AgentRunOriginKind::Retry));
+        assert_eq!(retried.lineage_run_id.as_deref(), Some("run-source"));
+
+        let takeover = store
+            .take_over_agent_run("run-source", "developer", Some("omni"), 5)
+            .expect("take over source")
+            .expect("takeover created");
+        assert_eq!(
+            takeover.origin_kind,
+            Some(aria_core::AgentRunOriginKind::Takeover)
+        );
+        assert_eq!(takeover.lineage_run_id.as_deref(), Some("run-source"));
+        assert_eq!(takeover.agent_id, "developer");
+
+        let snapshot = store
+            .build_agent_run_tree_snapshot(session_id)
+            .expect("build run tree snapshot");
+        assert!(snapshot
+            .transitions
+            .iter()
+            .any(|transition| transition.kind == AgentRunEventKind::Retried));
+        assert!(snapshot
+            .transitions
+            .iter()
+            .any(|transition| transition.kind == AgentRunEventKind::TakeoverQueued));
+    }
+
+    #[test]
     fn runtime_store_round_trips_skill_mcp_control_and_compaction_records() {
         let (_dir, store) = temp_store();
         let skill = SkillPackageManifest {
@@ -645,6 +771,7 @@ mod tests {
             wasm_module_ref: None,
             config_schema: Some("{}".into()),
             enabled: true,
+            provenance: None,
         };
         store
             .upsert_skill_package(&skill, 20)
@@ -846,6 +973,7 @@ mod tests {
             audit_id: "shell-1".into(),
             session_id: Some(session_id.to_string()),
             agent_id: Some("developer".into()),
+            execution_backend_id: Some("local-default".into()),
             command: "echo hello".into(),
             cwd: Some("/workspace".into()),
             os_containment_requested: true,
@@ -1017,6 +1145,7 @@ mod tests {
                     audit_id: format!("shell-{}", idx),
                     session_id: Some("sess-1".into()),
                     agent_id: Some("agent-1".into()),
+                    execution_backend_id: Some("local-default".into()),
                     command: format!("echo {}", idx),
                     cwd: Some("/workspace".into()),
                     os_containment_requested: false,
@@ -1089,6 +1218,7 @@ mod tests {
                     audit_id: format!("shell-cfg-{}", idx),
                     session_id: Some("sess-2".into()),
                     agent_id: Some("agent-2".into()),
+                    execution_backend_id: Some("local-default".into()),
                     command: format!("echo {}", idx),
                     cwd: Some("/workspace".into()),
                     os_containment_requested: false,
@@ -2060,6 +2190,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,

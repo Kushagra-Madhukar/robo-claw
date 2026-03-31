@@ -1179,10 +1179,66 @@ pub struct TelemetryConfig {
     /// Log level hint (e.g. "info", "debug").
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Local-first telemetry exporter settings.
+    #[serde(default)]
+    pub exporters: TelemetryExporterConfig,
+    /// Redaction settings for inspection and export surfaces.
+    #[serde(default)]
+    pub redaction: TelemetryRedactionConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryExporterConfig {
+    #[serde(default = "default_telemetry_export_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_telemetry_export_output_dir")]
+    pub output_dir: String,
+    #[serde(default = "default_telemetry_export_json_bundle")]
+    pub write_json_bundle: bool,
+    #[serde(default = "default_telemetry_export_jsonl")]
+    pub write_jsonl: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryRedactionConfig {
+    #[serde(default = "default_redact_secret_like_values")]
+    pub redact_secret_like_values: bool,
+    #[serde(default = "default_redact_provider_payloads_in_shared_export")]
+    pub redact_provider_payloads_in_shared_export: bool,
+    #[serde(default = "default_redact_user_content_in_shared_export")]
+    pub redact_user_content_in_shared_export: bool,
 }
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_telemetry_export_enabled() -> bool {
+    true
+}
+
+fn default_telemetry_export_output_dir() -> String {
+    "../workspace/telemetry".to_string()
+}
+
+fn default_telemetry_export_json_bundle() -> bool {
+    true
+}
+
+fn default_telemetry_export_jsonl() -> bool {
+    true
+}
+
+fn default_redact_secret_like_values() -> bool {
+    true
+}
+
+fn default_redact_provider_payloads_in_shared_export() -> bool {
+    true
+}
+
+fn default_redact_user_content_in_shared_export() -> bool {
+    true
 }
 
 /// Initialize tracing. RUST_LOG overrides config.
@@ -1210,6 +1266,30 @@ impl Default for TelemetryConfig {
         Self {
             enabled: false,
             log_level: default_log_level(),
+            exporters: TelemetryExporterConfig::default(),
+            redaction: TelemetryRedactionConfig::default(),
+        }
+    }
+}
+
+impl Default for TelemetryExporterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_telemetry_export_enabled(),
+            output_dir: default_telemetry_export_output_dir(),
+            write_json_bundle: default_telemetry_export_json_bundle(),
+            write_jsonl: default_telemetry_export_jsonl(),
+        }
+    }
+}
+
+impl Default for TelemetryRedactionConfig {
+    fn default() -> Self {
+        Self {
+            redact_secret_like_values: default_redact_secret_like_values(),
+            redact_provider_payloads_in_shared_export:
+                default_redact_provider_payloads_in_shared_export(),
+            redact_user_content_in_shared_export: default_redact_user_content_in_shared_export(),
         }
     }
 }
@@ -1221,6 +1301,13 @@ pub struct UiConfig {
     /// Bind address for the HTTP server hosting `/ui/*`.
     #[serde(default = "default_ui_bind")]
     pub bind_addr: String,
+    /// Default agent to select for TUI and bootstrap-friendly operator flows.
+    #[serde(default = "default_ui_default_agent")]
+    pub default_agent: String,
+}
+
+fn default_ui_default_agent() -> String {
+    "developer".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1285,6 +1372,7 @@ impl Default for UiConfig {
         Self {
             enabled: false,
             bind_addr: default_ui_bind(),
+            default_agent: default_ui_default_agent(),
         }
     }
 }
@@ -1645,11 +1733,11 @@ fn runtime_env() -> RuntimeEnvConfig {
     }
 }
 
-fn runtime_resource_budget() -> RuntimeResourceBudget {
+pub(crate) fn runtime_resource_budget() -> RuntimeResourceBudget {
     app_runtime().resource_budget.clone()
 }
 
-fn runtime_deployment_profile() -> DeploymentProfile {
+pub(crate) fn runtime_deployment_profile() -> DeploymentProfile {
     app_runtime().deployment_profile
 }
 

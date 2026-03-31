@@ -44,6 +44,15 @@ mod tests {
         .expect("parse test config")
     }
 
+    fn test_llm_pool() -> LlmBackendPool {
+        LlmBackendPool::new(vec!["primary".into()], Duration::from_millis(100))
+    }
+
+    fn rules_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     #[test]
     fn cli_control_command_sets_and_reports_agent_override() {
         let mut config = base_test_config();
@@ -72,6 +81,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -84,6 +95,7 @@ mod tests {
         });
 
         let session_memory = aria_ssmu::SessionMemory::new(10);
+        let llm_pool = test_llm_pool();
         let req = AgentRequest {
             request_id: [1; 16],
             session_id: [0; 16],
@@ -94,7 +106,8 @@ mod tests {
             timestamp_us: 1,
         };
 
-        let reply = handle_cli_control_command(&req, &config, &agent_store, &session_memory)
+        let reply =
+            handle_cli_control_command(&req, &config, &llm_pool, &agent_store, &session_memory)
             .expect("cli command handled");
         assert!(reply.contains("developer"));
 
@@ -109,7 +122,7 @@ mod tests {
             ..req.clone()
         };
         let session_reply =
-            handle_cli_control_command(&session_req, &config, &agent_store, &session_memory)
+            handle_cli_control_command(&session_req, &config, &llm_pool, &agent_store, &session_memory)
                 .expect("session command handled");
         assert!(session_reply.contains("agent_override=developer"));
 
@@ -118,7 +131,7 @@ mod tests {
             ..req.clone()
         };
         let cleared_reply =
-            handle_cli_control_command(&clear_req, &config, &agent_store, &session_memory)
+            handle_cli_control_command(&clear_req, &config, &llm_pool, &agent_store, &session_memory)
                 .expect("clear command handled");
         assert!(cleared_reply.contains("Session history was not cleared"));
 
@@ -134,6 +147,7 @@ mod tests {
         let cleared_session_reply = handle_cli_control_command(
             &cleared_session_req,
             &config,
+            &llm_pool,
             &agent_store,
             &session_memory,
         )
@@ -145,11 +159,105 @@ mod tests {
                 ..cleared_session_req.clone()
             },
             &config,
+            &llm_pool,
             &agent_store,
             &session_memory,
         )
         .expect("clear session handled")
         .contains("Session history cleared"));
+    }
+
+    #[test]
+    fn build_rule_resolution_layers_project_user_org_and_path_rules() {
+        let _guard = rules_env_lock().lock().expect("rules env lock");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let src_dir = workspace.path().join("src");
+        std::fs::create_dir_all(&src_dir).expect("create src dir");
+        std::fs::write(workspace.path().join("HIVECLAW.md"), "project rule").expect("write hiveclaw");
+        std::fs::write(workspace.path().join("AGENTS.md"), "agents rule").expect("write agents");
+        std::fs::write(src_dir.join("CLAUDE.md"), "path rule").expect("write claude");
+        std::fs::write(src_dir.join("lib.rs"), "fn main() {}\n").expect("write lib");
+
+        let org_rules = tempfile::NamedTempFile::new().expect("org rules");
+        std::fs::write(org_rules.path(), "org rule").expect("write org rules");
+        let user_rules = tempfile::NamedTempFile::new().expect("user rules");
+        std::fs::write(user_rules.path(), "user rule").expect("write user rules");
+
+        std::env::set_var("HIVECLAW_ORG_RULES_PATH", org_rules.path());
+        std::env::set_var("HIVECLAW_USER_RULES_PATH", user_rules.path());
+
+        let resolution = build_rule_resolution(
+            &[workspace.path().to_string_lossy().to_string()],
+            "Please update src/lib.rs to print hello",
+            None,
+            1,
+        )
+        .expect("rule resolution");
+
+        std::env::remove_var("HIVECLAW_ORG_RULES_PATH");
+        std::env::remove_var("HIVECLAW_USER_RULES_PATH");
+
+        assert_eq!(resolution.resolved_target_path.as_deref(), Some(src_dir.join("lib.rs").to_string_lossy().as_ref()));
+        assert!(resolution
+            .active_rules
+            .iter()
+            .any(|rule| rule.scope == aria_core::RuleScope::Org));
+        assert!(resolution
+            .active_rules
+            .iter()
+            .any(|rule| rule.scope == aria_core::RuleScope::User));
+        assert!(resolution
+            .active_rules
+            .iter()
+            .any(|rule| rule.source_kind == aria_core::RuleSourceKind::HiveClaw));
+        assert!(resolution
+            .active_rules
+            .iter()
+            .any(|rule| rule.source_kind == aria_core::RuleSourceKind::AgentsMd));
+        assert!(resolution
+            .active_rules
+            .iter()
+            .any(|rule| rule.source_kind == aria_core::RuleSourceKind::ClaudeMd
+                && rule.scope == aria_core::RuleScope::Path));
+    }
+
+    #[test]
+    fn operator_cli_inspect_rules_routes_to_rule_resolution_json() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("HIVECLAW.md"), "project rule").expect("write hiveclaw");
+        std::fs::create_dir_all(workspace.path().join("src")).expect("create src");
+        std::fs::write(workspace.path().join("src/lib.rs"), "fn demo() {}\n").expect("write file");
+
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let policy_path = config_dir.path().join("policy.cedar");
+        std::fs::write(&policy_path, r#"permit(principal, action, resource);"#)
+            .expect("write policy");
+
+        let mut config = base_test_config();
+        config.ssmu.sessions_dir = workspace.path().join("sessions").to_string_lossy().to_string();
+        config.policy.policy_path = policy_path.to_string_lossy().to_string();
+        let resolved = ResolvedAppConfig {
+            path: config_dir.path().join("config.toml"),
+            file: config,
+            runtime: load_runtime_env_config().expect("runtime env config"),
+        };
+
+        let out = run_operator_cli_command(
+            &resolved,
+            &[
+                "aria-x".into(),
+                "inspect".into(),
+                "rules".into(),
+                workspace.path().to_string_lossy().to_string(),
+                "edit src/lib.rs".into(),
+            ],
+        )
+        .expect("inspect rules should route")
+        .expect("inspect rules output");
+
+        assert!(out.contains("\"active_rules\""));
+        assert!(out.contains("\"project\""));
+        assert!(out.contains("\"hive_claw\""));
     }
 
     #[test]
@@ -180,6 +288,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -192,6 +302,7 @@ mod tests {
         });
 
         let session_memory = aria_ssmu::SessionMemory::new(10);
+        let llm_pool = test_llm_pool();
         let req = AgentRequest {
             request_id: [7; 16],
             session_id: [8; 16],
@@ -202,7 +313,8 @@ mod tests {
             timestamp_us: 1,
         };
 
-        let reply = handle_cli_control_command(&req, &config, &agent_store, &session_memory)
+        let reply =
+            handle_cli_control_command(&req, &config, &llm_pool, &agent_store, &session_memory)
             .expect("omni command handled");
         assert!(reply.contains("Session override set to agent: omni."));
 
@@ -242,6 +354,8 @@ mod tests {
                 web_domain_blocklist: vec![],
                 browser_profile_allowlist: vec![],
                 browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
                 browser_session_scope: None,
                 crawl_scope: None,
                 web_approval_policy: None,
@@ -255,6 +369,7 @@ mod tests {
         }
 
         let session_memory = aria_ssmu::SessionMemory::new(10);
+        let llm_pool = test_llm_pool();
         let set_req = AgentRequest {
             request_id: [9; 16],
             session_id: [10; 16],
@@ -265,9 +380,14 @@ mod tests {
             timestamp_us: 1,
         };
 
-        let output =
-            handle_shared_control_command(&set_req, &config, &agent_store, &session_memory)
-                .expect("telegram switch handled");
+        let output = handle_shared_control_command(
+            &set_req,
+            &config,
+            &llm_pool,
+            &agent_store,
+            &session_memory,
+        )
+        .expect("telegram switch handled");
         assert!(output.text.contains("developer"));
 
         let stable_uuid = stable_channel_user_session_uuid(GatewayChannel::Telegram, "tg_user");
@@ -329,6 +449,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -340,6 +462,7 @@ mod tests {
             fallback_agent: None,
         });
         let session_memory = aria_ssmu::SessionMemory::new(10);
+        let llm_pool = test_llm_pool();
         let req = AgentRequest {
             request_id: [3; 16],
             session_id: [4; 16],
@@ -350,7 +473,8 @@ mod tests {
             timestamp_us: 1,
         };
 
-        let output = handle_shared_control_command(&req, &config, &agent_store, &session_memory)
+        let output =
+            handle_shared_control_command(&req, &config, &llm_pool, &agent_store, &session_memory)
             .expect("telegram agents handled");
         assert_eq!(output.parse_mode, Some("HTML"));
         assert!(output.text.contains("Available agents"));
@@ -363,6 +487,7 @@ mod tests {
         let config = base_test_config();
         let agent_store = AgentConfigStore::new();
         let session_memory = aria_ssmu::SessionMemory::new(10);
+        let llm_pool = test_llm_pool();
         let session_uuid = uuid::Uuid::new_v4();
         let _ = session_memory.update_overrides(
             session_uuid,
@@ -385,9 +510,11 @@ mod tests {
             ..cli_req.clone()
         };
 
-        let cli = handle_shared_control_command(&cli_req, &config, &agent_store, &session_memory)
+        let cli =
+            handle_shared_control_command(&cli_req, &config, &llm_pool, &agent_store, &session_memory)
             .expect("cli session");
-        let tg = handle_shared_control_command(&tg_req, &config, &agent_store, &session_memory)
+        let tg =
+            handle_shared_control_command(&tg_req, &config, &llm_pool, &agent_store, &session_memory)
             .expect("tg session");
         assert!(cli.text.contains(&session_uuid.to_string()));
         assert!(tg.text.contains(&session_uuid.to_string()));
@@ -410,6 +537,7 @@ mod tests {
         };
         let agent_store = AgentConfigStore::new();
         let session_memory = aria_ssmu::SessionMemory::new(10);
+        let llm_pool = test_llm_pool();
         let req = AgentRequest {
             request_id: [1; 16],
             session_id: [2; 16],
@@ -435,7 +563,8 @@ mod tests {
         };
         write_approval_record(sessions_dir.path(), &record).expect("write approval");
 
-        let reply = handle_cli_control_command(&req, &config, &agent_store, &session_memory)
+        let reply =
+            handle_cli_control_command(&req, &config, &llm_pool, &agent_store, &session_memory)
             .expect("approvals command handled");
         assert!(reply.contains("Pending approvals:"));
         assert!(reply.contains("1."));
@@ -456,6 +585,7 @@ mod tests {
         };
         let agent_store = AgentConfigStore::new();
         let session_memory = aria_ssmu::SessionMemory::new(10);
+        let llm_pool = test_llm_pool();
         let req = AgentRequest {
             request_id: [1; 16],
             session_id: [2; 16],
@@ -481,7 +611,8 @@ mod tests {
         };
         write_approval_record(sessions_dir.path(), &record).expect("write approval");
 
-        let output = handle_shared_control_command(&req, &config, &agent_store, &session_memory)
+        let output =
+            handle_shared_control_command(&req, &config, &llm_pool, &agent_store, &session_memory)
             .expect("telegram approvals");
         assert_eq!(output.parse_mode, Some("HTML"));
         assert!(output.text.contains("Pending approvals"));
@@ -500,6 +631,8 @@ mod tests {
         let run = AgentRunRecord {
             run_id: "run-1".into(),
             parent_run_id: None,
+                    origin_kind: None,
+                    lineage_run_id: None,
             session_id,
             user_id: "u1".into(),
             requested_by_agent: Some("omni".into()),
@@ -532,6 +665,7 @@ mod tests {
             .expect("append mailbox");
 
         let session_memory = aria_ssmu::SessionMemory::new(10);
+        let llm_pool = test_llm_pool();
         let runs_req = AgentRequest {
             request_id: [8; 16],
             session_id,
@@ -541,7 +675,8 @@ mod tests {
             tool_runtime_policy: None,
             timestamp_us: 12,
         };
-        let runs = handle_runtime_control_command(&runs_req, &config, &session_memory, None)
+        let runs =
+            handle_runtime_control_command(&runs_req, &config, &llm_pool, &session_memory, None)
             .await
             .expect("runs handled");
         assert!(runs.text.contains("run-1"));
@@ -551,7 +686,13 @@ mod tests {
             content: MessageContent::Text("/mailbox run-1".into()),
             ..runs_req
         };
-        let mailbox = handle_runtime_control_command(&mailbox_req, &config, &session_memory, None)
+        let mailbox = handle_runtime_control_command(
+            &mailbox_req,
+            &config,
+            &llm_pool,
+            &session_memory,
+            None,
+        )
             .await
             .expect("mailbox handled");
         assert!(mailbox.text.contains("Sub-agent completed"));
@@ -565,6 +706,8 @@ mod tests {
         let queued = AgentRunRecord {
             run_id: "run-presence-1".into(),
             parent_run_id: None,
+                    origin_kind: None,
+                    lineage_run_id: None,
             session_id: [1; 16],
             user_id: "u1".into(),
             requested_by_agent: None,
@@ -1541,6 +1684,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -1755,6 +1900,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -1892,6 +2039,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -2067,6 +2216,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -2244,6 +2395,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -2430,6 +2583,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -2584,6 +2739,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -2761,6 +2918,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -2926,6 +3085,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -3141,6 +3302,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -3321,6 +3484,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -3530,6 +3695,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -3692,6 +3859,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -4366,6 +4535,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -4397,6 +4568,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -4516,6 +4689,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -4660,6 +4835,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -4691,6 +4868,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -4760,6 +4939,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -4791,6 +4972,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -4863,6 +5046,8 @@ mod tests {
                 web_domain_blocklist: vec![],
                 browser_profile_allowlist: vec![],
                 browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
                 browser_session_scope: None,
                 crawl_scope: None,
                 web_approval_policy: None,
@@ -5413,6 +5598,8 @@ mod tests {
                 &AgentRunRecord {
                     run_id: "run-existing".into(),
                     parent_run_id: Some(parent_run_id.clone()),
+                    origin_kind: None,
+                    lineage_run_id: None,
                     session_id,
                     user_id: "u1".into(),
                     requested_by_agent: Some("developer".into()),
@@ -5496,6 +5683,7 @@ mod tests {
                     wasm_module_ref: None,
                     config_schema: None,
                     enabled: true,
+                    provenance: None,
                 },
                 1,
             )
@@ -5538,6 +5726,8 @@ mod tests {
                 web_domain_blocklist: vec![],
                 browser_profile_allowlist: vec![],
                 browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
                 browser_session_scope: None,
                 crawl_scope: None,
                 web_approval_policy: None,
@@ -5583,6 +5773,7 @@ mod tests {
                     wasm_module_ref: None,
                     config_schema: None,
                     enabled: true,
+                    provenance: None,
                 },
                 1,
             )
@@ -5634,6 +5825,8 @@ mod tests {
                 web_domain_blocklist: vec![],
                 browser_profile_allowlist: vec![],
                 browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
                 browser_session_scope: None,
                 crawl_scope: None,
                 web_approval_policy: None,
@@ -5690,6 +5883,7 @@ mod tests {
                     wasm_module_ref: Some(wasm_path.display().to_string()),
                     config_schema: None,
                     enabled: true,
+                    provenance: None,
                 },
                 1,
             )
@@ -5741,6 +5935,8 @@ mod tests {
                 web_domain_blocklist: vec![],
                 browser_profile_allowlist: vec![],
                 browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
                 browser_session_scope: None,
                 crawl_scope: None,
                 web_approval_policy: None,
@@ -5789,6 +5985,7 @@ mod tests {
                     wasm_module_ref: Some(wasm_path.display().to_string()),
                     config_schema: None,
                     enabled: true,
+                    provenance: None,
                 },
                 1,
             )
@@ -5852,6 +6049,8 @@ mod tests {
                 web_domain_blocklist: vec![],
                 browser_profile_allowlist: vec![],
                 browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
                 browser_session_scope: None,
                 crawl_scope: None,
                 web_approval_policy: None,
@@ -6344,6 +6543,236 @@ enabled = true
     }
 
     #[tokio::test]
+    #[ignore = "live docker verification requires local Docker availability"]
+    async fn native_run_shell_executes_in_docker_backend_and_persists_backend_id() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let session_id = *uuid::Uuid::new_v4().as_bytes();
+        let exec = NativeToolExecutor {
+            tx_cron: {
+                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                tx
+            },
+            invoking_agent_id: Some("developer".into()),
+            session_id: Some(session_id),
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Cli),
+            session_memory: None,
+            cedar: None,
+            sessions_dir: Some(sessions.path().to_path_buf()),
+            scheduling_intent: None,
+            user_timezone: chrono_tz::UTC,
+        };
+
+        let cwd = sessions.path().to_string_lossy().to_string();
+        let result = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "run_shell".into(),
+                arguments: format!(
+                    r#"{{"command":"echo docker_ok","backend_id":"docker-sandbox","docker_image":"alpine:3.20","cwd":"{}","timeout_seconds":120}}"#,
+                    cwd.replace('\\', "\\\\").replace('"', "\\\"")
+                ),
+            })
+            .await
+            .expect("docker-backed run_shell should succeed");
+        assert!(result.render_for_prompt().contains("docker_ok"));
+
+        let audits = RuntimeStore::for_sessions_dir(sessions.path())
+            .list_shell_exec_audits(
+                Some(&uuid::Uuid::from_bytes(session_id).to_string()),
+                Some("developer"),
+            )
+            .expect("list shell audits");
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].execution_backend_id.as_deref(), Some("docker-sandbox"));
+        assert_eq!(audits[0].containment_backend.as_deref(), Some("docker"));
+    }
+
+    #[tokio::test]
+    #[ignore = "live ssh verification requires elevated localhost sshd access"]
+    async fn native_run_shell_executes_in_ssh_backend_and_persists_backend_id() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let ssh_fixture = tempfile::tempdir().expect("ssh fixture");
+        let host_key = ssh_fixture.path().join("ssh_host_ed25519_key");
+        let client_key = ssh_fixture.path().join("id_ed25519");
+        let authorized_keys = ssh_fixture.path().join("authorized_keys");
+        let log_path = ssh_fixture.path().join("sshd.log");
+        let pid_path = ssh_fixture.path().join("sshd.pid");
+        let config_path = ssh_fixture.path().join("sshd_config");
+
+        for key_path in [&host_key, &client_key] {
+            let status = std::process::Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(key_path)
+                .status()
+                .expect("run ssh-keygen");
+            assert!(status.success(), "ssh-keygen should succeed");
+        }
+        std::fs::copy(client_key.with_extension("pub"), &authorized_keys)
+            .expect("write authorized_keys");
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind temp port");
+            let port = listener.local_addr().expect("local addr").port();
+            drop(listener);
+            port
+        };
+        let current_user = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_else(|_| "unknown".into());
+        let config = format!(
+            "Port {port}\nListenAddress 127.0.0.1\nHostKey {host_key}\nAuthorizedKeysFile {authorized_keys}\nPidFile {pid_path}\nLogLevel VERBOSE\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nChallengeResponseAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nPermitRootLogin no\nStrictModes no\nAllowUsers {current_user}\n",
+            port = port,
+            host_key = host_key.display(),
+            authorized_keys = authorized_keys.display(),
+            pid_path = pid_path.display(),
+            current_user = current_user
+        );
+        std::fs::write(&config_path, config).expect("write sshd config");
+
+        let mut sshd = std::process::Command::new("/usr/sbin/sshd")
+            .args(["-D", "-f"])
+            .arg(&config_path)
+            .args(["-E"])
+            .arg(&log_path)
+            .spawn()
+            .expect("spawn sshd");
+
+        let probe_status = (0..30)
+            .find_map(|_| {
+                let status = std::process::Command::new("ssh")
+                    .args([
+                        "-o",
+                        "BatchMode=yes",
+                        "-o",
+                        "StrictHostKeyChecking=no",
+                        "-o",
+                        "UserKnownHostsFile=/dev/null",
+                        "-i",
+                    ])
+                    .arg(&client_key)
+                    .args(["-p", &port.to_string(), "127.0.0.1", "echo ssh_ready"])
+                    .status()
+                    .ok()?;
+                if status.success() {
+                    Some(status)
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    None
+                }
+            })
+            .expect("sshd should accept the probe");
+        assert!(probe_status.success(), "ssh probe should succeed");
+
+        let session_id = *uuid::Uuid::new_v4().as_bytes();
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        store
+            .upsert_execution_backend_profile(
+                &aria_core::ExecutionBackendProfile {
+                    backend_id: "ssh-loopback".into(),
+                    display_name: "SSH Loopback".into(),
+                    kind: aria_core::ExecutionBackendKind::Ssh,
+                    config: Some(aria_core::ExecutionBackendConfig::Ssh(
+                        aria_core::ExecutionBackendSshConfig {
+                            host: "127.0.0.1".into(),
+                            port,
+                            user: Some(current_user),
+                            identity_file: Some(client_key.to_string_lossy().to_string()),
+                            remote_workspace_root: Some(
+                                ssh_fixture.path().to_string_lossy().to_string(),
+                            ),
+                            known_hosts_policy:
+                                aria_core::ExecutionBackendKnownHostsPolicy::InsecureIgnore,
+                        },
+                    )),
+                    is_default: false,
+                    requires_approval: true,
+                    supports_workspace_mount: true,
+                    supports_browser: false,
+                    supports_desktop: false,
+                    supports_artifact_return: true,
+                    supports_network_egress: true,
+                    trust_level: aria_core::ExecutionBackendTrustLevel::RemoteBounded,
+                },
+                chrono::Utc::now().timestamp_micros() as u64,
+            )
+            .expect("upsert ssh backend");
+
+        let exec = NativeToolExecutor {
+            tx_cron: {
+                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                tx
+            },
+            invoking_agent_id: Some("developer".into()),
+            session_id: Some(session_id),
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Cli),
+            session_memory: None,
+            cedar: None,
+            sessions_dir: Some(sessions.path().to_path_buf()),
+            scheduling_intent: None,
+            user_timezone: chrono_tz::UTC,
+        };
+
+        let cwd = ssh_fixture.path().to_string_lossy().to_string();
+        let result = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "run_shell".into(),
+                arguments: format!(
+                    r#"{{"command":"echo ssh_ok","backend_id":"ssh-loopback","cwd":"{}","timeout_seconds":30}}"#,
+                    cwd.replace('\\', "\\\\").replace('"', "\\\"")
+                ),
+            })
+            .await
+            .expect("ssh-backed run_shell should succeed");
+        assert!(result.render_for_prompt().contains("ssh_ok"));
+
+        let audits = RuntimeStore::for_sessions_dir(sessions.path())
+            .list_shell_exec_audits(
+                Some(&uuid::Uuid::from_bytes(session_id).to_string()),
+                Some("developer"),
+            )
+            .expect("list shell audits");
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].execution_backend_id.as_deref(), Some("ssh-loopback"));
+        assert_eq!(audits[0].containment_backend.as_deref(), Some("ssh"));
+
+        let _ = sshd.kill();
+        let _ = sshd.wait();
+    }
+
+    #[tokio::test]
+    async fn native_run_shell_reports_managed_vm_boundary_explicitly() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let session_id = *uuid::Uuid::new_v4().as_bytes();
+        let exec = NativeToolExecutor {
+            tx_cron: {
+                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                tx
+            },
+            invoking_agent_id: Some("developer".into()),
+            session_id: Some(session_id),
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Cli),
+            session_memory: None,
+            cedar: None,
+            sessions_dir: Some(sessions.path().to_path_buf()),
+            scheduling_intent: None,
+            user_timezone: chrono_tz::UTC,
+        };
+
+        let err = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "run_shell".into(),
+                arguments: r#"{"command":"echo vm","backend_id":"vm-guarded","cwd":"."}"#.into(),
+            })
+            .await
+            .expect_err("managed vm backend should be an explicit boundary");
+        assert!(format!("{}", err).contains("managed VM profile boundary"));
+    }
+
+    #[tokio::test]
     async fn native_bind_skill_persists_agent_mapping() {
         let sessions = tempfile::tempdir().expect("sessions");
         let store = RuntimeStore::for_sessions_dir(sessions.path());
@@ -6361,6 +6790,7 @@ enabled = true
                     wasm_module_ref: None,
                     config_schema: None,
                     enabled: true,
+                    provenance: None,
                 },
                 1,
             )
@@ -6428,6 +6858,7 @@ enabled = true
                     wasm_module_ref: None,
                     config_schema: None,
                     enabled: true,
+                    provenance: None,
                 },
                 1,
             )
@@ -6842,6 +7273,8 @@ enabled = true
                 web_domain_blocklist: vec![],
                 browser_profile_allowlist: vec![],
                 browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
                 browser_session_scope: None,
                 crawl_scope: None,
                 web_approval_policy: None,
@@ -6948,6 +7381,8 @@ enabled = true
                 web_domain_blocklist: vec![],
                 browser_profile_allowlist: vec![],
                 browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
                 browser_session_scope: None,
                 crawl_scope: None,
                 web_approval_policy: None,
@@ -7056,6 +7491,8 @@ enabled = true
                 web_domain_blocklist: vec![],
                 browser_profile_allowlist: vec![],
                 browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
                 browser_session_scope: None,
                 crawl_scope: None,
                 web_approval_policy: None,
@@ -7531,6 +7968,8 @@ enabled = true
                 web_domain_blocklist: vec![],
                 browser_profile_allowlist: vec![],
                 browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
                 browser_session_scope: None,
                 crawl_scope: None,
                 web_approval_policy: None,
@@ -7637,6 +8076,8 @@ enabled = true
                 web_domain_blocklist: vec![],
                 browser_profile_allowlist: vec![],
                 browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
                 browser_session_scope: None,
                 crawl_scope: None,
                 web_approval_policy: None,
@@ -7745,6 +8186,8 @@ enabled = true
                 web_domain_blocklist: vec![],
                 browser_profile_allowlist: vec![],
                 browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
                 browser_session_scope: None,
                 crawl_scope: None,
                 web_approval_policy: None,
@@ -7851,6 +8294,8 @@ enabled = true
                 web_domain_blocklist: vec![],
                 browser_profile_allowlist: vec![],
                 browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
                 browser_session_scope: None,
                 crawl_scope: None,
                 web_approval_policy: None,
@@ -7941,6 +8386,8 @@ enabled = true
                 &AgentRunRecord {
                     run_id: "run-cancel-1".into(),
                     parent_run_id: Some("run-parent".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
                     session_id: *uuid::Uuid::new_v4().as_bytes(),
                     user_id: "u1".into(),
                     requested_by_agent: Some("omni".into()),
@@ -8004,6 +8451,8 @@ enabled = true
                 &AgentRunRecord {
                     run_id: "run-source-1".into(),
                     parent_run_id: Some("run-parent".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
                     session_id,
                     user_id: "u1".into(),
                     requested_by_agent: Some("omni".into()),
@@ -8065,9 +8514,91 @@ enabled = true
             .list_agent_run_events(&new_run_id)
             .expect("list retried events");
         assert_eq!(events.len(), 1);
-        assert!(events[0]
-            .summary
-            .contains("Run retried from 'run-source-1'"));
+        assert_eq!(events[0].kind, AgentRunEventKind::Queued);
+        assert_eq!(retried.origin_kind, Some(aria_core::AgentRunOriginKind::Retry));
+        assert_eq!(retried.lineage_run_id.as_deref(), Some("run-source-1"));
+    }
+
+    #[tokio::test]
+    async fn native_takeover_agent_run_queues_new_child_run_for_replacement_agent() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        let session_id = *uuid::Uuid::new_v4().as_bytes();
+        store
+            .upsert_agent_run(
+                &AgentRunRecord {
+                    run_id: "run-source-2".into(),
+                    parent_run_id: Some("run-parent".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
+                    session_id,
+                    user_id: "u1".into(),
+                    requested_by_agent: Some("omni".into()),
+                    agent_id: "researcher".into(),
+                    status: AgentRunStatus::Running,
+                    request_text: "take over me".into(),
+                    inbox_on_completion: true,
+                    max_runtime_seconds: Some(120),
+                    created_at_us: 1,
+                    started_at_us: Some(2),
+                    finished_at_us: None,
+                    result: None,
+                },
+                2,
+            )
+            .expect("upsert source run");
+        let exec = NativeToolExecutor {
+            tx_cron: {
+                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                tx
+            },
+            invoking_agent_id: Some("omni".into()),
+            session_id: Some(session_id),
+            user_id: Some("u1".into()),
+            channel: Some(GatewayChannel::Cli),
+            session_memory: None,
+            cedar: None,
+            sessions_dir: Some(sessions.path().to_path_buf()),
+            scheduling_intent: None,
+            user_timezone: chrono_tz::UTC,
+        };
+
+        let result = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "takeover_agent_run".into(),
+                arguments: r#"{"run_id":"run-source-2","agent_id":"developer"}"#.into(),
+            })
+            .await
+            .expect("takeover should succeed");
+        let new_run_id = match result {
+            aria_intelligence::ToolExecutionResult::Structured { payload, .. } => payload
+                .get("run_id")
+                .and_then(|value| value.as_str())
+                .expect("run_id")
+                .to_string(),
+            other => panic!("expected structured result, got {:?}", other),
+        };
+
+        let takeover = store.read_agent_run(&new_run_id).expect("read takeover run");
+        assert_eq!(takeover.agent_id, "developer");
+        assert_eq!(
+            takeover.origin_kind,
+            Some(aria_core::AgentRunOriginKind::Takeover)
+        );
+        assert_eq!(takeover.lineage_run_id.as_deref(), Some("run-source-2"));
+
+        let original = store
+            .read_agent_run("run-source-2")
+            .expect("read original run");
+        assert_eq!(original.status, AgentRunStatus::Cancelled);
+        let snapshot = store
+            .build_agent_run_tree_snapshot(uuid::Uuid::from_bytes(session_id))
+            .expect("build run tree snapshot");
+        assert!(snapshot
+            .transitions
+            .iter()
+            .any(|transition| transition.kind == AgentRunEventKind::TakeoverQueued));
     }
 
     #[tokio::test]
@@ -8080,6 +8611,8 @@ enabled = true
                 &AgentRunRecord {
                     run_id: "run-read-1".into(),
                     parent_run_id: Some("run-parent".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
                     session_id,
                     user_id: "u1".into(),
                     requested_by_agent: Some("omni".into()),
@@ -8107,6 +8640,8 @@ enabled = true
                 kind: AgentRunEventKind::Completed,
                 summary: "done".into(),
                 created_at_us: 3,
+                related_run_id: None,
+                actor_agent_id: None,
             })
             .expect("append event");
         store
@@ -8193,6 +8728,8 @@ enabled = true
                 &AgentRunRecord {
                     run_id: "run-child-1".into(),
                     parent_run_id: Some("run-parent".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
                     session_id: parent_session,
                     user_id: "u1".into(),
                     requested_by_agent: Some("omni".into()),
@@ -8250,6 +8787,8 @@ enabled = true
                 &AgentRunRecord {
                     run_id: "run-child-2".into(),
                     parent_run_id: Some("run-parent".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
                     session_id: *uuid::Uuid::new_v4().as_bytes(),
                     user_id: "u1".into(),
                     requested_by_agent: Some("omni".into()),
@@ -8311,6 +8850,8 @@ enabled = true
                 &AgentRunRecord {
                     run_id: "run-child-3".into(),
                     parent_run_id: Some("run-parent".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
                     session_id: *uuid::Uuid::new_v4().as_bytes(),
                     user_id: "u1".into(),
                     requested_by_agent: Some("omni".into()),
@@ -8366,6 +8907,8 @@ enabled = true
                 &AgentRunRecord {
                     run_id: "run-child-4".into(),
                     parent_run_id: Some("run-parent".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
                     session_id: *uuid::Uuid::new_v4().as_bytes(),
                     user_id: "u1".into(),
                     requested_by_agent: Some("omni".into()),
@@ -8430,6 +8973,8 @@ enabled = true
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -8454,6 +8999,8 @@ enabled = true
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -8486,6 +9033,8 @@ enabled = true
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -8510,6 +9059,8 @@ enabled = true
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -8534,6 +9085,8 @@ enabled = true
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -8566,6 +9119,8 @@ enabled = true
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -8590,6 +9145,8 @@ enabled = true
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -8614,6 +9171,8 @@ enabled = true
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -8656,6 +9215,8 @@ enabled = true
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -8727,6 +9288,8 @@ enabled = true
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -13829,6 +14392,72 @@ exit 0
     }
 
     #[tokio::test]
+    async fn policy_checked_executor_requires_approval_for_computer_pointer_click() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let cedar = Arc::new(
+            aria_policy::CedarEvaluator::from_policy_str(r#"permit(principal, action, resource);"#)
+                .expect("policy"),
+        );
+        let mut profile = build_capability_profile("researcher", &["computer_act"], false);
+        profile.computer_profile_allowlist = vec!["desktop-safe".into()];
+        profile.computer_action_scope = Some(aria_core::ComputerActionScope::FullDesktopControl);
+        profile.side_effect_level = aria_core::SideEffectLevel::Privileged;
+        let exec = PolicyCheckedExecutor::new(
+            TestOkExecutor,
+            cedar,
+            "researcher".into(),
+            GatewayChannel::Cli,
+            vec![],
+            vec![],
+            Some(profile),
+            Some(sessions.path().to_path_buf()),
+            Some(*uuid::Uuid::new_v4().as_bytes()),
+        );
+
+        let err = exec
+            .execute(&ToolCall {
+                invocation_id: None,
+                name: "computer_act".into(),
+                arguments: r#"{"profile_id":"desktop-safe","action":"pointer_click","x":20,"y":30,"button":"left"}"#.into(),
+            })
+            .await
+            .expect_err("computer pointer click should require approval");
+        assert!(format!("{}", err).to_ascii_lowercase().contains("approval"));
+    }
+
+    #[tokio::test]
+    async fn policy_checked_executor_allows_computer_pointer_move_without_approval() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let cedar = Arc::new(
+            aria_policy::CedarEvaluator::from_policy_str(r#"permit(principal, action, resource);"#)
+                .expect("policy"),
+        );
+        let mut profile = build_capability_profile("researcher", &["computer_act"], false);
+        profile.computer_profile_allowlist = vec!["desktop-safe".into()];
+        profile.computer_action_scope = Some(aria_core::ComputerActionScope::PointerOnly);
+        profile.side_effect_level = aria_core::SideEffectLevel::StatefulWrite;
+        let exec = PolicyCheckedExecutor::new(
+            TestOkExecutor,
+            cedar,
+            "researcher".into(),
+            GatewayChannel::Cli,
+            vec![],
+            vec![],
+            Some(profile),
+            Some(sessions.path().to_path_buf()),
+            Some(*uuid::Uuid::new_v4().as_bytes()),
+        );
+
+        exec.execute(&ToolCall {
+            invocation_id: None,
+            name: "computer_act".into(),
+            arguments: r#"{"profile_id":"desktop-safe","action":"pointer_move","x":20,"y":30}"#.into(),
+        })
+        .await
+        .expect("computer pointer move should be allowed");
+    }
+
+    #[tokio::test]
     async fn policy_checked_executor_denies_browser_action_via_cedar_policy() {
         let cedar = Arc::new(
             aria_policy::CedarEvaluator::from_policy_str(
@@ -14041,12 +14670,13 @@ exit 0
     #[test]
     fn render_cli_help_lists_install_doctor_and_runtime_commands() {
         let help = render_cli_help(None);
-        assert!(help.contains("aria-x install"));
-        assert!(help.contains("aria-x doctor"));
-        assert!(help.contains("aria-x run"));
-        assert!(help.contains("aria-x tui"));
-        assert!(help.contains("aria-x inspect context"));
-        assert!(help.contains("aria-x explain context"));
+        assert!(help.contains("hiveclaw init"));
+        assert!(help.contains("hiveclaw install"));
+        assert!(help.contains("hiveclaw doctor"));
+        assert!(help.contains("hiveclaw run"));
+        assert!(help.contains("hiveclaw tui"));
+        assert!(help.contains("hiveclaw inspect context"));
+        assert!(help.contains("hiveclaw explain context"));
         assert!(help.contains("--explain-context"));
         assert!(help.contains("--explain-provider-payloads"));
     }
@@ -14054,15 +14684,16 @@ exit 0
     #[test]
     fn render_cli_help_supports_topic_help() {
         let help = render_cli_help(Some("doctor"));
-        assert!(help.contains("aria-x doctor"));
+        assert!(help.contains("hiveclaw doctor"));
         assert!(help.contains("doctor stt"));
-        assert!(!help.contains("aria-x install"));
+        assert!(!help.contains("hiveclaw install"));
     }
 
     #[test]
     fn render_cli_help_lists_completion_and_extended_doctor_topics() {
         let help = render_cli_help(None);
-        assert!(help.contains("aria-x completion"));
+        assert!(help.contains("hiveclaw completion"));
+        assert!(help.contains("hiveclaw skills"));
         let doctor_help = render_cli_help(Some("doctor"));
         assert!(doctor_help.contains("doctor env"));
         assert!(doctor_help.contains("doctor gateway"));
@@ -14070,6 +14701,10 @@ exit 0
         assert!(doctor_help.contains("doctor mcp"));
         let inspect_help = render_cli_help(Some("inspect"));
         assert!(inspect_help.contains("provider-payloads"));
+        assert!(inspect_help.contains("rules"));
+        assert!(inspect_help.contains("workspace-locks"));
+        assert!(inspect_help.contains("mcp-servers"));
+        assert!(inspect_help.contains("mcp-bindings"));
         let explain_help = render_cli_help(Some("explain"));
         assert!(explain_help.contains("provider-payloads"));
     }
@@ -14079,6 +14714,33 @@ exit 0
         let setup_help = render_cli_help(Some("setup"));
         assert!(setup_help.contains("setup stt --local"));
         assert!(setup_help.contains("setup chrome-devtools-mcp"));
+        assert!(setup_help.contains("setup ssh-backend"));
+    }
+
+    #[test]
+    fn render_cli_help_supports_replay_topic() {
+        let replay_help = render_cli_help(Some("replay"));
+        assert!(replay_help.contains("hiveclaw replay"));
+        assert!(replay_help.contains("replay golden"));
+        assert!(replay_help.contains("replay contracts"));
+        assert!(replay_help.contains("replay providers"));
+    }
+
+    #[test]
+    fn render_cli_help_supports_telemetry_topic() {
+        let telemetry_help = render_cli_help(Some("telemetry"));
+        assert!(telemetry_help.contains("hiveclaw telemetry"));
+        assert!(telemetry_help.contains("telemetry export"));
+    }
+
+    #[test]
+    fn render_cli_help_supports_skills_topic() {
+        let skills_help = render_cli_help(Some("skills"));
+        assert!(skills_help.contains("hiveclaw skills"));
+        assert!(skills_help.contains("skills install"));
+        assert!(skills_help.contains("--codex-dir"));
+        assert!(skills_help.contains("skills doctor"));
+        assert!(skills_help.contains("--format <native|codex>"));
     }
 
     #[test]
@@ -14152,6 +14814,646 @@ exit 0
         assert!(mcp_text.contains("chrome_devtools_registered:"));
     }
 
+    #[test]
+    fn setup_ssh_backend_cli_registers_profile_and_preserves_defaults() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let mut cfg = base_test_config();
+        cfg.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        let runtime = load_runtime_env_config().expect("runtime env config");
+        let resolved = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+
+        let message = setup_ssh_backend_cli(
+            &resolved,
+            &[
+                "hiveclaw".into(),
+                "setup".into(),
+                "ssh-backend".into(),
+                "--backend-id".into(),
+                "ssh-build".into(),
+                "--host".into(),
+                "builder.internal".into(),
+                "--user".into(),
+                "deploy".into(),
+                "--remote-workspace-root".into(),
+                "/srv/workspaces/anima".into(),
+                "--known-hosts-policy".into(),
+                "accept_new".into(),
+            ],
+        )
+        .expect("register ssh backend");
+        assert!(message.contains("Registered SSH backend 'ssh-build'"));
+
+        let backends = ensure_default_execution_backend_profiles(sessions.path())
+            .expect("list backends after setup");
+        assert!(backends.iter().any(|profile| profile.backend_id == "local-default"));
+        assert!(backends.iter().any(|profile| profile.backend_id == "docker-sandbox"));
+        let ssh = backends
+            .iter()
+            .find(|profile| profile.backend_id == "ssh-build")
+            .expect("ssh backend profile");
+        match ssh.config.as_ref().expect("ssh config") {
+            aria_core::ExecutionBackendConfig::Ssh(config) => {
+                assert_eq!(config.host, "builder.internal");
+                assert_eq!(config.user.as_deref(), Some("deploy"));
+                assert_eq!(
+                    config.remote_workspace_root.as_deref(),
+                    Some("/srv/workspaces/anima")
+                );
+            }
+            other => panic!("unexpected backend config: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn evaluate_golden_replay_suite_passes_matching_trace() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        store
+            .record_execution_trace(&ExecutionTrace {
+                request_id: "req-1".into(),
+                session_id: uuid::Uuid::new_v4().to_string(),
+                user_id: "user-1".into(),
+                agent_id: "developer".into(),
+                channel: GatewayChannel::Cli,
+                prompt_mode: "tool_assisted".into(),
+                task_fingerprint: TaskFingerprint::from_parts(
+                    "developer",
+                    "tool_assisted",
+                    "create a file",
+                    &["write_file".into()],
+                ),
+                user_input_summary: "create a file".into(),
+                tool_names: vec!["write_file".into()],
+                retrieved_corpora: vec!["workspace".into()],
+                outcome: TraceOutcome::Succeeded,
+                latency_ms: 10,
+                response_summary: "created file successfully".into(),
+                tool_runtime_policy: None,
+                recorded_at_us: 10,
+            })
+            .expect("record execution trace");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        store
+            .record_reward_event(&RewardEvent {
+                event_id: "reward-1".into(),
+                request_id: "req-1".into(),
+                session_id: "session-1".into(),
+                kind: RewardKind::Accepted,
+                value: 1,
+                notes: None,
+                recorded_at_us: 11,
+            })
+            .expect("record reward");
+
+        let fingerprint = TaskFingerprint::from_parts(
+            "developer",
+            "tool_assisted",
+            "create a file",
+            &["write_file".into()],
+        );
+        let suite = GoldenReplaySuite {
+            scenarios: vec![GoldenReplayScenario {
+                id: "file-create".into(),
+                task_fingerprint: fingerprint.key,
+                expected_outcome: TraceOutcome::Succeeded,
+                min_samples: 1,
+                required_tools: vec!["write_file".into()],
+                response_must_contain: vec!["created".into()],
+                min_reward_score: Some(1),
+            }],
+        };
+        let report = evaluate_golden_replay_suite(&store, &suite).expect("evaluate replay suite");
+        assert_eq!(report.passed_count, 1);
+        assert_eq!(report.failed_count, 0);
+        assert!(report.results[0].passed);
+    }
+
+    #[test]
+    fn run_golden_replay_cli_fails_for_missing_samples() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let suite_path = sessions.path().join("golden.toml");
+        std::fs::write(
+            &suite_path,
+            r#"
+[[scenarios]]
+id = "missing"
+task_fingerprint = "v1|agent=developer|mode=tool_assisted|text=missing|tools="
+expected_outcome = "succeeded"
+"#,
+        )
+        .expect("write suite");
+        let mut cfg = base_test_config();
+        cfg.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        let runtime = load_runtime_env_config().expect("runtime env config");
+        let resolved = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+
+        let err = run_golden_replay_cli(
+            &resolved,
+            &[
+                "hiveclaw".into(),
+                "replay".into(),
+                "golden".into(),
+                suite_path.to_string_lossy().to_string(),
+            ],
+        )
+        .expect_err("missing replay samples should fail");
+        assert!(err.contains("failed: 1"));
+        assert!(err.contains("no replay samples found"));
+    }
+
+    #[test]
+    fn evaluate_contract_regression_suite_passes_default_scenarios() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let report = evaluate_contract_regression_suite(sessions.path())
+            .expect("evaluate contract regression suite");
+        assert_eq!(report.scenario_count, default_contract_regression_scenarios().len());
+        assert_eq!(report.failed_count, 0, "reasons: {:?}", report.results);
+        assert_eq!(report.passed_count, report.scenario_count);
+        assert!(report.results.iter().all(|result| result.passed));
+    }
+
+    #[test]
+    fn evaluate_contract_regression_suite_reports_mismatched_expectation() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let scenarios = vec![ContractRegressionScenario {
+            id: "mismatch",
+            request_text: "Create a hello.js file with console.log('hi')",
+            expected_kind: aria_core::ExecutionContractKind::AnswerOnly,
+            expected_required_artifacts: vec![],
+            expected_required_tools: vec![],
+            expected_approval_required: false,
+            expected_tool_choice: Some("auto"),
+            satisfied_tool_names: vec!["write_file"],
+            expected_plain_text_failure: None,
+            approval_probe: None,
+        }];
+        let report = evaluate_contract_regression_scenarios(sessions.path(), &scenarios)
+            .expect("evaluate mismatched contract regression suite");
+        assert_eq!(report.failed_count, 1);
+        let result = &report.results[0];
+        assert!(!result.passed);
+        assert!(result
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("expected contract")));
+        assert!(result
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("expected approval_required")));
+        assert!(result
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("expected tool choice")));
+    }
+
+    #[test]
+    fn run_contract_regression_cli_renders_success_report() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let mut cfg = base_test_config();
+        cfg.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        let runtime = load_runtime_env_config().expect("runtime env config");
+        let resolved = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+
+        let report = run_contract_regression_cli(&resolved).expect("contract regression cli");
+        assert!(report.contains("Contract regression report"));
+        assert!(report.contains("failed: 0"));
+        assert!(report.contains("artifact-create-file: PASS"));
+    }
+
+    #[test]
+    fn evaluate_provider_benchmark_suite_compares_provider_samples_and_fallbacks() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        let session_a = uuid::Uuid::new_v4();
+        let session_b = uuid::Uuid::new_v4();
+        let req_a = uuid::Uuid::new_v4();
+        let req_b = uuid::Uuid::new_v4();
+        let fingerprint = TaskFingerprint::from_parts(
+            "developer",
+            "execution",
+            "summarize repo health",
+            &["search_web".into()],
+        );
+
+        for (request_id, session_id, provider_model, outcome, latency_ms) in [
+            (
+                req_a,
+                session_a,
+                "openrouter/openai/gpt-4o-mini",
+                TraceOutcome::Succeeded,
+                120,
+            ),
+            (
+                req_b,
+                session_b,
+                "gemini/gemini-3-flash",
+                TraceOutcome::ApprovalRequired,
+                180,
+            ),
+        ] {
+            store
+                .record_execution_trace(&ExecutionTrace {
+                    request_id: request_id.to_string(),
+                    session_id: session_id.to_string(),
+                    user_id: "user-1".into(),
+                    agent_id: "developer".into(),
+                    channel: GatewayChannel::Cli,
+                    prompt_mode: "execution".into(),
+                    task_fingerprint: fingerprint.clone(),
+                    user_input_summary: "summarize repo health".into(),
+                    tool_names: vec!["search_web".into()],
+                    retrieved_corpora: vec!["workspace".into()],
+                    outcome,
+                    latency_ms,
+                    response_summary: "done".into(),
+                    tool_runtime_policy: None,
+                    recorded_at_us: latency_ms as u64,
+                })
+                .expect("record execution trace");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            store
+                .append_context_inspection(&aria_core::ContextInspectionRecord {
+                    context_id: format!("ctx-{}", request_id),
+                    request_id: *request_id.as_bytes(),
+                    session_id: *session_id.as_bytes(),
+                    agent_id: "developer".into(),
+                    channel: aria_core::GatewayChannel::Cli,
+                    provider_model: Some(provider_model.into()),
+                    prompt_mode: "execution".into(),
+                    history_tokens: 10,
+                    context_tokens: 20,
+                    system_tokens: 30,
+                    user_tokens: 5,
+                    tool_count: 1,
+                    active_tool_names: vec!["search_web".into()],
+                    tool_runtime_policy: Some(aria_core::ToolRuntimePolicy::default()),
+                    tool_selection: None,
+                    provider_request_payload: None,
+                    selected_tool_catalog: Vec::new(),
+                    hidden_tool_messages: Vec::new(),
+                    emitted_artifacts: Vec::new(),
+                    tool_provider_readiness: Vec::new(),
+                    pack: aria_core::ExecutionContextPack {
+                        system_prompt: "sys".into(),
+                        history_messages: vec![],
+                        context_blocks: vec![],
+                        user_request: "summarize repo health".into(),
+                        channel: aria_core::GatewayChannel::Cli,
+                        execution_contract: None,
+                        retrieved_context: None,
+                        working_set: None,
+                        context_plan: None,
+                    },
+                    rendered_prompt: "rendered".into(),
+                    created_at_us: latency_ms as u64,
+                })
+                .expect("append context inspection");
+        }
+
+        store
+            .append_streaming_decision_audit(&StreamingDecisionAuditRecord {
+                audit_id: "stream-1".into(),
+                request_id: req_a.to_string(),
+                session_id: session_a.to_string(),
+                user_id: "user-1".into(),
+                agent_id: "developer".into(),
+                phase: "response".into(),
+                mode: "stream_used".into(),
+                model_ref: Some("openrouter/openai/gpt-4o-mini".into()),
+                created_at_us: 200,
+            })
+            .expect("append stream used audit");
+        store
+            .append_streaming_decision_audit(&StreamingDecisionAuditRecord {
+                audit_id: "stream-2".into(),
+                request_id: req_b.to_string(),
+                session_id: session_b.to_string(),
+                user_id: "user-1".into(),
+                agent_id: "developer".into(),
+                phase: "response".into(),
+                mode: "fallback_used".into(),
+                model_ref: Some("gemini/gemini-3-flash".into()),
+                created_at_us: 210,
+            })
+            .expect("append fallback audit");
+        store
+            .append_repair_fallback_audit(&RepairFallbackAuditRecord {
+                audit_id: "repair-1".into(),
+                request_id: req_b.to_string(),
+                session_id: session_b.to_string(),
+                user_id: "user-1".into(),
+                agent_id: "developer".into(),
+                provider_id: Some("gemini".into()),
+                model_id: Some("gemini-3-flash".into()),
+                tool_name: "search_web".into(),
+                created_at_us: 220,
+            })
+            .expect("append repair fallback audit");
+
+        let suite = ProviderBenchmarkSuite {
+            scenarios: vec![ProviderBenchmarkScenario {
+                id: "provider-compare".into(),
+                task_fingerprint: fingerprint.key.clone(),
+                min_samples_per_provider: 1,
+                required_providers: vec!["openrouter".into(), "gemini".into()],
+                require_fallback_visibility: true,
+            }],
+        };
+        let report = evaluate_provider_benchmark_suite(sessions.path(), &suite)
+            .expect("evaluate provider benchmark suite");
+        assert_eq!(report.failed_count, 0, "report: {:?}", report);
+        assert_eq!(report.passed_count, 1);
+        assert_eq!(report.results[0].providers.len(), 2);
+        assert!(report.results[0]
+            .providers
+            .iter()
+            .any(|provider| provider.provider_id == "gemini" && provider.fallback_outcomes == 1));
+        assert!(report.results[0]
+            .providers
+            .iter()
+            .any(|provider| provider.provider_id == "gemini" && provider.repair_fallback_calls == 1));
+    }
+
+    #[test]
+    fn run_provider_benchmark_cli_renders_report() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        let request_id = uuid::Uuid::new_v4();
+        let session_id = uuid::Uuid::new_v4();
+        let fingerprint = TaskFingerprint::from_parts(
+            "developer",
+            "execution",
+            "compare providers",
+            &["read_file".into()],
+        );
+        store
+            .record_execution_trace(&ExecutionTrace {
+                request_id: request_id.to_string(),
+                session_id: session_id.to_string(),
+                user_id: "user-1".into(),
+                agent_id: "developer".into(),
+                channel: GatewayChannel::Cli,
+                prompt_mode: "execution".into(),
+                task_fingerprint: fingerprint.clone(),
+                user_input_summary: "compare providers".into(),
+                tool_names: vec!["read_file".into()],
+                retrieved_corpora: vec![],
+                outcome: TraceOutcome::Succeeded,
+                latency_ms: 75,
+                response_summary: "done".into(),
+                tool_runtime_policy: None,
+                recorded_at_us: 75,
+            })
+            .expect("record trace");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        store
+            .append_context_inspection(&aria_core::ContextInspectionRecord {
+                context_id: "ctx-provider-cli".into(),
+                request_id: *request_id.as_bytes(),
+                session_id: *session_id.as_bytes(),
+                agent_id: "developer".into(),
+                channel: aria_core::GatewayChannel::Cli,
+                provider_model: Some("openrouter/openai/gpt-4o-mini".into()),
+                prompt_mode: "execution".into(),
+                history_tokens: 2,
+                context_tokens: 3,
+                system_tokens: 4,
+                user_tokens: 5,
+                tool_count: 1,
+                active_tool_names: vec!["read_file".into()],
+                tool_runtime_policy: Some(aria_core::ToolRuntimePolicy::default()),
+                tool_selection: None,
+                provider_request_payload: None,
+                selected_tool_catalog: Vec::new(),
+                hidden_tool_messages: Vec::new(),
+                emitted_artifacts: Vec::new(),
+                tool_provider_readiness: Vec::new(),
+                pack: aria_core::ExecutionContextPack {
+                    system_prompt: "sys".into(),
+                    history_messages: vec![],
+                    context_blocks: vec![],
+                    user_request: "compare providers".into(),
+                    channel: aria_core::GatewayChannel::Cli,
+                    execution_contract: None,
+                    retrieved_context: None,
+                    working_set: None,
+                    context_plan: None,
+                },
+                rendered_prompt: "rendered".into(),
+                created_at_us: 75,
+            })
+            .expect("append context");
+        let suite_path = sessions.path().join("providers.toml");
+        std::fs::write(
+            &suite_path,
+            format!(
+                "[[scenarios]]\nid = \"cli-provider\"\ntask_fingerprint = \"{}\"\nrequired_providers = [\"openrouter\"]\n",
+                fingerprint.key
+            ),
+        )
+        .expect("write suite");
+        let mut cfg = base_test_config();
+        cfg.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        let runtime = load_runtime_env_config().expect("runtime env config");
+        let resolved = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+
+        let out = run_provider_benchmark_cli(
+            &resolved,
+            &[
+                "hiveclaw".into(),
+                "replay".into(),
+                "providers".into(),
+                suite_path.to_string_lossy().to_string(),
+            ],
+        )
+        .expect("provider benchmark cli");
+        assert!(out.contains("Provider benchmark report"));
+        assert!(out.contains("cli-provider: PASS"));
+        assert!(out.contains("openrouter [openrouter/openai/gpt-4o-mini]"));
+    }
+
+    #[test]
+    fn telemetry_config_parses_exporter_and_redaction_fields() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [llm]
+            backend = "mock"
+            model = "test"
+            max_tool_rounds = 5
+
+            [policy]
+            policy_path = "./policy.cedar"
+
+            [gateway]
+            adapter = "cli"
+
+            [mesh]
+            mode = "peer"
+            endpoints = []
+
+            [telemetry]
+            enabled = true
+            log_level = "debug"
+
+            [telemetry.exporters]
+            enabled = true
+            output_dir = "./telemetry"
+            write_json_bundle = true
+            write_jsonl = false
+
+            [telemetry.redaction]
+            redact_secret_like_values = true
+            redact_provider_payloads_in_shared_export = true
+            redact_user_content_in_shared_export = true
+            "#,
+        )
+        .expect("parse telemetry config");
+        assert!(cfg.telemetry.enabled);
+        assert_eq!(cfg.telemetry.log_level, "debug");
+        assert_eq!(cfg.telemetry.exporters.output_dir, "./telemetry");
+        assert!(cfg.telemetry.exporters.write_json_bundle);
+        assert!(!cfg.telemetry.exporters.write_jsonl);
+        assert!(cfg.telemetry.redaction.redact_secret_like_values);
+    }
+
+    #[test]
+    fn telemetry_export_writes_files_and_redacts_shared_payloads() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let output = tempfile::tempdir().expect("output");
+        let request_id = uuid::Uuid::new_v4();
+        let session_id = uuid::Uuid::new_v4();
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        store
+            .record_execution_trace(&ExecutionTrace {
+                request_id: request_id.to_string(),
+                session_id: session_id.to_string(),
+                user_id: "user-1".into(),
+                agent_id: "developer".into(),
+                channel: GatewayChannel::Cli,
+                prompt_mode: "execution".into(),
+                task_fingerprint: TaskFingerprint::from_parts(
+                    "developer",
+                    "execution",
+                    "open the vault",
+                    &["read_file".into()],
+                ),
+                user_input_summary: "open the vault".into(),
+                tool_names: vec!["read_file".into()],
+                retrieved_corpora: vec!["workspace".into()],
+                outcome: TraceOutcome::Succeeded,
+                latency_ms: 50,
+                response_summary: "used bearer token".into(),
+                tool_runtime_policy: None,
+                recorded_at_us: 50,
+            })
+            .expect("record trace");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        store
+            .append_context_inspection(&aria_core::ContextInspectionRecord {
+                context_id: "ctx-telemetry".into(),
+                request_id: *request_id.as_bytes(),
+                session_id: *session_id.as_bytes(),
+                agent_id: "developer".into(),
+                channel: aria_core::GatewayChannel::Cli,
+                provider_model: Some("openrouter/openai/gpt-4o-mini".into()),
+                prompt_mode: "execution".into(),
+                history_tokens: 3,
+                context_tokens: 4,
+                system_tokens: 5,
+                user_tokens: 6,
+                tool_count: 1,
+                active_tool_names: vec!["read_file".into()],
+                tool_runtime_policy: Some(aria_core::ToolRuntimePolicy::default()),
+                tool_selection: None,
+                provider_request_payload: Some(serde_json::json!({
+                    "authorization": "Bearer sk-secret-token",
+                    "messages": [{"role":"user","content":"please use my master key"}]
+                })),
+                selected_tool_catalog: Vec::new(),
+                hidden_tool_messages: Vec::new(),
+                emitted_artifacts: Vec::new(),
+                tool_provider_readiness: Vec::new(),
+                pack: aria_core::ExecutionContextPack {
+                    system_prompt: "system prompt with Bearer token".into(),
+                    history_messages: vec![aria_core::PromptContextMessage {
+                        role: "user".into(),
+                        content: "previous turn".into(),
+                        timestamp_us: 1,
+                    }],
+                    context_blocks: vec![],
+                    user_request: "please use my master key".into(),
+                    channel: aria_core::GatewayChannel::Cli,
+                    execution_contract: None,
+                    retrieved_context: None,
+                    working_set: None,
+                    context_plan: None,
+                },
+                rendered_prompt: "rendered prompt".into(),
+                created_at_us: 55,
+            })
+            .expect("append context");
+
+        let mut cfg = base_test_config();
+        cfg.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        cfg.telemetry.exporters.output_dir = output.path().to_string_lossy().to_string();
+        let runtime = load_runtime_env_config().expect("runtime env config");
+        let resolved = ResolvedAppConfig {
+            path: output.path().join("config.toml"),
+            file: cfg,
+            runtime,
+        };
+
+        let shared_message = export_telemetry_bundle(
+            &resolved,
+            TelemetryExportScope::Shared,
+            Some(output.path()),
+        )
+        .expect("shared export");
+        assert!(shared_message.contains("Telemetry export complete."));
+        let bundle_path = std::fs::read_dir(output.path())
+            .expect("read output dir")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .expect("bundle path");
+        let bundle_text = std::fs::read_to_string(&bundle_path).expect("read bundle");
+        assert!(!bundle_text.contains("sk-secret-token"));
+        assert!(!bundle_text.contains("please use my master key"));
+        assert!(bundle_text.contains("<redacted-provider-payload>"));
+
+        let local_output = tempfile::tempdir().expect("local output");
+        let local_message = export_telemetry_bundle(
+            &resolved,
+            TelemetryExportScope::Local,
+            Some(local_output.path()),
+        )
+        .expect("local export");
+        assert!(local_message.contains("Telemetry export complete."));
+        let local_bundle = std::fs::read_dir(local_output.path())
+            .expect("read local output dir")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+            .expect("local bundle path");
+        let local_text = std::fs::read_to_string(local_bundle).expect("read local bundle");
+        assert!(!local_text.contains("sk-secret-token"));
+        assert!(local_text.contains("please use my master key"));
+    }
+
     #[cfg(feature = "mcp-runtime")]
     #[test]
     fn render_mcp_doctor_live_reports_probe_success() {
@@ -14204,9 +15506,487 @@ exit 0
     #[test]
     fn render_shell_completion_supports_zsh_and_rejects_unknown_shell() {
         let zsh = render_shell_completion("zsh").expect("zsh completion");
-        assert!(zsh.contains("#compdef aria-x"));
+        assert!(zsh.contains("#compdef hiveclaw"));
+        assert!(zsh.contains("skills"));
         let err = render_shell_completion("powershell").expect_err("unknown shell should fail");
-        assert!(err.contains("Usage: aria-x completion"));
+        assert!(err.contains("Usage: hiveclaw completion"));
+    }
+
+    #[test]
+    fn run_skill_management_command_supports_install_bind_enable_disable_and_doctor() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let skill_dir = tempfile::tempdir().expect("skill dir");
+        std::fs::write(
+            skill_dir.path().join("skill.toml"),
+            r#"skill_id = "triage"
+name = "Issue Triage"
+description = "Review incoming issues"
+version = "1.0.0"
+entry_document = "SKILL.md"
+enabled = true
+"#,
+        )
+        .expect("write skill manifest");
+        std::fs::write(skill_dir.path().join("SKILL.md"), "# Issue Triage")
+            .expect("write skill entry");
+
+        let mut cfg = base_test_config();
+        cfg.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        let runtime = load_runtime_env_config().expect("runtime env config");
+        let cfg = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+
+        let install = run_skill_management_command(
+            &cfg,
+            &vec![
+                "hiveclaw".into(),
+                "skills".into(),
+                "install".into(),
+                "--dir".into(),
+                skill_dir.path().display().to_string(),
+            ],
+        )
+        .expect("skills command")
+        .expect("install should succeed");
+        assert!(install.contains("Installed skill 'triage'"));
+
+        let bind = run_skill_management_command(
+            &cfg,
+            &vec![
+                "hiveclaw".into(),
+                "skills".into(),
+                "bind".into(),
+                "triage".into(),
+                "--agent".into(),
+                "developer".into(),
+            ],
+        )
+        .expect("skills command")
+        .expect("bind should succeed");
+        assert!(bind.contains("Bound skill 'triage' to agent 'developer'"));
+
+        let disable = run_skill_management_command(
+            &cfg,
+            &vec![
+                "hiveclaw".into(),
+                "skills".into(),
+                "disable".into(),
+                "triage".into(),
+            ],
+        )
+        .expect("skills command")
+        .expect("disable should succeed");
+        assert!(disable.contains("Disabled skill 'triage'"));
+
+        let doctor = run_skill_management_command(
+            &cfg,
+            &vec![
+                "hiveclaw".into(),
+                "skills".into(),
+                "doctor".into(),
+                "triage".into(),
+            ],
+        )
+        .expect("skills command")
+        .expect("doctor should succeed");
+        assert!(doctor.contains("skill: triage"));
+        assert!(doctor.contains("enabled: false"));
+        assert!(doctor.contains("provenance: local"));
+        assert!(doctor.contains("trust_state: unsigned_local"));
+        assert!(doctor.contains("bindings: 1"));
+
+        let enable = run_skill_management_command(
+            &cfg,
+            &vec![
+                "hiveclaw".into(),
+                "skills".into(),
+                "enable".into(),
+                "triage".into(),
+            ],
+        )
+        .expect("skills command")
+        .expect("enable should succeed");
+        assert!(enable.contains("Enabled skill 'triage'"));
+    }
+
+    #[test]
+    fn run_skill_management_command_signed_install_marks_skill_trusted() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let skill_dir = tempfile::tempdir().expect("skill dir");
+        let manifest_toml = r#"skill_id = "triage"
+name = "Issue Triage"
+description = "Review incoming issues"
+version = "1.0.0"
+entry_document = "SKILL.md"
+enabled = true
+"#;
+        std::fs::write(skill_dir.path().join("skill.toml"), manifest_toml).expect("write skill manifest");
+        std::fs::write(skill_dir.path().join("SKILL.md"), "# Issue Triage")
+            .expect("write skill entry");
+        let signing_key = parse_signing_key_hex(&"11".repeat(32)).expect("signing key");
+        let manifest =
+            aria_skill_runtime::parse_skill_manifest_toml(manifest_toml).expect("parse manifest");
+        let signature =
+            sign_skill_manifest_bytes(&manifest, manifest_toml.as_bytes(), &signing_key);
+        std::fs::write(
+            skill_dir.path().join("skill.sig.json"),
+            serde_json::to_vec_pretty(&signature).expect("signature json"),
+        )
+        .expect("write signature");
+
+        let mut cfg = base_test_config();
+        cfg.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        let runtime = load_runtime_env_config().expect("runtime env config");
+        let cfg = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+
+        let install = run_skill_management_command(
+            &cfg,
+            &vec![
+                "hiveclaw".into(),
+                "skills".into(),
+                "install".into(),
+                "--signed-dir".into(),
+                skill_dir.path().display().to_string(),
+            ],
+        )
+        .expect("skills command")
+        .expect("signed install should succeed");
+        assert!(install.contains("trust_state: trusted"));
+
+        let doctor = run_skill_management_command(
+            &cfg,
+            &vec![
+                "hiveclaw".into(),
+                "skills".into(),
+                "doctor".into(),
+                "triage".into(),
+            ],
+        )
+        .expect("skills command")
+        .expect("doctor should succeed");
+        assert!(doctor.contains("trust_state: trusted"));
+        assert!(doctor.contains("provenance: imported"));
+        assert!(doctor.contains("verified_signatures: 1"));
+    }
+
+    #[test]
+    fn synthesize_skill_prompt_context_loads_only_relevant_bound_skills() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let browser_skill_dir = tempfile::tempdir().expect("browser skill dir");
+        let writing_skill_dir = tempfile::tempdir().expect("writing skill dir");
+        std::fs::write(
+            browser_skill_dir.path().join("SKILL.md"),
+            r#"---
+name: "playwright"
+description: "Browser automation and screenshots"
+---
+
+# Playwright
+
+Use this skill when the user needs browser automation, screenshots, or page interaction.
+"#,
+        )
+        .expect("write browser skill");
+        std::fs::write(
+            writing_skill_dir.path().join("SKILL.md"),
+            r#"---
+name: "writer"
+description: "General writing assistance"
+---
+
+# Writer
+
+Use this skill when the user needs polished prose or summaries.
+"#,
+        )
+        .expect("write writing skill");
+
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        store
+            .upsert_skill_package(
+                &SkillPackageManifest {
+                    skill_id: "playwright".into(),
+                    name: "playwright".into(),
+                    description: "Browser automation and screenshots".into(),
+                    version: "1.0.0".into(),
+                    entry_document: "SKILL.md".into(),
+                    tool_names: vec!["navigate".into(), "screenshot".into()],
+                    mcp_server_dependencies: vec![],
+                    retrieval_hints: vec!["browser".into(), "screenshot".into()],
+                    wasm_module_ref: None,
+                    config_schema: None,
+                    enabled: true,
+                    provenance: Some(skill_provenance_from_install(
+                        aria_core::SkillProvenanceKind::CompatibilityImport,
+                        Some(browser_skill_dir.path().display().to_string()),
+                        1,
+                    )),
+                },
+                1,
+            )
+            .expect("browser skill package");
+        store
+            .upsert_skill_package(
+                &SkillPackageManifest {
+                    skill_id: "writer".into(),
+                    name: "writer".into(),
+                    description: "General writing assistance".into(),
+                    version: "1.0.0".into(),
+                    entry_document: "SKILL.md".into(),
+                    tool_names: vec!["write_file".into()],
+                    mcp_server_dependencies: vec![],
+                    retrieval_hints: vec!["writing".into(), "summary".into()],
+                    wasm_module_ref: None,
+                    config_schema: None,
+                    enabled: true,
+                    provenance: Some(skill_provenance_from_install(
+                        aria_core::SkillProvenanceKind::CompatibilityImport,
+                        Some(writing_skill_dir.path().display().to_string()),
+                        1,
+                    )),
+                },
+                2,
+            )
+            .expect("writer skill package");
+        store
+            .upsert_skill_binding(&SkillBinding {
+                binding_id: "bind-playwright".into(),
+                agent_id: "developer".into(),
+                skill_id: "playwright".into(),
+                activation_policy: SkillActivationPolicy::AutoLoadLowRisk,
+                created_at_us: 3,
+            })
+            .expect("bind playwright");
+        store
+            .upsert_skill_binding(&SkillBinding {
+                binding_id: "bind-writer".into(),
+                agent_id: "developer".into(),
+                skill_id: "writer".into(),
+                activation_policy: SkillActivationPolicy::Manual,
+                created_at_us: 4,
+            })
+            .expect("bind writer");
+
+        let selection = synthesize_skill_prompt_context(
+            &store,
+            "developer",
+            "Please take a browser screenshot of the dashboard and inspect the page.",
+            &[CachedTool {
+                name: "screenshot".into(),
+                description: "Capture a screenshot".into(),
+                parameters_schema: "{}".into(),
+                embedding: Vec::new(),
+                requires_strict_schema: false,
+                streaming_safe: true,
+                parallel_safe: true,
+                modalities: vec![],
+            }],
+        )
+        .expect("skill prompt context");
+
+        assert!(
+            selection
+                .selected_blocks
+                .iter()
+                .any(|block| block.label == "skill:playwright")
+        );
+        assert!(
+            selection
+                .selected_blocks
+                .iter()
+                .all(|block| block.label != "skill:writer")
+        );
+        assert!(
+            selection
+                .selected_blocks
+                .iter()
+                .find(|block| block.label == "skill:playwright")
+                .expect("playwright block")
+                .content
+                .contains("Why included:")
+        );
+        assert!(selection
+            .deferred_labels
+            .iter()
+            .any(|label| label.contains("writer")));
+    }
+
+    #[test]
+    fn run_skill_management_command_supports_codex_compat_import_and_export() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let codex_skill = tempfile::tempdir().expect("codex skill");
+        let export_root = tempfile::tempdir().expect("export root");
+        std::fs::write(
+            codex_skill.path().join("SKILL.md"),
+            r#"---
+name: "playwright"
+description: "Use when browser automation is needed"
+---
+
+# Playwright
+
+Open a page, take snapshots, and capture screenshots when relevant.
+"#,
+        )
+        .expect("write codex skill");
+
+        let mut cfg = base_test_config();
+        cfg.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        let runtime = load_runtime_env_config().expect("runtime env config");
+        let cfg = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+
+        let install = run_skill_management_command(
+            &cfg,
+            &vec![
+                "hiveclaw".into(),
+                "skills".into(),
+                "install".into(),
+                "--codex-dir".into(),
+                codex_skill.path().display().to_string(),
+            ],
+        )
+        .expect("skills command")
+        .expect("compat install should succeed");
+        assert!(install.contains("provenance: compatibility_import"));
+
+        let doctor = run_skill_management_command(
+            &cfg,
+            &vec![
+                "hiveclaw".into(),
+                "skills".into(),
+                "doctor".into(),
+                derive_skill_id_from_path(codex_skill.path()),
+            ],
+        )
+        .expect("skills command")
+        .expect("doctor should succeed");
+        assert!(doctor.contains("provenance: compatibility_import"));
+
+        let export = run_skill_management_command(
+            &cfg,
+            &vec![
+                "hiveclaw".into(),
+                "skills".into(),
+                "export".into(),
+                derive_skill_id_from_path(codex_skill.path()),
+                "--output-dir".into(),
+                export_root.path().display().to_string(),
+                "--format".into(),
+                "codex".into(),
+            ],
+        )
+        .expect("skills command")
+        .expect("compat export should succeed");
+        assert!(export.contains("Codex-compatible"));
+        let exported_skill = export_root
+            .path()
+            .join(derive_skill_id_from_path(codex_skill.path()))
+            .join("SKILL.md");
+        let exported_body = std::fs::read_to_string(exported_skill).expect("exported skill");
+        assert!(exported_body.contains("name: \"playwright\""));
+        assert!(exported_body.contains("Open a page, take snapshots"));
+    }
+
+    #[test]
+    fn run_init_command_bootstraps_local_project_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let args = vec![
+            "hiveclaw".to_string(),
+            "init".to_string(),
+            root.display().to_string(),
+            "--non-interactive".to_string(),
+        ];
+        let out = run_init_command(&args).expect("init should succeed");
+        assert!(out.contains("HiveClaw project bootstrapped."));
+        assert!(root.join(".hiveclaw/config.toml").exists());
+        assert!(root.join(".hiveclaw/policies/default.cedar").exists());
+        assert!(root.join(".hiveclaw/agents/README.md").exists());
+        assert!(root.join("HIVECLAW.md").exists());
+        let config = std::fs::read_to_string(root.join(".hiveclaw/config.toml")).expect("read config");
+        assert!(config.contains("backend = "));
+        assert!(config.contains("default_agent = \"developer\""));
+    }
+
+    #[test]
+    fn run_init_command_merges_existing_guidance_files_by_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        std::fs::write(root.join("AGENTS.md"), "Use careful code review.\n").expect("write AGENTS");
+        std::fs::write(root.join("CLAUDE.md"), "Prefer hooks and project memory.\n")
+            .expect("write CLAUDE");
+        let args = vec![
+            "hiveclaw".to_string(),
+            "init".to_string(),
+            root.display().to_string(),
+            "--non-interactive".to_string(),
+        ];
+        run_init_command(&args).expect("init should succeed");
+        let guidance = std::fs::read_to_string(root.join("HIVECLAW.md")).expect("read guidance");
+        assert!(guidance.contains("Imported from AGENTS.md"));
+        assert!(guidance.contains("Use careful code review."));
+        assert!(guidance.contains("Imported from CLAUDE.md"));
+        assert!(guidance.contains("Prefer hooks and project memory."));
+    }
+
+    #[test]
+    fn run_init_command_edge_preset_reduces_resource_and_browser_defaults() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let args = vec![
+            "hiveclaw".to_string(),
+            "init".to_string(),
+            root.display().to_string(),
+            "--preset".to_string(),
+            "edge".to_string(),
+            "--non-interactive".to_string(),
+        ];
+        let out = run_init_command(&args).expect("init should succeed");
+        assert!(out.contains("preset: edge"));
+        assert!(out.contains("browser tooling not suggested"));
+
+        let config = std::fs::read_to_string(root.join(".hiveclaw/config.toml")).expect("read config");
+        assert!(config.contains("profile = \"edge\""));
+        assert!(config.contains("browser_automation_enabled = false"));
+        assert!(config.contains("learning_enabled = false"));
+        assert!(config.contains("max_parallel_requests = 2"));
+        assert!(config.contains("retrieval_context_char_budget = 6000"));
+
+        let guidance = std::fs::read_to_string(root.join("HIVECLAW.md")).expect("read guidance");
+        assert!(guidance.contains("- preset: `edge`"));
+        assert!(guidance.contains("- browser_runtime_suggested: `false`"));
+        assert!(guidance.contains("- chrome_devtools_mcp_suggested: `false`"));
+    }
+
+    #[test]
+    fn run_init_command_generated_config_loads_with_runtime_schema() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let args = vec![
+            "hiveclaw".to_string(),
+            "init".to_string(),
+            root.display().to_string(),
+            "--non-interactive".to_string(),
+        ];
+        run_init_command(&args).expect("init should succeed");
+
+        let config_path = root.join(".hiveclaw/config.toml");
+        let cfg = crate::load_config(config_path.to_string_lossy().as_ref())
+            .expect("generated config should load");
+        assert_eq!(cfg.gateway.adapters, vec!["cli".to_string()]);
+        assert_eq!(cfg.ui.default_agent, "developer");
+        assert_eq!(cfg.cluster.profile, DeploymentProfile::Node);
     }
 
     #[test]
@@ -14656,6 +16436,8 @@ exit 0
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -14696,6 +16478,8 @@ exit 0
                 &AgentRunRecord {
                     run_id: "run-child-summary-1".into(),
                     parent_run_id: Some("session:abc".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
                     session_id: *session_uuid.as_bytes(),
                     user_id: "u1".into(),
                     requested_by_agent: Some("omni".into()),
@@ -14764,6 +16548,8 @@ exit 0
                 web_domain_blocklist: vec![],
                 browser_profile_allowlist: vec![],
                 browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
                 browser_session_scope: None,
                 crawl_scope: None,
                 web_approval_policy: None,
@@ -14898,6 +16684,8 @@ exit 0
         let run = AgentRunRecord {
             run_id: "run-1".into(),
             parent_run_id: None,
+                    origin_kind: None,
+                    lineage_run_id: None,
             session_id: *session_id.as_bytes(),
             user_id: "u1".into(),
             requested_by_agent: Some("developer".into()),
@@ -14923,6 +16711,8 @@ exit 0
                 kind: AgentRunEventKind::Completed,
                 summary: "completed".into(),
                 created_at_us: 3,
+                related_run_id: None,
+                actor_agent_id: None,
             })
             .expect("append event");
         store
@@ -14959,6 +16749,85 @@ exit 0
             .expect("mailbox array")
             .clone();
         assert_eq!(mailbox[0]["body"], "sub-agent completed");
+    }
+
+    #[test]
+    fn inspect_agent_run_tree_json_surfaces_children_and_continuations() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let session_id = uuid::Uuid::new_v4();
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        for run in [
+            AgentRunRecord {
+                run_id: "run-root".into(),
+                parent_run_id: None,
+                origin_kind: None,
+                lineage_run_id: None,
+                session_id: *session_id.as_bytes(),
+                user_id: "u1".into(),
+                requested_by_agent: Some("developer".into()),
+                agent_id: "planner".into(),
+                status: AgentRunStatus::Completed,
+                request_text: "root task".into(),
+                inbox_on_completion: true,
+                max_runtime_seconds: Some(60),
+                created_at_us: 1,
+                started_at_us: Some(2),
+                finished_at_us: Some(3),
+                result: None,
+            },
+            AgentRunRecord {
+                run_id: "run-child".into(),
+                parent_run_id: Some("run-root".into()),
+                origin_kind: Some(aria_core::AgentRunOriginKind::Spawned),
+                lineage_run_id: None,
+                session_id: *session_id.as_bytes(),
+                user_id: "u1".into(),
+                requested_by_agent: Some("planner".into()),
+                agent_id: "researcher".into(),
+                status: AgentRunStatus::Completed,
+                request_text: "child task".into(),
+                inbox_on_completion: true,
+                max_runtime_seconds: Some(60),
+                created_at_us: 4,
+                started_at_us: Some(5),
+                finished_at_us: Some(6),
+                result: None,
+            },
+            AgentRunRecord {
+                run_id: "run-retry".into(),
+                parent_run_id: Some("run-root".into()),
+                origin_kind: Some(aria_core::AgentRunOriginKind::Retry),
+                lineage_run_id: Some("run-child".into()),
+                session_id: *session_id.as_bytes(),
+                user_id: "u1".into(),
+                requested_by_agent: Some("planner".into()),
+                agent_id: "researcher".into(),
+                status: AgentRunStatus::Queued,
+                request_text: "child retry".into(),
+                inbox_on_completion: true,
+                max_runtime_seconds: Some(60),
+                created_at_us: 7,
+                started_at_us: None,
+                finished_at_us: None,
+                result: None,
+            },
+        ] {
+            store.upsert_agent_run(&run, run.created_at_us).expect("upsert run");
+        }
+
+        let json = inspect_agent_run_tree_json(sessions.path(), &session_id.to_string(), None)
+            .expect("inspect run tree");
+        assert_eq!(json["session_id"], session_id.to_string());
+        assert_eq!(json["snapshot"]["root_run_ids"][0], "run-root");
+        let roots = json["roots"].as_array().expect("roots array");
+        assert_eq!(roots.len(), 1);
+        let children = roots[0]["children"].as_array().expect("children array");
+        assert_eq!(children.len(), 1);
+        let continuations = children[0]["continuations"]
+            .as_array()
+            .expect("continuations array");
+        assert_eq!(continuations.len(), 1);
+        assert_eq!(continuations[0]["run"]["run_id"], "run-retry");
     }
 
     #[test]
@@ -15173,6 +17042,7 @@ exit 0
                     wasm_module_ref: None,
                     config_schema: None,
                     enabled: true,
+                    provenance: None,
                 },
                 1,
             )
@@ -15470,6 +17340,7 @@ exit 0
                 audit_id: "shell-1".into(),
                 session_id: Some("sess-1".into()),
                 agent_id: Some("developer".into()),
+                execution_backend_id: Some("local-default".into()),
                 command: "echo hello".into(),
                 cwd: Some("/workspace".into()),
                 os_containment_requested: true,
@@ -16089,6 +17960,242 @@ exit 0
     }
 
     #[test]
+    fn inspect_computer_profiles_json_returns_stable_shape() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        RuntimeStore::for_sessions_dir(sessions.path())
+            .upsert_computer_profile(
+                &aria_core::ComputerExecutionProfile {
+                    profile_id: "desktop-safe".into(),
+                    display_name: "Desktop Safe".into(),
+                    runtime_kind: aria_core::ComputerRuntimeKind::LocalDesktop,
+                    isolated: false,
+                    headless: false,
+                    allow_clipboard: true,
+                    allow_keyboard: true,
+                    allow_pointer: true,
+                    allowed_windows: vec!["TextEdit".into()],
+                    created_at_us: 1,
+                },
+                2,
+            )
+            .expect("upsert computer profile");
+
+        let json =
+            inspect_computer_profiles_json(sessions.path()).expect("inspect computer profiles");
+        let profiles = json.as_array().expect("profiles array");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0]["profile_id"], "desktop-safe");
+        assert_eq!(profiles[0]["runtime_kind"], "local_desktop");
+    }
+
+    #[test]
+    fn inspect_computer_sessions_json_returns_stable_shape() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let session_id = uuid::Uuid::new_v4();
+        RuntimeStore::for_sessions_dir(sessions.path())
+            .upsert_computer_session(
+                &aria_core::ComputerSessionRecord {
+                    computer_session_id: "computer-session-1".into(),
+                    session_id: *session_id.as_bytes(),
+                    agent_id: "developer".into(),
+                    profile_id: "desktop-safe".into(),
+                    runtime_kind: aria_core::ComputerRuntimeKind::LocalDesktop,
+                    selected_window_id: Some("TextEdit".into()),
+                    created_at_us: 1,
+                    updated_at_us: 2,
+                },
+                2,
+            )
+            .expect("upsert computer session");
+
+        let json = inspect_computer_sessions_json(
+            sessions.path(),
+            Some(&session_id.to_string()),
+            Some("developer"),
+        )
+        .expect("inspect computer sessions");
+        let sessions_json = json.as_array().expect("computer sessions array");
+        assert_eq!(sessions_json.len(), 1);
+        assert_eq!(
+            sessions_json[0]["computer_session_id"],
+            "computer-session-1"
+        );
+        assert_eq!(sessions_json[0]["selected_window_id"], "TextEdit");
+    }
+
+    #[test]
+    fn inspect_computer_artifacts_json_returns_stable_shape() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let session_id = uuid::Uuid::new_v4();
+        RuntimeStore::for_sessions_dir(sessions.path())
+            .append_computer_artifact(&aria_core::ComputerArtifactRecord {
+                artifact_id: "artifact-1".into(),
+                session_id: *session_id.as_bytes(),
+                agent_id: "developer".into(),
+                computer_session_id: Some("computer-session-1".into()),
+                profile_id: Some("desktop-safe".into()),
+                kind: aria_core::ComputerArtifactKind::Screenshot,
+                mime_type: "image/png".into(),
+                storage_path: "/tmp/computer-artifact.png".into(),
+                metadata: serde_json::json!({"source":"test"}),
+                created_at_us: 1,
+            })
+            .expect("append computer artifact");
+
+        let json = inspect_computer_artifacts_json(
+            sessions.path(),
+            Some(&session_id.to_string()),
+            Some("developer"),
+        )
+        .expect("inspect computer artifacts");
+        let artifacts = json.as_array().expect("computer artifacts array");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0]["artifact_id"], "artifact-1");
+        assert_eq!(artifacts[0]["kind"], "screenshot");
+    }
+
+    #[test]
+    fn inspect_computer_action_audits_json_returns_stable_shape() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let session_id = uuid::Uuid::new_v4();
+        RuntimeStore::for_sessions_dir(sessions.path())
+            .append_computer_action_audit(&aria_core::ComputerActionAuditRecord {
+                audit_id: "audit-1".into(),
+                session_id: *session_id.as_bytes(),
+                agent_id: "developer".into(),
+                computer_session_id: Some("computer-session-1".into()),
+                profile_id: Some("desktop-safe".into()),
+                action: aria_core::ComputerActionKind::PointerMove,
+                target: Some("point=120,240".into()),
+                metadata: serde_json::json!({"x":120,"y":240}),
+                created_at_us: 1,
+            })
+            .expect("append computer action audit");
+
+        let json = inspect_computer_action_audits_json(
+            sessions.path(),
+            Some(&session_id.to_string()),
+            Some("developer"),
+        )
+        .expect("inspect computer action audits");
+        let audits = json.as_array().expect("computer audits array");
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0]["audit_id"], "audit-1");
+        assert_eq!(audits[0]["action"], "pointer_move");
+    }
+
+    #[test]
+    fn inspect_execution_backends_json_returns_stable_shape() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        RuntimeStore::for_sessions_dir(sessions.path())
+            .upsert_execution_backend_profile(
+                &aria_core::ExecutionBackendProfile {
+                    backend_id: "docker-main".into(),
+                    display_name: "Docker Main".into(),
+                    kind: aria_core::ExecutionBackendKind::Docker,
+                    config: None,
+                    is_default: false,
+                    requires_approval: true,
+                    supports_workspace_mount: true,
+                    supports_browser: false,
+                    supports_desktop: false,
+                    supports_artifact_return: true,
+                    supports_network_egress: false,
+                    trust_level: aria_core::ExecutionBackendTrustLevel::IsolatedSandbox,
+                },
+                2,
+            )
+            .expect("upsert execution backend");
+
+        let json =
+            inspect_execution_backends_json(sessions.path()).expect("inspect execution backends");
+        let backends = json.as_array().expect("execution backends array");
+        assert_eq!(backends.len(), 1);
+        assert_eq!(backends[0]["backend_id"], "docker-main");
+        assert_eq!(backends[0]["kind"], "docker");
+    }
+
+    #[test]
+    fn inspect_execution_workers_json_returns_stable_shape() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        RuntimeStore::for_sessions_dir(sessions.path())
+            .upsert_execution_worker(
+                &aria_core::ExecutionWorkerRecord {
+                    worker_id: "worker-a".into(),
+                    display_name: "Worker A".into(),
+                    node_id: "node-a".into(),
+                    backend_id: "docker-main".into(),
+                    backend_kind: aria_core::ExecutionBackendKind::Docker,
+                    supports_browser: false,
+                    supports_desktop: false,
+                    supports_gpu: false,
+                    supports_robotics: false,
+                    max_concurrency: 2,
+                    trust_level: aria_core::ExecutionBackendTrustLevel::IsolatedSandbox,
+                    status: aria_core::ExecutionWorkerStatus::Online,
+                    last_heartbeat_us: 10,
+                    robot_binding: Some(aria_core::RobotWorkerBinding {
+                        robot_id: "rover-7".into(),
+                        ros2_profile_id: Some("ros2-lab".into()),
+                        allowed_intents: vec![aria_core::RoboticsIntentKind::ReportState],
+                        policy_group: "lab-safe".into(),
+                        max_abs_velocity: 0.1,
+                        health: aria_core::RobotWorkerHealth::Healthy,
+                        health_notes: vec![],
+                    }),
+                },
+                11,
+            )
+            .expect("upsert execution worker");
+
+        let json = inspect_execution_workers_json(sessions.path(), Some("docker-main"))
+            .expect("inspect execution workers");
+        let workers = json.as_array().expect("execution workers array");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0]["worker_id"], "worker-a");
+        assert_eq!(workers[0]["status"], "online");
+        assert_eq!(workers[0]["robot_binding"]["robot_id"], "rover-7");
+        assert_eq!(workers[0]["robot_binding"]["ros2_profile_id"], "ros2-lab");
+    }
+
+    #[test]
+    fn execution_workers_mark_stale_heartbeats_offline() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        store
+            .upsert_execution_worker(
+                &aria_core::ExecutionWorkerRecord {
+                    worker_id: "worker-a".into(),
+                    display_name: "Worker A".into(),
+                    node_id: "node-a".into(),
+                    backend_id: "docker-main".into(),
+                    backend_kind: aria_core::ExecutionBackendKind::Docker,
+                    supports_browser: false,
+                    supports_desktop: false,
+                    supports_gpu: false,
+                    supports_robotics: false,
+                    max_concurrency: 2,
+                    trust_level: aria_core::ExecutionBackendTrustLevel::IsolatedSandbox,
+                    status: aria_core::ExecutionWorkerStatus::Online,
+                    last_heartbeat_us: 10,
+                    robot_binding: None,
+                },
+                10,
+            )
+            .expect("upsert worker");
+
+        let changed = store
+            .mark_stale_execution_workers_offline(50, 200)
+            .expect("mark stale workers");
+        assert_eq!(changed, 1);
+        let workers = store
+            .list_execution_workers(Some("docker-main"))
+            .expect("list execution workers");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].status, aria_core::ExecutionWorkerStatus::Offline);
+    }
+
+    #[test]
     fn inspect_browser_challenge_events_json_returns_stable_shape() {
         let sessions = tempfile::tempdir().expect("sessions");
         let session_id = uuid::Uuid::new_v4();
@@ -16281,6 +18388,8 @@ exit 0
                 &AgentRunRecord {
                     run_id: "run-1".into(),
                     parent_run_id: None,
+                    origin_kind: None,
+                    lineage_run_id: None,
                     session_id: *session_id.as_bytes(),
                     user_id: "u1".into(),
                     requested_by_agent: None,
@@ -16383,6 +18492,7 @@ exit 0
                 audit_id: "shell-1".into(),
                 session_id: Some(session_id_str.clone()),
                 agent_id: Some("developer".into()),
+                execution_backend_id: Some("local-default".into()),
                 command: "echo hello".into(),
                 cwd: Some("/workspace".into()),
                 os_containment_requested: true,
@@ -16693,6 +18803,8 @@ exit 0
                 &AgentRunRecord {
                     run_id: "run-1".into(),
                     parent_run_id: None,
+                    origin_kind: None,
+                    lineage_run_id: None,
                     session_id: *session_id.as_bytes(),
                     user_id: "u1".into(),
                     requested_by_agent: None,
@@ -17347,6 +19459,7 @@ exit 0
                 audit_id: "shell-1".into(),
                 session_id: Some("sess-1".into()),
                 agent_id: Some("developer".into()),
+                execution_backend_id: Some("local-default".into()),
                 command: "echo hello".into(),
                 cwd: Some("/workspace".into()),
                 os_containment_requested: true,
@@ -17470,6 +19583,8 @@ exit 0
                 &AgentRunRecord {
                     run_id: "run-1".into(),
                     parent_run_id: None,
+                    origin_kind: None,
+                    lineage_run_id: None,
                     session_id: *session_id.as_bytes(),
                     user_id: "u1".into(),
                     requested_by_agent: None,
@@ -18951,6 +21066,596 @@ exit 0
     }
 
     #[test]
+    fn operator_provider_payload_inspection_redacts_secret_like_values() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let policy_path = config_dir.path().join("policy.cedar");
+        std::fs::write(&policy_path, r#"permit(principal, action, resource);"#)
+            .expect("write policy");
+
+        let mut config = base_test_config();
+        config.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        config.policy.policy_path = policy_path.to_string_lossy().to_string();
+        let resolved = ResolvedAppConfig {
+            path: config_dir.path().join("config.toml"),
+            file: config,
+            runtime: load_runtime_env_config().expect("runtime env config"),
+        };
+
+        let session_id = *uuid::Uuid::new_v4().as_bytes();
+        RuntimeStore::for_sessions_dir(sessions.path())
+            .append_context_inspection(&aria_core::ContextInspectionRecord {
+                context_id: "ctx-secret".into(),
+                request_id: *uuid::Uuid::new_v4().as_bytes(),
+                session_id,
+                agent_id: "omni".into(),
+                channel: aria_core::GatewayChannel::Cli,
+                provider_model: Some("openrouter/openai/gpt-4o-mini".into()),
+                prompt_mode: "execution".into(),
+                history_tokens: 1,
+                context_tokens: 1,
+                system_tokens: 1,
+                user_tokens: 1,
+                tool_count: 1,
+                active_tool_names: vec!["read_file".into()],
+                tool_runtime_policy: Some(aria_core::ToolRuntimePolicy::default()),
+                tool_selection: None,
+                provider_request_payload: Some(serde_json::json!({
+                    "authorization":"Bearer sk-live-secret",
+                    "messages":[{"role":"user","content":"hello"}]
+                })),
+                selected_tool_catalog: Vec::new(),
+                hidden_tool_messages: Vec::new(),
+                emitted_artifacts: Vec::new(),
+                tool_provider_readiness: Vec::new(),
+                pack: aria_core::ExecutionContextPack {
+                    system_prompt: "sys".into(),
+                    history_messages: vec![],
+                    context_blocks: vec![],
+                    user_request: "hello".into(),
+                    channel: aria_core::GatewayChannel::Cli,
+                    execution_contract: None,
+                    retrieved_context: None,
+                    working_set: None,
+                    context_plan: None,
+                },
+                rendered_prompt: "rendered".into(),
+                created_at_us: 1,
+            })
+            .expect("append context inspection");
+
+        let out = run_operator_cli_command(
+            &resolved,
+            &[
+                "aria-x".into(),
+                "inspect".into(),
+                "provider-payloads".into(),
+                uuid::Uuid::from_bytes(session_id).to_string(),
+            ],
+        )
+        .expect("inspect command should route")
+        .expect("inspect output");
+        assert!(!out.contains("sk-live-secret"));
+        assert!(out.contains("<redacted>"));
+    }
+
+    #[test]
+    fn operator_cli_inspect_benchmark_summary_reports_quality_metrics() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let policy_path = config_dir.path().join("policy.cedar");
+        std::fs::write(&policy_path, r#"permit(principal, action, resource);"#)
+            .expect("write policy");
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        let request_id = uuid::Uuid::new_v4();
+        let session_id = uuid::Uuid::new_v4();
+        store
+            .record_execution_trace(&ExecutionTrace {
+                request_id: request_id.to_string(),
+                session_id: session_id.to_string(),
+                user_id: "user-1".into(),
+                agent_id: "developer".into(),
+                channel: GatewayChannel::Cli,
+                prompt_mode: "execution".into(),
+                task_fingerprint: TaskFingerprint::from_parts(
+                    "developer",
+                    "execution",
+                    "summarize quality",
+                    &["read_file".into()],
+                ),
+                user_input_summary: "summarize quality".into(),
+                tool_names: vec!["read_file".into()],
+                retrieved_corpora: vec![],
+                outcome: TraceOutcome::Succeeded,
+                latency_ms: 33,
+                response_summary: "done".into(),
+                tool_runtime_policy: None,
+                recorded_at_us: 33,
+            })
+            .expect("record trace");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        store
+            .append_context_inspection(&aria_core::ContextInspectionRecord {
+                context_id: "ctx-benchmark".into(),
+                request_id: *request_id.as_bytes(),
+                session_id: *session_id.as_bytes(),
+                agent_id: "developer".into(),
+                channel: aria_core::GatewayChannel::Cli,
+                provider_model: Some("openrouter/openai/gpt-4o-mini".into()),
+                prompt_mode: "execution".into(),
+                history_tokens: 2,
+                context_tokens: 3,
+                system_tokens: 4,
+                user_tokens: 5,
+                tool_count: 1,
+                active_tool_names: vec!["read_file".into()],
+                tool_runtime_policy: Some(aria_core::ToolRuntimePolicy::default()),
+                tool_selection: None,
+                provider_request_payload: None,
+                selected_tool_catalog: Vec::new(),
+                hidden_tool_messages: Vec::new(),
+                emitted_artifacts: Vec::new(),
+                tool_provider_readiness: Vec::new(),
+                pack: aria_core::ExecutionContextPack {
+                    system_prompt: "sys".into(),
+                    history_messages: vec![],
+                    context_blocks: vec![],
+                    user_request: "summarize quality".into(),
+                    channel: aria_core::GatewayChannel::Cli,
+                    execution_contract: None,
+                    retrieved_context: None,
+                    working_set: None,
+                    context_plan: None,
+                },
+                rendered_prompt: "rendered".into(),
+                created_at_us: 40,
+            })
+            .expect("append context");
+
+        let mut config = base_test_config();
+        config.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        config.policy.policy_path = policy_path.to_string_lossy().to_string();
+        let resolved = ResolvedAppConfig {
+            path: config_dir.path().join("config.toml"),
+            file: config,
+            runtime: load_runtime_env_config().expect("runtime env config"),
+        };
+        let out = run_operator_cli_command(
+            &resolved,
+            &["aria-x".into(), "inspect".into(), "benchmark-summary".into()],
+        )
+        .expect("inspect benchmark summary should route")
+        .expect("inspect benchmark summary output");
+        assert!(out.contains("\"trace_count\": 1"));
+        assert!(out.contains("\"provider_usage\""));
+        assert!(out.contains("\"streaming_metrics\""));
+    }
+
+    #[test]
+    fn operator_cli_inspect_runtime_profile_reports_edge_budget() {
+        let mut config = base_test_config();
+        config.cluster.profile = DeploymentProfile::Edge;
+        config.resource_budget.max_parallel_requests = 9;
+        config.resource_budget.wasm_max_memory_pages = 256;
+        config.resource_budget.max_tool_rounds = 7;
+        config.resource_budget.retrieval_context_char_budget = 12_000;
+        config.resource_budget.browser_automation_enabled = true;
+        config.resource_budget.learning_enabled = true;
+        let resolved = Arc::new(ResolvedAppConfig {
+            path: PathBuf::from("/tmp/hiveclaw-edge.toml"),
+            file: config,
+            runtime: load_runtime_env_config().expect("runtime env config"),
+        });
+        install_app_runtime(Arc::clone(&resolved));
+
+        let out = run_operator_cli_command(
+            &resolved,
+            &["aria-x".into(), "inspect".into(), "runtime-profile".into()],
+        )
+        .expect("inspect runtime profile should route")
+        .expect("inspect runtime profile output");
+
+        assert!(out.contains("\"deployment_profile\": \"edge\""));
+        assert!(out.contains("\"max_parallel_requests\": 2"));
+        assert!(out.contains("\"wasm_max_memory_pages\": 96"));
+        assert!(out.contains("\"browser_automation_enabled\": false"));
+        assert!(out.contains("low-end CPU / memory nodes"));
+    }
+
+    #[test]
+    fn robotics_simulate_command_persists_state_and_simulations() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let fixture_dir = tempfile::tempdir().expect("fixture dir");
+        let fixture_path = fixture_dir.path().join("robotics_fixture.json");
+        std::fs::write(
+            &fixture_path,
+            serde_json::json!({
+                "agent_id": "robotics_ctrl",
+                "contract": {
+                    "intent_id": uuid::Uuid::new_v4().to_string(),
+                    "robot_id": "rover-1",
+                    "requested_by_agent": "robotics_ctrl",
+                    "kind": "move_actuator",
+                    "actuator_id": 4,
+                    "target_velocity": 0.15,
+                    "reason": "simulation smoke test",
+                    "execution_mode": "simulation",
+                    "timestamp_us": 42
+                },
+                "state": {
+                    "robot_id": "rover-1",
+                    "battery_percent": 88,
+                    "active_faults": [],
+                    "degraded_local_mode": false,
+                    "last_heartbeat_us": 41
+                },
+                "safety_envelope": {
+                    "max_abs_velocity": 0.2,
+                    "allowed_actuator_ids": [1, 4, 7],
+                    "motion_requires_approval": false,
+                    "allow_capture": true
+                }
+            })
+            .to_string(),
+        )
+        .expect("write fixture");
+
+        let mut config = base_test_config();
+        config.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        let resolved = ResolvedAppConfig {
+            path: fixture_dir.path().join("config.toml"),
+            file: config,
+            runtime: load_runtime_env_config().expect("runtime env config"),
+        };
+
+        let out = run_robotics_simulation_command(
+            &resolved,
+            &[
+                "hiveclaw".into(),
+                "robotics".into(),
+                "simulate".into(),
+                fixture_path.to_string_lossy().to_string(),
+            ],
+        )
+        .expect("robotics simulate command");
+        assert!(out.contains("\"outcome\": \"simulated\""));
+
+        let inspect_state = run_operator_cli_command(
+            &resolved,
+            &["hiveclaw".into(), "inspect".into(), "robot-state".into(), "rover-1".into()],
+        )
+        .expect("inspect robot state should route")
+        .expect("inspect robot state output");
+        assert!(inspect_state.contains("\"robot_id\": \"rover-1\""));
+        assert!(inspect_state.contains("\"execution_mode\": \"simulation\""));
+
+        let inspect_runs = run_operator_cli_command(
+            &resolved,
+            &[
+                "hiveclaw".into(),
+                "inspect".into(),
+                "robotics-runs".into(),
+                "rover-1".into(),
+            ],
+        )
+        .expect("inspect robotics runs should route")
+        .expect("inspect robotics runs output");
+        assert!(inspect_runs.contains("\"outcome\": \"simulated\""));
+        assert!(inspect_runs.contains("\"directive\""));
+    }
+
+    #[test]
+    fn robotics_simulate_command_marks_motion_as_approval_required() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let fixture_dir = tempfile::tempdir().expect("fixture dir");
+        let fixture_path = fixture_dir.path().join("robotics_fixture_approval.json");
+        std::fs::write(
+            &fixture_path,
+            serde_json::json!({
+                "agent_id": "robotics_ctrl",
+                "contract": {
+                    "intent_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "robot_id": "rover-2",
+                    "requested_by_agent": "robotics_ctrl",
+                    "kind": "move_actuator",
+                    "actuator_id": 4,
+                    "target_velocity": 0.1,
+                    "reason": "requires approval",
+                    "execution_mode": "simulation",
+                    "timestamp_us": 52
+                },
+                "state": {
+                    "robot_id": "rover-2",
+                    "battery_percent": 73,
+                    "active_faults": [],
+                    "degraded_local_mode": false,
+                    "last_heartbeat_us": 51
+                },
+                "safety_envelope": {
+                    "max_abs_velocity": 0.2,
+                    "allowed_actuator_ids": [1, 4, 7],
+                    "motion_requires_approval": true,
+                    "allow_capture": true
+                }
+            })
+            .to_string(),
+        )
+        .expect("write approval fixture");
+
+        let mut config = base_test_config();
+        config.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        let resolved = ResolvedAppConfig {
+            path: fixture_dir.path().join("config.toml"),
+            file: config,
+            runtime: load_runtime_env_config().expect("runtime env config"),
+        };
+
+        let out = run_robotics_simulation_command(
+            &resolved,
+            &[
+                "hiveclaw".into(),
+                "robotics".into(),
+                "simulate".into(),
+                fixture_path.to_string_lossy().to_string(),
+            ],
+        )
+        .expect("robotics simulate approval command");
+        assert!(out.contains("\"outcome\": \"approval_required\""));
+        assert!(out.contains("\"safety_events\""));
+
+        let inspect_runs = run_operator_cli_command(
+            &resolved,
+            &[
+                "hiveclaw".into(),
+                "inspect".into(),
+                "robotics-runs".into(),
+                "rover-2".into(),
+            ],
+        )
+        .expect("inspect robotics runs should route")
+        .expect("inspect robotics runs output");
+        assert!(inspect_runs.contains("\"outcome\": \"approval_required\""));
+        assert!(inspect_runs.contains("\"ApprovalRequired\"") || inspect_runs.contains("\"approval_required\""));
+    }
+
+    #[test]
+    fn robotics_ros2_simulate_command_persists_profile_and_bridge_record() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let fixture_dir = tempfile::tempdir().expect("fixture dir");
+        let fixture_path = fixture_dir.path().join("robotics_ros2_fixture.json");
+        std::fs::write(
+            &fixture_path,
+            serde_json::json!({
+                "agent_id": "robotics_ctrl",
+                "connection_kind": "ros2",
+                "contract": {
+                    "intent_id": uuid::Uuid::new_v4().to_string(),
+                    "robot_id": "rover-ros2",
+                    "requested_by_agent": "robotics_ctrl",
+                    "kind": "report_state",
+                    "reason": "ros2 simulation smoke test",
+                    "execution_mode": "simulation",
+                    "timestamp_us": 71
+                },
+                "state": {
+                    "robot_id": "rover-ros2",
+                    "battery_percent": 91,
+                    "active_faults": [],
+                    "degraded_local_mode": false,
+                    "last_heartbeat_us": 70
+                },
+                "safety_envelope": {
+                    "max_abs_velocity": 0.2,
+                    "allowed_actuator_ids": [1, 4, 7],
+                    "motion_requires_approval": false,
+                    "allow_capture": true
+                },
+                "ros2_profile": {
+                    "profile_id": "ros2-lab",
+                    "display_name": "Lab ROS2",
+                    "namespace": "/robots/lab",
+                    "command_topic": "cmd",
+                    "telemetry_topic": "telemetry",
+                    "image_topic": "camera",
+                    "service_prefix": "svc",
+                    "requires_approval": true,
+                    "simulation_only": true
+                },
+                "namespace_override": "/robots/rover-ros2"
+            })
+            .to_string(),
+        )
+        .expect("write ros2 fixture");
+
+        let mut config = base_test_config();
+        config.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        let resolved = ResolvedAppConfig {
+            path: fixture_dir.path().join("config.toml"),
+            file: config,
+            runtime: load_runtime_env_config().expect("runtime env config"),
+        };
+
+        let out = run_robotics_ros2_simulation_command(
+            &resolved,
+            &[
+                "hiveclaw".into(),
+                "robotics".into(),
+                "ros2-simulate".into(),
+                fixture_path.to_string_lossy().to_string(),
+            ],
+        )
+        .expect("robotics ros2 simulate command");
+        assert!(out.contains("\"outcome\": \"simulated\""));
+        assert!(out.contains("\"ros2_profile_id\": \"ros2-lab\""));
+        assert!(out.contains("/robots/rover-ros2/cmd"));
+
+        let inspect_profiles = run_operator_cli_command(
+            &resolved,
+            &[
+                "hiveclaw".into(),
+                "inspect".into(),
+                "ros2-profiles".into(),
+                "ros2-lab".into(),
+            ],
+        )
+        .expect("inspect ros2 profiles should route")
+        .expect("inspect ros2 profiles output");
+        assert!(inspect_profiles.contains("\"profile_id\": \"ros2-lab\""));
+        assert!(inspect_profiles.contains("\"telemetry_topic\": \"telemetry\""));
+
+        let inspect_state = run_operator_cli_command(
+            &resolved,
+            &["hiveclaw".into(), "inspect".into(), "robot-state".into(), "rover-ros2".into()],
+        )
+        .expect("inspect robot state should route")
+        .expect("inspect robot state output");
+        assert!(inspect_state.contains("\"bridge_profile_id\": \"ros2-lab\""));
+        assert!(inspect_state.contains("\"connection_kind\": \"ros2_simulation\""));
+
+        let inspect_runs = run_operator_cli_command(
+            &resolved,
+            &[
+                "hiveclaw".into(),
+                "inspect".into(),
+                "robotics-runs".into(),
+                "rover-ros2".into(),
+            ],
+        )
+        .expect("inspect robotics runs should route")
+        .expect("inspect robotics runs output");
+        assert!(inspect_runs.contains("\"ros2_profile_id\": \"ros2-lab\""));
+        assert!(inspect_runs.contains("/robots/rover-ros2/telemetry"));
+    }
+
+    #[test]
+    fn run_release_gate_cli_succeeds_when_replay_contracts_and_provider_reports_pass() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        let request_id = uuid::Uuid::new_v4();
+        let session_id = uuid::Uuid::new_v4();
+        let fingerprint = TaskFingerprint::from_parts(
+            "developer",
+            "execution",
+            "gate check",
+            &["write_file".into()],
+        );
+        store
+            .record_execution_trace(&ExecutionTrace {
+                request_id: request_id.to_string(),
+                session_id: session_id.to_string(),
+                user_id: "user-1".into(),
+                agent_id: "developer".into(),
+                channel: GatewayChannel::Cli,
+                prompt_mode: "execution".into(),
+                task_fingerprint: fingerprint.clone(),
+                user_input_summary: "gate check".into(),
+                tool_names: vec!["write_file".into()],
+                retrieved_corpora: vec![],
+                outcome: TraceOutcome::Succeeded,
+                latency_ms: 45,
+                response_summary: "created file successfully".into(),
+                tool_runtime_policy: None,
+                recorded_at_us: 45,
+            })
+            .expect("record trace");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        store
+            .record_reward_event(&RewardEvent {
+                event_id: "reward-gate".into(),
+                request_id: request_id.to_string(),
+                session_id: session_id.to_string(),
+                kind: RewardKind::Accepted,
+                value: 1,
+                notes: None,
+                recorded_at_us: 46,
+            })
+            .expect("reward event");
+        store
+            .append_context_inspection(&aria_core::ContextInspectionRecord {
+                context_id: "ctx-gate".into(),
+                request_id: *request_id.as_bytes(),
+                session_id: *session_id.as_bytes(),
+                agent_id: "developer".into(),
+                channel: aria_core::GatewayChannel::Cli,
+                provider_model: Some("openrouter/openai/gpt-4o-mini".into()),
+                prompt_mode: "execution".into(),
+                history_tokens: 1,
+                context_tokens: 1,
+                system_tokens: 1,
+                user_tokens: 1,
+                tool_count: 1,
+                active_tool_names: vec!["write_file".into()],
+                tool_runtime_policy: Some(aria_core::ToolRuntimePolicy::default()),
+                tool_selection: None,
+                provider_request_payload: None,
+                selected_tool_catalog: Vec::new(),
+                hidden_tool_messages: Vec::new(),
+                emitted_artifacts: Vec::new(),
+                tool_provider_readiness: Vec::new(),
+                pack: aria_core::ExecutionContextPack {
+                    system_prompt: "sys".into(),
+                    history_messages: vec![],
+                    context_blocks: vec![],
+                    user_request: "gate check".into(),
+                    channel: aria_core::GatewayChannel::Cli,
+                    execution_contract: None,
+                    retrieved_context: None,
+                    working_set: None,
+                    context_plan: None,
+                },
+                rendered_prompt: "rendered".into(),
+                created_at_us: 47,
+            })
+            .expect("append context");
+
+        let golden_path = sessions.path().join("golden.toml");
+        std::fs::write(
+            &golden_path,
+            format!(
+                "[[scenarios]]\nid = \"gate\"\ntask_fingerprint = \"{}\"\nexpected_outcome = \"succeeded\"\nrequired_tools = [\"write_file\"]\nresponse_must_contain = [\"created\"]\nmin_reward_score = 1\n",
+                fingerprint.key
+            ),
+        )
+        .expect("write golden suite");
+        let provider_path = sessions.path().join("providers.toml");
+        std::fs::write(
+            &provider_path,
+            format!(
+                "[[scenarios]]\nid = \"gate-provider\"\ntask_fingerprint = \"{}\"\nrequired_providers = [\"openrouter\"]\n",
+                fingerprint.key
+            ),
+        )
+        .expect("write provider suite");
+
+        let mut cfg = base_test_config();
+        cfg.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        let runtime = load_runtime_env_config().expect("runtime env config");
+        let resolved = ResolvedAppConfig {
+            path: PathBuf::from("config.toml"),
+            file: cfg,
+            runtime,
+        };
+
+        let out = run_release_gate_cli(
+            &resolved,
+            &[
+                "hiveclaw".into(),
+                "replay".into(),
+                "gate".into(),
+                "--golden".into(),
+                golden_path.to_string_lossy().to_string(),
+                "--providers".into(),
+                provider_path.to_string_lossy().to_string(),
+            ],
+        )
+        .expect("release gate should pass");
+        assert!(out.contains("Release gate report"));
+        assert!(out.contains("golden_failed: 0"));
+        assert!(out.contains("contracts_failed: 0"));
+        assert!(out.contains("provider_benchmark_failed: 0"));
+    }
+
+    #[test]
     fn operator_cli_provider_payload_singular_alias_routes_for_inspect_and_explain() {
         let sessions = tempfile::tempdir().expect("sessions");
         let config_dir = tempfile::tempdir().expect("config dir");
@@ -19042,6 +21747,163 @@ exit 0
         .expect("explain alias command should route")
         .expect("explain alias output");
         assert!(explain_out.contains("Context ctx-cli-alias"));
+    }
+
+    #[test]
+    fn operator_cli_inspect_runs_routes_to_agent_run_json() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let policy_path = config_dir.path().join("policy.cedar");
+        std::fs::write(&policy_path, r#"permit(principal, action, resource);"#)
+            .expect("write policy");
+
+        let mut config = base_test_config();
+        config.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        config.policy.policy_path = policy_path.to_string_lossy().to_string();
+        let resolved = ResolvedAppConfig {
+            path: config_dir.path().join("config.toml"),
+            file: config,
+            runtime: load_runtime_env_config().expect("runtime env config"),
+        };
+
+        let session_id = uuid::Uuid::new_v4();
+        RuntimeStore::for_sessions_dir(sessions.path())
+            .upsert_agent_run(
+                &aria_core::AgentRunRecord {
+                    run_id: "run-inspect-1".into(),
+                    parent_run_id: Some("parent-1".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
+                    session_id: *session_id.as_bytes(),
+                    user_id: "cli_user".into(),
+                    requested_by_agent: Some("omni".into()),
+                    agent_id: "researcher".into(),
+                    status: aria_core::AgentRunStatus::Running,
+                    request_text: "inspect this".into(),
+                    inbox_on_completion: true,
+                    max_runtime_seconds: Some(60),
+                    created_at_us: 1,
+                    started_at_us: Some(2),
+                    finished_at_us: None,
+                    result: None,
+                },
+                2,
+            )
+            .expect("upsert run");
+
+        let out = run_operator_cli_command(
+            &resolved,
+            &[
+                "aria-x".into(),
+                "inspect".into(),
+                "runs".into(),
+                session_id.to_string(),
+            ],
+        )
+        .expect("inspect runs should route")
+        .expect("inspect runs output");
+        assert!(out.contains("\"run-inspect-1\""));
+        assert!(out.contains("\"researcher\""));
+    }
+
+    #[test]
+    fn operator_cli_inspect_mcp_servers_and_bindings_are_discoverable() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let policy_path = config_dir.path().join("policy.cedar");
+        std::fs::write(&policy_path, r#"permit(principal, action, resource);"#)
+            .expect("write policy");
+
+        let mut config = base_test_config();
+        config.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        config.policy.policy_path = policy_path.to_string_lossy().to_string();
+        let resolved = ResolvedAppConfig {
+            path: config_dir.path().join("config.toml"),
+            file: config,
+            runtime: load_runtime_env_config().expect("runtime env config"),
+        };
+
+        let store = RuntimeStore::for_sessions_dir(sessions.path());
+        store
+            .upsert_mcp_server(
+                &aria_core::McpServerProfile {
+                    server_id: "chrome_devtools".into(),
+                    display_name: "Chrome DevTools MCP".into(),
+                    transport: "stdio".into(),
+                    endpoint: "npx -y chrome-devtools-mcp@latest --headless --isolated --slim"
+                        .into(),
+                    auth_ref: None,
+                    enabled: true,
+                },
+                10,
+            )
+            .expect("upsert mcp server");
+        store
+            .upsert_mcp_binding(&aria_core::McpBindingRecord {
+                binding_id: "binding-1".into(),
+                agent_id: "developer".into(),
+                server_id: "chrome_devtools".into(),
+                primitive_kind: aria_core::McpPrimitiveKind::Tool,
+                target_name: "navigate".into(),
+                created_at_us: 11,
+            })
+            .expect("upsert mcp binding");
+
+        let servers_out = run_operator_cli_command(
+            &resolved,
+            &["aria-x".into(), "inspect".into(), "mcp-servers".into()],
+        )
+        .expect("inspect mcp servers should route")
+        .expect("inspect mcp servers output");
+        assert!(servers_out.contains("\"chrome_devtools\""));
+
+        let bindings_out = run_operator_cli_command(
+            &resolved,
+            &[
+                "aria-x".into(),
+                "inspect".into(),
+                "mcp-bindings".into(),
+                "developer".into(),
+            ],
+        )
+        .expect("inspect mcp bindings should route")
+        .expect("inspect mcp bindings output");
+        assert!(bindings_out.contains("\"navigate\""));
+    }
+
+    #[tokio::test]
+    async fn operator_cli_inspect_workspace_locks_routes_to_snapshot_json() {
+        let sessions = tempfile::tempdir().expect("sessions");
+        let config_dir = tempfile::tempdir().expect("config dir");
+        let policy_path = config_dir.path().join("policy.cedar");
+        std::fs::write(&policy_path, r#"permit(principal, action, resource);"#)
+            .expect("write policy");
+
+        let mut config = base_test_config();
+        config.ssmu.sessions_dir = sessions.path().to_string_lossy().to_string();
+        config.policy.policy_path = policy_path.to_string_lossy().to_string();
+        let resolved = ResolvedAppConfig {
+            path: config_dir.path().join("config.toml"),
+            file: config,
+            runtime: load_runtime_env_config().expect("runtime env config"),
+        };
+
+        let workspace_key = format!("workspace:/cli-inspect-{}", uuid::Uuid::new_v4());
+        let guard = workspace_lock_manager()
+            .acquire(workspace_key.clone(), "cli-inspection")
+            .await
+            .expect("workspace lock");
+
+        let out = run_operator_cli_command(
+            &resolved,
+            &["aria-x".into(), "inspect".into(), "workspace-locks".into()],
+        )
+        .expect("inspect workspace locks should route")
+        .expect("inspect workspace locks output");
+        assert!(out.contains(&workspace_key));
+        assert!(out.contains("cli-inspection"));
+
+        drop(guard);
     }
 
     #[test]
@@ -19275,6 +22137,8 @@ exit 0
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -19328,6 +22192,8 @@ exit 0
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,
@@ -19709,6 +22575,8 @@ exit 0
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,

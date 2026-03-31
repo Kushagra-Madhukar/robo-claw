@@ -52,10 +52,10 @@ use aria_intelligence::{
         self, ollama::OllamaBackend, resolve_capability_profile, ProviderRegistry, SecretRef,
     },
     AgentConfigStore, AgentOrchestrator, CachedTool, DynamicToolCache, EmbeddingModel,
-    ExecutedToolCall, FastEmbedder, LLMBackend, LLMResponse, LlmBackendPool, OrchestratorError,
-    OrchestratorEvent, OrchestratorEventSink, PromptManager, RouteConfig, RouterIndex,
-    ScheduleSpec, ScheduledJobKind, ScheduledPromptJob, SemanticRouter, ToolCall,
-    ToolExecutionResult, ToolExecutor,
+    ExecutedToolCall, ExecutionBackendRequest, FastEmbedder, LLMBackend, LLMResponse,
+    LlmBackendPool, OrchestratorError, OrchestratorEvent, OrchestratorEventSink,
+    PromptManager, RouteConfig, RouterIndex, ScheduleSpec, ScheduledJobKind, ScheduledPromptJob,
+    SemanticRouter, ToolCall, ToolExecutionResult, ToolExecutor, select_execution_backend,
     ToolManifestStore,
 };
 use aria_learning::{
@@ -73,6 +73,8 @@ mod channel_health;
 mod ingress;
 mod outbound;
 mod robotics_bridge;
+mod ros2_bridge;
+mod robotics_runtime;
 mod runtime_store;
 mod stt;
 mod telegram_support;
@@ -104,10 +106,15 @@ enum RagCorpus {
 }
 
 include!("config.rs");
+include!("rules.rs");
 include!("workspace_lock.rs");
 include!("gateway_runtime.rs");
 include!("tools.rs");
 include!("browser.rs");
+include!("computer.rs");
+include!("execution_backends.rs");
+include!("redaction.rs");
+include!("telemetry_export.rs");
 include!("web.rs");
 include!("crawl.rs");
 include!("scheduler.rs");

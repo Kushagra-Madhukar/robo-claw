@@ -52,12 +52,14 @@ HiveClaw now supports two MCP tools for this flow:
 
 HiveClaw also exposes operator CLI entrypoints:
 
-- `aria-x doctor mcp`
+- `hiveclaw doctor mcp`
   - shows MCP runtime readiness, Chrome binary detection, and current `chrome_devtools` registration/import state
   - supports `--live` to perform a real Chrome DevTools MCP handshake probe
   - supports `--mode auto_connect` with `--live` to probe the active Chrome session instead of a managed launched session
-- `aria-x setup chrome-devtools-mcp`
+- `hiveclaw setup chrome-devtools-mcp`
   - registers Chrome DevTools MCP, discovers the live catalog, and binds tools to an agent
+
+The legacy `aria-x` command remains available for compatibility.
 
 ## Recommended Setup
 
@@ -69,7 +71,7 @@ For the default developer agent flow, configure Chrome DevTools MCP like this:
 Equivalent CLI command:
 
 ```bash
-aria-x setup chrome-devtools-mcp --agent developer
+hiveclaw setup chrome-devtools-mcp --agent developer
 ```
 
 Conceptually, that setup request maps to:
@@ -107,7 +109,7 @@ Use attach mode when you explicitly want DevTools access to a Chrome session you
 Equivalent CLI command:
 
 ```bash
-aria-x setup chrome-devtools-mcp --mode auto_connect --agent developer
+hiveclaw setup chrome-devtools-mcp --mode auto_connect --agent developer
 ```
 
 Conceptually:
@@ -155,19 +157,19 @@ Use the existing MCP inspection surfaces to confirm:
 For a quick CLI summary:
 
 ```bash
-aria-x doctor mcp
-aria-x doctor mcp --live
-aria-x doctor mcp --live --mode auto_connect
+hiveclaw doctor mcp
+hiveclaw doctor mcp --live
+hiveclaw doctor mcp --live --mode auto_connect
 ```
 
 ## First Run
 
 Recommended first operator flow:
 
-1. Run `aria-x doctor mcp` to confirm local Chrome and `npx` detection.
-2. Run `aria-x doctor mcp --live` to verify the managed-launch probe path.
-3. If you want to work against your already-open Chrome session, run `aria-x doctor mcp --live --mode auto_connect`.
-4. Register the integration for an agent with `aria-x setup chrome-devtools-mcp --agent developer`.
+1. Run `hiveclaw doctor mcp` to confirm local Chrome and `npx` detection.
+2. Run `hiveclaw doctor mcp --live` to verify the managed-launch probe path.
+3. If you want to work against your already-open Chrome session, run `hiveclaw doctor mcp --live --mode auto_connect`.
+4. Register the integration for an agent with `hiveclaw setup chrome-devtools-mcp --agent developer`.
 
 ## Notes
 

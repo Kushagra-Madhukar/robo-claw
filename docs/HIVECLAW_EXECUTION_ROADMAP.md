@@ -4,6 +4,10 @@ This document turns the current architecture review and competitive analysis int
 
 It is not a speculative vision note. It is the working program plan for making HiveClaw competitive with the strongest agent runtimes while preserving the parts of the architecture that are already better than the field.
 
+Execution tracker:
+
+- [HIVECLAW_IMPLEMENTATION_CHECKLIST.md](/Users/kushagramadhukar/coding/anima/docs/HIVECLAW_IMPLEMENTATION_CHECKLIST.md)
+
 ## Document Purpose
 
 Use this document for:

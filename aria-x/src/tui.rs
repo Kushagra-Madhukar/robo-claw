@@ -1,10 +1,11 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{stdout, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use crate::{default_project_config_path, resolve_config_path};
+use crate::{build_approval_descriptor, ensure_approval_handle, RuntimeStore};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -44,6 +45,8 @@ pub(crate) fn parse_startup_mode(
         .unwrap_or_else(|| default_project_config_path().to_string_lossy().to_string());
     match args.get(1).map(|value| value.as_str()) {
         Some("channels")
+        | Some("init")
+        | Some("skills")
         | Some("inspect")
         | Some("explain")
         | Some("--inspect-context")
@@ -148,7 +151,11 @@ pub(crate) async fn run_tui_mode(
         }
     });
 
-    let prefs = load_tui_preferences();
+    let default_agent = crate::load_config(config_path)
+        .ok()
+        .map(|cfg| cfg.ui.default_agent.clone())
+        .unwrap_or_else(default_tui_active_agent);
+    let prefs = load_tui_preferences(&default_agent);
     let bootstrap_agent = prefs.active_agent.clone();
     let mut state = TuiState::new(
         config_path.to_string(),
@@ -168,6 +175,8 @@ pub(crate) async fn run_tui_mode(
     ));
     send_ws_text(&mut sink, state.make_request("/agents")).await?;
     send_ws_text(&mut sink, state.make_request("/approvals")).await?;
+    send_ws_text(&mut sink, state.make_request("/provider_health")).await?;
+    send_ws_text(&mut sink, state.make_request("/workspace_locks")).await?;
     state.render(&mut guard.stdout)?;
 
     loop {
@@ -395,7 +404,6 @@ struct TuiState {
     log_path: std::path::PathBuf,
     input: String,
     lines: Vec<TuiLine>,
-    info: Vec<String>,
     scroll: usize,
     sidebar_tab: SidebarTab,
     active_agent: String,
@@ -406,9 +414,27 @@ struct TuiState {
     selected_agent_idx: usize,
     approval_items: Vec<ApprovalItem>,
     selected_approval_idx: usize,
+    approval_detail_cache: HashMap<String, ApprovalDetail>,
+    recent_run_signals: VecDeque<String>,
+    recent_tool_events: VecDeque<String>,
+    recent_context_events: VecDeque<String>,
+    recent_health_events: VecDeque<String>,
+    run_rows: Vec<String>,
+    visible_tool_rows: Vec<String>,
+    hidden_tool_rows: Vec<String>,
+    context_plan_rows: Vec<String>,
+    provider_health_rows: Vec<String>,
+    provider_circuit_rows: Vec<String>,
+    mcp_status_rows: Vec<String>,
+    workspace_lock_rows: Vec<String>,
+    failure_summary_rows: Vec<String>,
+    error_events: usize,
     notifications: VecDeque<String>,
     last_layout: Option<TuiLayout>,
     show_approval_detail: bool,
+    show_command_palette: bool,
+    command_palette_query: String,
+    selected_command_idx: usize,
     bootstrap_complete: bool,
 }
 
@@ -430,17 +456,6 @@ impl TuiState {
                 role: "system",
                 text: "HiveClaw Terminal UI ready. Enter to send, F1 help, F2 /agents, F3 /approvals, F4 /runs, Ctrl+C to quit.".into(),
             }],
-            info: vec![
-                "Shortcuts".into(),
-                "F1 help".into(),
-                "F2 agents".into(),
-                "F3 approvals".into(),
-                "F4 runs".into(),
-                "F5 clear".into(),
-                "Tab switch panel".into(),
-                "PgUp/PgDn scroll".into(),
-                "Use slash commands normally".into(),
-            ],
             scroll: 0,
             sidebar_tab: prefs.sidebar_tab,
             active_agent: prefs.active_agent,
@@ -451,9 +466,27 @@ impl TuiState {
             selected_agent_idx: 0,
             approval_items: Vec::new(),
             selected_approval_idx: 0,
+            approval_detail_cache: HashMap::new(),
+            recent_run_signals: VecDeque::new(),
+            recent_tool_events: VecDeque::new(),
+            recent_context_events: VecDeque::new(),
+            recent_health_events: VecDeque::new(),
+            run_rows: Vec::new(),
+            visible_tool_rows: Vec::new(),
+            hidden_tool_rows: Vec::new(),
+            context_plan_rows: Vec::new(),
+            provider_health_rows: Vec::new(),
+            provider_circuit_rows: Vec::new(),
+            mcp_status_rows: Vec::new(),
+            workspace_lock_rows: Vec::new(),
+            failure_summary_rows: Vec::new(),
+            error_events: 0,
             notifications: VecDeque::new(),
             last_layout: None,
             show_approval_detail: false,
+            show_command_palette: false,
+            command_palette_query: String::new(),
+            selected_command_idx: 0,
             bootstrap_complete: false,
         }
     }
@@ -471,11 +504,13 @@ impl TuiState {
 
     fn push_assistant(&mut self, text: String) {
         self.ingest_runtime_signal(&text);
+        self.refresh_operator_snapshot();
         self.lines.push(TuiLine { role: "aria", text });
         self.scroll = 0;
     }
 
     fn push_system(&mut self, text: String) {
+        self.push_health_event(text.clone());
         self.push_notification(text.clone());
         self.lines.push(TuiLine {
             role: "system",
@@ -495,7 +530,20 @@ impl TuiState {
     }
 
     fn handle_event(&mut self, evt: Event) -> Option<TuiAction> {
+        if self.show_command_palette {
+            return self.handle_command_palette_event(evt);
+        }
         match evt {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers,
+                ..
+            }) if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.show_command_palette = true;
+                self.command_palette_query.clear();
+                self.selected_command_idx = 0;
+                None
+            }
             Event::Key(KeyEvent {
                 code: KeyCode::Char('c'),
                 modifiers,
@@ -529,7 +577,7 @@ impl TuiState {
                 code: KeyCode::F(4),
                 ..
             }) => {
-                self.sidebar_tab = SidebarTab::Session;
+                self.sidebar_tab = SidebarTab::Runs;
                 Some(TuiAction::Send("/runs".into()))
             }
             Event::Key(KeyEvent {
@@ -846,12 +894,28 @@ impl TuiState {
         if self.show_approval_detail {
             self.draw_approval_overlay(stdout, cols, rows)?;
         }
+        if self.show_command_palette {
+            self.draw_command_palette_overlay(stdout, cols, rows)?;
+        }
         let cursor_input = truncate_from_end(&self.input, cols.saturating_sub(6) as usize);
-        queue!(
-            stdout,
-            MoveTo((2 + cursor_input.len()) as u16, header_h + chat_h + 2)
-        )
-        .map_err(|e| e.to_string())?;
+        if self.show_command_palette {
+            let overlay_width = cols.min(72).max(38);
+            let overlay_height = rows.min(16).max(10);
+            let overlay_x = cols.saturating_sub(overlay_width) / 2;
+            let overlay_y = rows.saturating_sub(overlay_height) / 2;
+            let query = truncate_from_end(
+                &self.command_palette_query,
+                overlay_width.saturating_sub(12) as usize,
+            );
+            queue!(stdout, MoveTo(overlay_x + 8 + query.len() as u16, overlay_y + 1))
+                .map_err(|e| e.to_string())?;
+        } else {
+            queue!(
+                stdout,
+                MoveTo((2 + cursor_input.len()) as u16, header_h + chat_h + 2)
+            )
+            .map_err(|e| e.to_string())?;
+        }
         // Render updates layout for mouse interaction after all coordinates are known.
         self.last_layout = Some(layout);
         stdout
@@ -897,15 +961,48 @@ impl TuiState {
         let x = cols.saturating_sub(width) / 2;
         let y = rows.saturating_sub(height) / 2;
         draw_box(stdout, x, y, width, height, " Approval Detail ")?;
-        let lines = [
+        let mut lines = vec![
             format!("handle   {}", selected.handle),
             format!("approval {}", selected.approval_id),
             format!("action   {}", selected.summary),
-            String::new(),
-            "Enter/a approve".into(),
-            "d deny".into(),
-            "i or Esc close".into(),
         ];
+        if let Some(target) = selected
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.target_summary.as_ref())
+            .or(selected.target_summary.as_ref())
+        {
+            lines.push(format!("target   {}", target));
+        }
+        if let Some(risk) = selected
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.risk_summary.as_ref())
+        {
+            lines.push(format!("risk     {}", risk));
+        }
+        if let Some(options) = selected
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.options_summary.as_ref())
+        {
+            lines.push(format!("options  {}", truncate_with_ellipsis(options, 44)));
+        }
+        if let Some(arguments) = selected
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.arguments_preview.as_ref())
+        {
+            lines.push(String::new());
+            lines.push("arguments".into());
+            for arg_line in arguments.lines().take(3) {
+                lines.push(truncate_with_ellipsis(arg_line.trim(), 44));
+            }
+        }
+        lines.push(String::new());
+        lines.push("Enter/a approve".into());
+        lines.push("d deny".into());
+        lines.push("i or Esc close".into());
         let mut row = y + 1;
         for line in lines {
             if row >= y + height - 1 {
@@ -914,6 +1011,65 @@ impl TuiState {
             write_at(stdout, x + 2, row, Color::Yellow, &line)?;
             row += 1;
         }
+        Ok(())
+    }
+
+    fn draw_command_palette_overlay(
+        &self,
+        stdout: &mut std::io::Stdout,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), String> {
+        let width = cols.min(72).max(38);
+        let height = rows.min(16).max(10);
+        let x = cols.saturating_sub(width) / 2;
+        let y = rows.saturating_sub(height) / 2;
+        draw_box(stdout, x, y, width, height, " Command Palette ")?;
+        write_at(stdout, x + 2, y + 1, Color::Cyan, "query")?;
+        write_at(
+            stdout,
+            x + 8,
+            y + 1,
+            Color::White,
+            &truncate_from_end(
+                &self.command_palette_query,
+                width.saturating_sub(12) as usize,
+            ),
+        )?;
+        let commands = self.filtered_palette_commands();
+        let mut row = y + 3;
+        if commands.is_empty() {
+            write_at(stdout, x + 2, row, Color::DarkGrey, "no matching commands")?;
+        } else {
+            for (idx, item) in commands
+                .iter()
+                .take(height.saturating_sub(6) as usize)
+                .enumerate()
+            {
+                let marker = if idx == self.selected_command_idx { ">" } else { " " };
+                let color = if idx == self.selected_command_idx {
+                    Color::Yellow
+                } else {
+                    Color::DarkYellow
+                };
+                let label = format!("{} {} - {}", marker, item.label, item.hint);
+                write_at(
+                    stdout,
+                    x + 2,
+                    row,
+                    color,
+                    &truncate_with_ellipsis(&label, width.saturating_sub(4) as usize),
+                )?;
+                row += 1;
+            }
+        }
+        write_at(
+            stdout,
+            x + 2,
+            y + height - 2,
+            Color::DarkGrey,
+            "Enter run  Esc close  Up/Down select",
+        )?;
         Ok(())
     }
 
@@ -933,6 +1089,25 @@ impl TuiState {
                 if let Some(err) = &self.last_error {
                     lines.push(String::new());
                     lines.push(format!("error {}", err));
+                }
+                lines.join("\n")
+            }
+            SidebarTab::Runs => {
+                let mut lines = vec![
+                    "tab runs".into(),
+                    "F4 or /runs refresh".into(),
+                    format!("known runs {}", self.recent_runs),
+                    format!("messages {}", self.lines.len()),
+                    String::new(),
+                ];
+                if !self.run_rows.is_empty() {
+                    lines.push("latest runs".into());
+                    lines.extend(self.run_rows.iter().cloned());
+                } else if self.recent_run_signals.is_empty() {
+                    lines.push("no run activity captured yet".into());
+                } else {
+                    lines.push("recent run activity".into());
+                    lines.extend(self.recent_run_signals.iter().cloned());
                 }
                 lines.join("\n")
             }
@@ -987,7 +1162,23 @@ impl TuiState {
                         } else {
                             " "
                         };
-                        lines.push(format!("{} {} [{}]", marker, item.summary, item.handle));
+                        let risk = item
+                            .detail
+                            .as_ref()
+                            .and_then(|detail| detail.risk_summary.as_deref())
+                            .unwrap_or("risk pending");
+                        let target = item
+                            .detail
+                            .as_ref()
+                            .and_then(|detail| detail.target_summary.as_deref())
+                            .or(item.target_summary.as_deref())
+                            .map(|value| format!(" ({})", value))
+                            .unwrap_or_default();
+                        lines.push(format!(
+                            "{} {}{} [{}]",
+                            marker, item.summary, target, item.handle
+                        ));
+                        lines.push(format!("  {}", truncate_with_ellipsis(risk, 42)));
                     }
                     if let Some(selected) = self.selected_approval() {
                         lines.push(String::new());
@@ -995,7 +1186,108 @@ impl TuiState {
                         lines.push(format!("handle {}", selected.handle));
                         lines.push(format!("approval {}", selected.approval_id));
                         lines.push(format!("action {}", selected.summary));
+                        if let Some(target) = selected
+                            .detail
+                            .as_ref()
+                            .and_then(|detail| detail.target_summary.as_ref())
+                            .or(selected.target_summary.as_ref())
+                        {
+                            lines.push(format!("target {}", target));
+                        }
+                        if let Some(risk) = selected
+                            .detail
+                            .as_ref()
+                            .and_then(|detail| detail.risk_summary.as_ref())
+                        {
+                            lines.push(format!("risk {}", risk));
+                        }
                     }
+                }
+                lines.join("\n")
+            }
+            SidebarTab::ToolsContext => {
+                let mut lines = vec![
+                    "tab tools/context".into(),
+                    format!("tool events {}", self.recent_tool_events.len()),
+                    format!("context events {}", self.recent_context_events.len()),
+                    String::new(),
+                ];
+                if !self.visible_tool_rows.is_empty() {
+                    lines.push("visible tools".into());
+                    lines.extend(self.visible_tool_rows.iter().cloned());
+                } else if self.recent_tool_events.is_empty() {
+                    lines.push("tools: no activity yet".into());
+                } else {
+                    lines.push("tools".into());
+                    lines.extend(self.recent_tool_events.iter().cloned());
+                }
+                lines.push(String::new());
+                if !self.hidden_tool_rows.is_empty() {
+                    lines.push("hidden tools".into());
+                    lines.extend(self.hidden_tool_rows.iter().cloned());
+                    lines.push(String::new());
+                }
+                if !self.context_plan_rows.is_empty() {
+                    lines.push("context plan".into());
+                    lines.extend(self.context_plan_rows.iter().cloned());
+                } else if self.recent_context_events.is_empty() {
+                    lines.push("context: no activity yet".into());
+                } else {
+                    lines.push("context".into());
+                    lines.extend(self.recent_context_events.iter().cloned());
+                }
+                lines.join("\n")
+            }
+            SidebarTab::SystemHealth => {
+                let transcript_state = if self.scroll == 0 {
+                    "live tail"
+                } else {
+                    "manual scroll"
+                };
+                let mut lines = vec![
+                    "tab system/health".into(),
+                    format!("bootstrap {}", if self.bootstrap_complete { "ok" } else { "pending" }),
+                    format!("ws 127.0.0.1:{}", self.websocket_port),
+                    format!("view {}", transcript_state),
+                    format!("errors {}", self.error_events),
+                ];
+                if let Some(err) = &self.last_error {
+                    lines.push(format!("last error {}", err));
+                }
+                if !self.recent_health_events.is_empty() {
+                    lines.push(String::new());
+                    lines.push("recent health".into());
+                    lines.extend(self.recent_health_events.iter().cloned());
+                }
+                if !self.provider_health_rows.is_empty() {
+                    lines.push(String::new());
+                    lines.push("provider health".into());
+                    lines.extend(self.provider_health_rows.iter().cloned());
+                }
+                if !self.provider_circuit_rows.is_empty() {
+                    lines.push(String::new());
+                    lines.push("provider circuits".into());
+                    lines.extend(self.provider_circuit_rows.iter().cloned());
+                }
+                if !self.mcp_status_rows.is_empty() {
+                    lines.push(String::new());
+                    lines.push("mcp".into());
+                    lines.extend(self.mcp_status_rows.iter().cloned());
+                }
+                if !self.workspace_lock_rows.is_empty() {
+                    lines.push(String::new());
+                    lines.push("workspace locks".into());
+                    lines.extend(self.workspace_lock_rows.iter().cloned());
+                }
+                if !self.failure_summary_rows.is_empty() {
+                    lines.push(String::new());
+                    lines.push("why this happened".into());
+                    lines.extend(self.failure_summary_rows.iter().cloned());
+                }
+                if let Some(log_tail) = self.runtime_log_tail() {
+                    lines.push(String::new());
+                    lines.push("runtime log".into());
+                    lines.extend(log_tail.lines().map(|line| line.to_string()));
                 }
                 lines.join("\n")
             }
@@ -1005,43 +1297,6 @@ impl TuiState {
                     lines.push("no recent notifications".into());
                 } else {
                     lines.extend(self.notifications.iter().cloned());
-                }
-                lines.join("\n")
-            }
-            SidebarTab::Shortcuts => {
-                let mut lines = vec!["tab shortcuts".into()];
-                lines.extend(self.info.clone());
-                lines.join("\n")
-            }
-            SidebarTab::Session => {
-                let transcript_state = if self.scroll == 0 {
-                    "live tail"
-                } else {
-                    "manual scroll"
-                };
-                let mut lines = vec![
-                    "tab session".into(),
-                    format!(
-                        "config {}",
-                        truncate_with_ellipsis(
-                            &self.config_path,
-                            if self.last_layout.is_some_and(|layout| layout.compact_mode) {
-                                18
-                            } else {
-                                28
-                            }
-                        )
-                    ),
-                    format!("ws 127.0.0.1:{}", self.websocket_port),
-                    format!("messages {}", self.lines.len()),
-                    format!("view {}", transcript_state),
-                    "Shift+Up/Down fine scroll".into(),
-                    "PgUp/PgDn page scroll".into(),
-                ];
-                if let Some(log_tail) = self.runtime_log_tail() {
-                    lines.push(String::new());
-                    lines.push("runtime log".into());
-                    lines.extend(log_tail.lines().map(|line| line.to_string()));
                 }
                 lines.join("\n")
             }
@@ -1074,12 +1329,46 @@ impl TuiState {
             self.push_notification(format!("loaded {} agents", self.available_agents.len()));
         }
         if text.starts_with("Pending approvals:") || text == "No pending approvals." {
-            self.approval_items = parse_approval_list(text);
+            self.approval_items = parse_approval_list(text)
+                .into_iter()
+                .map(|mut item| {
+                    item.detail = self
+                        .approval_detail_cache
+                        .get(&item.handle)
+                        .cloned()
+                        .or_else(|| self.approval_detail_cache.get(&item.approval_id).cloned());
+                    if item.target_summary.is_none() {
+                        item.target_summary = item
+                            .detail
+                            .as_ref()
+                            .and_then(|detail| detail.target_summary.clone());
+                    }
+                    item
+                })
+                .collect();
             self.pending_approvals = self.approval_items.len();
             if self.selected_approval_idx >= self.approval_items.len() {
                 self.selected_approval_idx = self.approval_items.len().saturating_sub(1);
             }
             self.push_notification(format!("approvals {}", self.pending_approvals));
+        }
+        if text.starts_with("Provider health:") || text == "No provider circuits are open." {
+            self.provider_circuit_rows = parse_provider_health_list(text);
+        }
+        if text.starts_with("Workspace locks:") || text == "No active workspace locks." {
+            self.workspace_lock_rows = parse_workspace_lock_list(text);
+        }
+        if let Some((handle, approval_id, detail)) = parse_pending_approval_detail(text) {
+            self.approval_detail_cache
+                .insert(handle.clone(), detail.clone());
+            self.approval_detail_cache.insert(approval_id.clone(), detail.clone());
+            if let Some(item) = self
+                .approval_items
+                .iter_mut()
+                .find(|item| item.handle == handle || item.approval_id == approval_id)
+            {
+                item.detail = Some(detail);
+            }
         }
         if text.contains("Stored pending approval") {
             self.pending_approvals = self.pending_approvals.saturating_add(1);
@@ -1091,11 +1380,13 @@ impl TuiState {
         }
         if let Some(count) = extract_prefixed_count(text, "Found ", " runs") {
             self.recent_runs = count;
+            self.push_run_signal(format!("found {} runs", count));
             self.push_notification(format!("runs {}", count));
         }
         if text.to_ascii_lowercase().contains("error")
             || text.to_ascii_lowercase().contains("failed")
         {
+            self.error_events = self.error_events.saturating_add(1);
             self.last_error = Some(
                 text.lines()
                     .next()
@@ -1104,8 +1395,23 @@ impl TuiState {
                     .take(72)
                     .collect(),
             );
-            if let Some(err) = &self.last_error {
+            if let Some(err) = self.last_error.clone() {
+                self.push_health_event(format!("error {}", err));
                 self.push_notification(format!("error {}", err));
+            }
+        }
+        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            if is_run_signal_line(line) {
+                self.push_run_signal(line.to_string());
+            }
+            if is_tool_signal_line(line) {
+                self.push_tool_event(line.to_string());
+            }
+            if is_context_signal_line(line) {
+                self.push_context_event(line.to_string());
+            }
+            if is_health_signal_line(line) {
+                self.push_health_event(line.to_string());
             }
         }
         if text.contains("I am not confident which agent should handle this request") {
@@ -1171,6 +1477,132 @@ impl TuiState {
         }
     }
 
+    fn refresh_operator_snapshot(&mut self) {
+        let Ok(cfg) = crate::load_config(&self.config_path) else {
+            return;
+        };
+        let session_uuid = websocket_session_uuid(self.session_id);
+        let session_str = session_uuid.to_string();
+        let store = RuntimeStore::for_sessions_dir(Path::new(&cfg.ssmu.sessions_dir));
+
+        if let Ok(runs) = store.list_agent_runs_for_session(session_uuid) {
+            self.recent_runs = runs.len();
+            self.run_rows = summarize_run_rows(&runs);
+        }
+
+        if let Ok(approvals) = store.list_approvals(
+            Some(*session_uuid.as_bytes()),
+            Some(&self.user_id),
+            Some(aria_core::ApprovalStatus::Pending),
+        ) {
+            self.pending_approvals = approvals.len();
+            self.approval_items = approvals
+                .into_iter()
+                .take(12)
+                .map(|record| {
+                    let descriptor = build_approval_descriptor(&record);
+                    let handle = ensure_approval_handle(Path::new(&cfg.ssmu.sessions_dir), &record)
+                        .unwrap_or_else(|_| record.approval_id.clone());
+                    let detail = ApprovalDetail {
+                        action_summary: descriptor.action_summary.clone(),
+                        target_summary: descriptor.target_summary.clone(),
+                        risk_summary: Some(descriptor.risk_summary.clone()),
+                        arguments_preview: Some(descriptor.arguments_preview.clone()),
+                        options_summary: Some(descriptor.options.join(", ")),
+                    };
+                    self.approval_detail_cache
+                        .insert(handle.clone(), detail.clone());
+                    self.approval_detail_cache
+                        .insert(record.approval_id.clone(), detail.clone());
+                    ApprovalItem {
+                        summary: descriptor.action_summary,
+                        handle,
+                        approval_id: record.approval_id,
+                        target_summary: descriptor.target_summary,
+                        detail: Some(detail),
+                    }
+                })
+                .collect();
+            if self.selected_approval_idx >= self.approval_items.len() {
+                self.selected_approval_idx = self.approval_items.len().saturating_sub(1);
+            }
+        }
+
+        if let Ok(records) = store.list_context_inspections(Some(&session_str), None) {
+            let latest = records
+                .iter()
+                .find(|record| record.agent_id == self.active_agent)
+                .or_else(|| records.first());
+            if let Some(record) = latest {
+                let visible_tools = record
+                    .tool_selection
+                    .as_ref()
+                    .map(|selection| selection.selected_tool_names.clone())
+                    .filter(|items| !items.is_empty())
+                    .unwrap_or_else(|| record.active_tool_names.clone());
+                self.visible_tool_rows = visible_tools
+                    .into_iter()
+                    .take(8)
+                    .map(|name| format!("- {}", name))
+                    .collect();
+                self.hidden_tool_rows = record
+                    .hidden_tool_messages
+                    .iter()
+                    .take(6)
+                    .map(|msg| format!("- {}", truncate_with_ellipsis(msg, 44)))
+                    .collect();
+                self.context_plan_rows = record
+                    .pack
+                    .context_plan
+                    .as_ref()
+                    .map(|plan| {
+                        let mut rows = Vec::new();
+                        if let Some(summary) = &plan.summary {
+                            rows.push(truncate_with_ellipsis(summary, 44));
+                        }
+                        for block in plan.block_records.iter().take(6) {
+                            rows.push(format!(
+                                "{:?} {} ({})",
+                                block.decision,
+                                truncate_with_ellipsis(&block.label, 20),
+                                block.token_estimate
+                            ));
+                        }
+                        if let Some(ambiguity) = &plan.ambiguity {
+                            rows.push(format!(
+                                "ambiguity {:?}",
+                                ambiguity.outcome
+                            ));
+                        }
+                        rows
+                    })
+                    .unwrap_or_default();
+                self.provider_health_rows = record
+                    .provider_model
+                    .as_ref()
+                    .map(|model| {
+                        vec![format!(
+                            "active backend {}",
+                            truncate_with_ellipsis(model, 40)
+                        )]
+                    })
+                    .unwrap_or_default();
+                self.provider_health_rows.extend(summarize_tool_provider_readiness_rows(
+                    &record.tool_provider_readiness,
+                ));
+                self.failure_summary_rows = summarize_failure_rows(
+                    self.last_error.as_deref(),
+                    &record.hidden_tool_messages,
+                    record.pack.context_plan.as_ref(),
+                    self.pending_approvals,
+                );
+            }
+        }
+
+        self.mcp_status_rows = summarize_mcp_status_rows(&store, &self.active_agent);
+
+    }
+
     fn persist_preferences(&self) {
         let prefs = TuiPreferences {
             active_agent: self.active_agent.clone(),
@@ -1183,10 +1615,35 @@ impl TuiState {
         if text.trim().is_empty() {
             return;
         }
-        self.notifications.push_front(text);
-        while self.notifications.len() > 8 {
-            self.notifications.pop_back();
+        push_capped(&mut self.notifications, text, 8);
+    }
+
+    fn push_run_signal(&mut self, text: String) {
+        if text.trim().is_empty() {
+            return;
         }
+        push_capped(&mut self.recent_run_signals, text, 6);
+    }
+
+    fn push_tool_event(&mut self, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        push_capped(&mut self.recent_tool_events, text, 6);
+    }
+
+    fn push_context_event(&mut self, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        push_capped(&mut self.recent_context_events, text, 6);
+    }
+
+    fn push_health_event(&mut self, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        push_capped(&mut self.recent_health_events, text, 8);
     }
 
     fn handle_mouse_click(&mut self, column: u16, row: u16) -> Option<TuiAction> {
@@ -1225,6 +1682,243 @@ impl TuiState {
         }
         None
     }
+
+    fn handle_command_palette_event(&mut self, evt: Event) -> Option<TuiAction> {
+        match evt {
+            Event::Key(KeyEvent {
+                code: KeyCode::Esc, ..
+            }) => {
+                self.show_command_palette = false;
+                self.command_palette_query.clear();
+                self.selected_command_idx = 0;
+                None
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            }) => {
+                self.command_palette_query.pop();
+                self.selected_command_idx = 0;
+                None
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Up, ..
+            }) => {
+                self.selected_command_idx = self.selected_command_idx.saturating_sub(1);
+                None
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Down, ..
+            }) => {
+                let max_idx = self.filtered_palette_commands().len().saturating_sub(1);
+                if self.selected_command_idx < max_idx {
+                    self.selected_command_idx += 1;
+                }
+                None
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            }) => {
+                let selected = self
+                    .filtered_palette_commands()
+                    .get(self.selected_command_idx)
+                    .cloned();
+                self.show_command_palette = false;
+                self.command_palette_query.clear();
+                self.selected_command_idx = 0;
+                selected.and_then(|item| self.execute_palette_command(item))
+            }
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            }) if !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.command_palette_query.push(ch);
+                self.selected_command_idx = 0;
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn filtered_palette_commands(&self) -> Vec<PaletteCommand> {
+        let query = self.command_palette_query.trim().to_ascii_lowercase();
+        self.palette_commands()
+            .into_iter()
+            .filter(|item| {
+                query.is_empty()
+                    || item.label.to_ascii_lowercase().contains(&query)
+                    || item.hint.to_ascii_lowercase().contains(&query)
+                    || item.search_terms.iter().any(|term| term.contains(&query))
+            })
+            .collect()
+    }
+
+    fn palette_commands(&self) -> Vec<PaletteCommand> {
+        let mut items = vec![
+            PaletteCommand::new(
+                "Refresh agents",
+                "Load and open the agents panel",
+                &["agents", "refresh agents", "switch agent"],
+                PaletteCommandAction::SendAndTab("/agents".into(), SidebarTab::Agents),
+            ),
+            PaletteCommand::new(
+                "Refresh approvals",
+                "Load and open pending approvals",
+                &["approvals", "approval queue", "review approvals"],
+                PaletteCommandAction::SendAndTab("/approvals".into(), SidebarTab::Approvals),
+            ),
+            PaletteCommand::new(
+                "Refresh runs",
+                "Load and open recent runs",
+                &["runs", "background jobs", "run state"],
+                PaletteCommandAction::SendAndTab("/runs".into(), SidebarTab::Runs),
+            ),
+            PaletteCommand::new(
+                "Refresh workspace locks",
+                "Load current workspace lock ownership and waiters",
+                &["workspace locks", "locks", "busy workspace", "contention"],
+                PaletteCommandAction::SendAndTab(
+                    "/workspace_locks".into(),
+                    SidebarTab::SystemHealth,
+                ),
+            ),
+            PaletteCommand::new(
+                "Refresh provider health",
+                "Load provider circuit and fallback state",
+                &["provider health", "circuits", "fallback", "backends"],
+                PaletteCommandAction::SendAndTab(
+                    "/provider_health".into(),
+                    SidebarTab::SystemHealth,
+                ),
+            ),
+            PaletteCommand::new(
+                "Open tools and context",
+                "Switch to the tools/context panel",
+                &["tools", "context", "tool visibility"],
+                PaletteCommandAction::SwitchTab(SidebarTab::ToolsContext),
+            ),
+            PaletteCommand::new(
+                "Open system health",
+                "Switch to runtime and health status",
+                &["system", "health", "errors", "runtime"],
+                PaletteCommandAction::SwitchTab(SidebarTab::SystemHealth),
+            ),
+            PaletteCommand::new(
+                "Inspect current context",
+                "Show the CLI command for context inspection",
+                &["inspect", "context", "why prompt", "debug context"],
+                PaletteCommandAction::SystemMessage(format!(
+                    "Inspect current context with: hiveclaw inspect context {} {}",
+                    websocket_session_uuid(self.session_id),
+                    self.active_agent
+                )),
+            ),
+            PaletteCommand::new(
+                "Explain current context",
+                "Show the CLI command for human-readable context explanation",
+                &["explain", "context", "context summary"],
+                PaletteCommandAction::SystemMessage(format!(
+                    "Explain current context with: hiveclaw explain context {} {}",
+                    websocket_session_uuid(self.session_id),
+                    self.active_agent
+                )),
+            ),
+            PaletteCommand::new(
+                "Inspect provider payloads",
+                "Show the CLI command for provider payload diagnostics",
+                &["inspect", "provider payload", "tool payload", "llm payload"],
+                PaletteCommandAction::SystemMessage(format!(
+                    "Inspect provider payloads with: hiveclaw inspect provider-payloads {} {}",
+                    websocket_session_uuid(self.session_id),
+                    self.active_agent
+                )),
+            ),
+            PaletteCommand::new(
+                "Inspect MCP servers",
+                "Show the CLI command for MCP server diagnostics",
+                &["inspect", "mcp", "chrome devtools", "mcp servers"],
+                PaletteCommandAction::SystemMessage(
+                    "Inspect MCP servers with: hiveclaw inspect mcp-servers".into(),
+                ),
+            ),
+            PaletteCommand::new(
+                "Inspect workspace locks",
+                "Show the CLI command for workspace lock diagnostics",
+                &["inspect", "workspace locks", "busy workspace", "contention"],
+                PaletteCommandAction::SystemMessage(
+                    "Inspect workspace locks with: hiveclaw inspect workspace-locks".into(),
+                ),
+            ),
+            PaletteCommand::new(
+                "Inspect provider health",
+                "Show the CLI command for provider circuit diagnostics",
+                &["inspect", "provider health", "circuit breaker", "fallback"],
+                PaletteCommandAction::SystemMessage(
+                    "Inspect provider health with: hiveclaw inspect provider-health".into(),
+                ),
+            ),
+            PaletteCommand::new(
+                "Open notifications",
+                "Show recent operator notices",
+                &["notifications", "notes", "messages"],
+                PaletteCommandAction::SwitchTab(SidebarTab::Notifications),
+            ),
+            PaletteCommand::new(
+                "Clear transcript",
+                "Remove current transcript lines from the TUI",
+                &["clear", "reset transcript", "clean panel"],
+                PaletteCommandAction::ClearTranscript,
+            ),
+            PaletteCommand::new(
+                "Show shortcuts help",
+                "Add a shortcuts reminder to the transcript",
+                &["help", "shortcuts", "keys", "palette"],
+                PaletteCommandAction::SystemMessage(
+                    "Shortcuts: Ctrl+P command palette, F2 agents, F3 approvals, F4 runs, Ctrl+C quit.".into(),
+                ),
+            ),
+        ];
+
+        for agent in &self.available_agents {
+            items.push(PaletteCommand::new(
+                &format!("Switch agent to {}", agent),
+                "Pin the current session to this agent",
+                &[agent.as_str(), "agent", "switch"],
+                PaletteCommandAction::SendAndTab(
+                    format!("/agent {}", agent),
+                    SidebarTab::Agents,
+                ),
+            ));
+        }
+
+        items
+    }
+
+    fn execute_palette_command(&mut self, item: PaletteCommand) -> Option<TuiAction> {
+        match item.action {
+            PaletteCommandAction::SendAndTab(command, tab) => {
+                self.sidebar_tab = tab;
+                Some(TuiAction::Send(command))
+            }
+            PaletteCommandAction::SwitchTab(tab) => {
+                self.sidebar_tab = tab;
+                None
+            }
+            PaletteCommandAction::ClearTranscript => {
+                self.lines.clear();
+                self.push_system("Transcript cleared.".into());
+                None
+            }
+            PaletteCommandAction::SystemMessage(message) => {
+                self.push_system(message);
+                None
+            }
+        }
+    }
 }
 
 enum TuiAction {
@@ -1232,59 +1926,94 @@ enum TuiAction {
     Send(String),
 }
 
+#[derive(Debug, Clone)]
+struct PaletteCommand {
+    label: String,
+    hint: String,
+    search_terms: Vec<String>,
+    action: PaletteCommandAction,
+}
+
+impl PaletteCommand {
+    fn new(label: &str, hint: &str, search_terms: &[&str], action: PaletteCommandAction) -> Self {
+        Self {
+            label: label.to_string(),
+            hint: hint.to_string(),
+            search_terms: search_terms
+                .iter()
+                .map(|value| value.to_ascii_lowercase())
+                .collect(),
+            action,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PaletteCommandAction {
+    SendAndTab(String, SidebarTab),
+    SwitchTab(SidebarTab),
+    ClearTranscript,
+    SystemMessage(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SidebarTab {
     Summary,
+    Runs,
+    ToolsContext,
+    SystemHealth,
     Agents,
     Approvals,
     Notifications,
-    Shortcuts,
-    Session,
 }
 
 impl SidebarTab {
-    fn all() -> [Self; 6] {
+    fn all() -> [Self; 7] {
         [
             Self::Summary,
+            Self::Runs,
+            Self::ToolsContext,
+            Self::SystemHealth,
             Self::Agents,
             Self::Approvals,
             Self::Notifications,
-            Self::Shortcuts,
-            Self::Session,
         ]
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::Summary => "summary",
+            Self::Runs => "runs",
+            Self::ToolsContext => "tools/ctx",
+            Self::SystemHealth => "system",
             Self::Agents => "agents",
             Self::Approvals => "approvals",
             Self::Notifications => "notes",
-            Self::Shortcuts => "keys",
-            Self::Session => "session",
         }
     }
 
     fn compact_label(self) -> &'static str {
         match self {
             Self::Summary => "sum",
+            Self::Runs => "run",
+            Self::ToolsContext => "tool",
+            Self::SystemHealth => "sys",
             Self::Agents => "agt",
             Self::Approvals => "apr",
             Self::Notifications => "note",
-            Self::Shortcuts => "key",
-            Self::Session => "sess",
         }
     }
 
     fn next(self) -> Self {
         match self {
-            Self::Summary => Self::Agents,
+            Self::Summary => Self::Runs,
+            Self::Runs => Self::ToolsContext,
+            Self::ToolsContext => Self::SystemHealth,
+            Self::SystemHealth => Self::Agents,
             Self::Agents => Self::Approvals,
             Self::Approvals => Self::Notifications,
-            Self::Notifications => Self::Shortcuts,
-            Self::Shortcuts => Self::Session,
-            Self::Session => Self::Summary,
+            Self::Notifications => Self::Summary,
         }
     }
 }
@@ -1351,6 +2080,17 @@ struct ApprovalItem {
     summary: String,
     handle: String,
     approval_id: String,
+    target_summary: Option<String>,
+    detail: Option<ApprovalDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ApprovalDetail {
+    action_summary: String,
+    target_summary: Option<String>,
+    risk_summary: Option<String>,
+    arguments_preview: Option<String>,
+    options_summary: Option<String>,
 }
 
 fn draw_box(
@@ -1689,6 +2429,136 @@ fn stable_tui_session_id() -> u64 {
     u64::from_be_bytes(bytes)
 }
 
+fn websocket_session_uuid(session_seed: u64) -> uuid::Uuid {
+    let mut session_id = [0u8; 16];
+    session_id[0..8].copy_from_slice(&session_seed.to_le_bytes());
+    uuid::Uuid::from_bytes(session_id)
+}
+
+fn summarize_run_rows(runs: &[aria_core::AgentRunRecord]) -> Vec<String> {
+    let mut rows = runs.to_vec();
+    rows.sort_by(|left, right| {
+        run_sort_rank(left)
+            .cmp(&run_sort_rank(right))
+            .then(right.created_at_us.cmp(&left.created_at_us))
+    });
+    rows.into_iter()
+        .take(6)
+        .map(|run| {
+            let scope = if run.parent_run_id.is_some() {
+                "bg"
+            } else {
+                "top"
+            };
+            let status = format!("{:?}", run.status).to_ascii_lowercase();
+            let request = truncate_with_ellipsis(run.request_text.trim(), 20);
+            let run_id = truncate_from_end(&run.run_id, 10);
+            format!("{} {} {} {} [{}]", scope, status, run.agent_id, request, run_id)
+        })
+        .collect()
+}
+
+fn run_sort_rank(run: &aria_core::AgentRunRecord) -> u8 {
+    match run.status {
+        aria_core::AgentRunStatus::Running => 0,
+        aria_core::AgentRunStatus::Queued => 1,
+        aria_core::AgentRunStatus::Completed => 2,
+        aria_core::AgentRunStatus::Failed => 3,
+        aria_core::AgentRunStatus::Cancelled => 4,
+        aria_core::AgentRunStatus::TimedOut => 5,
+    }
+}
+
+fn summarize_tool_provider_readiness_rows(
+    readiness: &[aria_core::ToolProviderReadiness],
+) -> Vec<String> {
+    readiness
+        .iter()
+        .take(6)
+        .map(|entry| {
+            let mut row = format!(
+                "{:?}/{} {:?}",
+                entry.provider_kind, entry.provider_id, entry.status
+            );
+            if entry.bound {
+                row.push_str(" bound");
+            }
+            if !entry.auth_ready {
+                row.push_str(" auth?");
+            }
+            row
+        })
+        .collect()
+}
+
+fn summarize_mcp_status_rows(store: &RuntimeStore, agent_id: &str) -> Vec<String> {
+    let servers = store.list_mcp_servers().unwrap_or_default();
+    let bindings = store.list_mcp_bindings_for_agent(agent_id).unwrap_or_default();
+    servers
+        .into_iter()
+        .take(4)
+        .map(|server| {
+            let tool_count = store
+                .list_mcp_imported_tools(&server.server_id)
+                .map(|items| items.len())
+                .unwrap_or(0);
+            let bound = bindings
+                .iter()
+                .filter(|binding| binding.server_id == server.server_id)
+                .count();
+            format!(
+                "{} {} tools={} bound={}",
+                server.server_id,
+                if server.enabled { "ready" } else { "disabled" },
+                tool_count,
+                bound
+            )
+        })
+        .collect()
+}
+
+fn summarize_failure_rows(
+    last_error: Option<&str>,
+    hidden_tool_messages: &[String],
+    context_plan: Option<&aria_core::ContextPlan>,
+    pending_approvals: usize,
+) -> Vec<String> {
+    let mut rows = Vec::new();
+    if let Some(error) = last_error {
+        let lower = error.to_ascii_lowercase();
+        if lower.contains("missingrequiredartifact") || lower.contains("required artifact") {
+            rows.push("artifact-required contract was not satisfied".into());
+        } else if lower.contains("timeout") {
+            rows.push("provider or tool timed out before completing".into());
+        } else if lower.contains("busy") && lower.contains("workspace") {
+            rows.push("workspace contention blocked a mutating run".into());
+        } else if lower.contains("approval") {
+            rows.push("action paused for approval or approval execution failed".into());
+        } else {
+            rows.push(truncate_with_ellipsis(error, 48));
+        }
+    }
+    if let Some(plan) = context_plan {
+        if let Some(ambiguity) = &plan.ambiguity {
+            rows.push(format!(
+                "reference resolution ended {:?}",
+                ambiguity.outcome
+            ));
+        }
+    }
+    if let Some(hidden) = hidden_tool_messages.first() {
+        rows.push(format!(
+            "tool visibility: {}",
+            truncate_with_ellipsis(hidden, 34)
+        ));
+    }
+    if pending_approvals > 0 {
+        rows.push(format!("{} approval(s) still pending", pending_approvals));
+    }
+    rows.truncate(4);
+    rows
+}
+
 fn extract_prefixed_count(text: &str, prefix: &str, suffix: &str) -> Option<usize> {
     let trimmed = text.trim();
     let rest = trimmed.strip_prefix(prefix)?;
@@ -1720,22 +2590,138 @@ fn parse_approval_list(text: &str) -> Vec<ApprovalItem> {
                 return None;
             }
             let (_, rest) = trimmed.split_once(". ")?;
-            let (summary, tail) = rest.split_once("[#")?;
+            let (summary_with_target, tail) = rest.split_once("[#")?;
             let handle = tail.split('|').next()?.trim();
             let approval_id = tail.split('|').nth(1)?.trim().trim_end_matches(']');
+            let summary_with_target = summary_with_target.trim();
+            let (summary, target_summary) = if let Some((prefix, suffix)) =
+                summary_with_target.rsplit_once(" (")
+            {
+                if let Some(target) = suffix.strip_suffix(')') {
+                    (prefix.trim().to_string(), Some(target.trim().to_string()))
+                } else {
+                    (summary_with_target.to_string(), None)
+                }
+            } else {
+                (summary_with_target.to_string(), None)
+            };
             Some(ApprovalItem {
-                summary: summary.trim().to_string(),
+                summary,
                 handle: handle.to_string(),
                 approval_id: approval_id.to_string(),
+                target_summary,
+                detail: None,
             })
         })
         .collect()
 }
 
+fn parse_workspace_lock_list(text: &str) -> Vec<String> {
+    if text == "No active workspace locks." {
+        return Vec::new();
+    }
+    text.lines()
+        .skip_while(|line| !line.trim().starts_with("Workspace locks:"))
+        .skip(1)
+        .map(str::trim)
+        .filter(|line| line.starts_with('-'))
+        .map(|line| line.trim_start_matches('-').trim().to_string())
+        .collect()
+}
+
+fn parse_provider_health_list(text: &str) -> Vec<String> {
+    if text == "No provider circuits are open." {
+        return Vec::new();
+    }
+    text.lines()
+        .skip_while(|line| !line.trim().starts_with("Provider health:"))
+        .skip(1)
+        .map(str::trim)
+        .filter(|line| line.starts_with('-'))
+        .map(|line| line.trim_start_matches('-').trim().to_string())
+        .collect()
+}
+
+fn parse_pending_approval_detail(text: &str) -> Option<(String, String, ApprovalDetail)> {
+    if !text.contains("Approval required") || !text.contains("Stored pending approval") {
+        return None;
+    }
+    let mut action_summary = None;
+    let mut target_summary = None;
+    let mut risk_summary = None;
+    let mut options_summary = None;
+    let mut arguments_lines = Vec::new();
+    let mut in_arguments = false;
+    let mut approval_id = None;
+    let mut handle = None;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if let Some(value) = line.strip_prefix("Action: ") {
+            action_summary = Some(value.trim().to_string());
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("Target: ") {
+            target_summary = Some(value.trim().to_string());
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("Risk: ") {
+            risk_summary = Some(value.trim().to_string());
+            continue;
+        }
+        if line == "Arguments:" {
+            in_arguments = true;
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("Options: ") {
+            options_summary = Some(value.trim().to_string());
+            in_arguments = false;
+            continue;
+        }
+        if in_arguments {
+            if line.is_empty() {
+                continue;
+            }
+            arguments_lines.push(raw_line.trim_end().to_string());
+        }
+        if let Some(rest) = line.strip_prefix("Stored pending approval '") {
+            if let Some((id, tail)) = rest.split_once("' (handle: `") {
+                approval_id = Some(id.to_string());
+                if let Some(found_handle) = tail.split('`').next() {
+                    handle = Some(found_handle.to_string());
+                }
+            }
+        }
+    }
+
+    let approval_id = approval_id?;
+    let handle = handle?;
+    let action_summary = action_summary.unwrap_or_else(|| "approval required".to_string());
+    let arguments_preview = if arguments_lines.is_empty() {
+        None
+    } else {
+        Some(arguments_lines.join("\n"))
+    };
+    Some((
+        handle,
+        approval_id,
+        ApprovalDetail {
+            action_summary,
+            target_summary,
+            risk_summary,
+            arguments_preview,
+            options_summary,
+        },
+    ))
+}
+
 fn is_bootstrap_safe_command(text: &str) -> bool {
     let trimmed = text.trim();
     trimmed.starts_with("/agent ")
-        || matches!(trimmed, "/agents" | "/approvals" | "/runs" | "/help")
+        || matches!(
+            trimmed,
+            "/agents" | "/approvals" | "/runs" | "/workspace_locks" | "/provider_health" | "/help"
+        )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1757,8 +2743,44 @@ impl Default for TuiPreferences {
 
 impl Default for SidebarTab {
     fn default() -> Self {
-        Self::Summary
+        Self::Runs
     }
+}
+
+fn push_capped(target: &mut VecDeque<String>, text: String, max_items: usize) {
+    target.push_front(text);
+    while target.len() > max_items {
+        target.pop_back();
+    }
+}
+
+fn is_run_signal_line(line: &str) -> bool {
+    line.starts_with("Found ") && line.contains(" runs")
+        || line.starts_with("Run ")
+        || line.starts_with("Queued async child agent")
+}
+
+fn is_tool_signal_line(line: &str) -> bool {
+    line.starts_with("Executed browser action")
+        || line.starts_with("Stored browser screenshot artifact")
+        || line.starts_with("Created file")
+        || line.starts_with("Tool ")
+}
+
+fn is_context_signal_line(line: &str) -> bool {
+    line.starts_with("Session override set to agent:")
+        || line.starts_with("Current agent override:")
+        || line.starts_with("Available agents:")
+        || line.to_ascii_lowercase().contains("context")
+}
+
+fn is_health_signal_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("error")
+        || lower.contains("failed")
+        || lower.contains("timeout")
+        || line.starts_with("Runtime connection")
+        || line.starts_with("Connected.")
 }
 
 fn default_tui_active_agent() -> String {
@@ -1773,14 +2795,20 @@ fn tui_preferences_path() -> Option<std::path::PathBuf> {
     Some(dir.join("tui_prefs.json"))
 }
 
-fn load_tui_preferences() -> TuiPreferences {
+fn load_tui_preferences(default_agent: &str) -> TuiPreferences {
     let Some(path) = tui_preferences_path() else {
-        return TuiPreferences::default();
+        return TuiPreferences {
+            active_agent: default_agent.to_string(),
+            ..TuiPreferences::default()
+        };
     };
     std::fs::read_to_string(path)
         .ok()
         .and_then(|content| serde_json::from_str(&content).ok())
-        .unwrap_or_default()
+        .unwrap_or(TuiPreferences {
+            active_agent: default_agent.to_string(),
+            ..TuiPreferences::default()
+        })
 }
 
 fn save_tui_preferences(prefs: &TuiPreferences) -> Result<(), String> {
@@ -1874,6 +2902,8 @@ mod tests {
         assert!(is_bootstrap_safe_command("/agent omni"));
         assert!(is_bootstrap_safe_command("/agents"));
         assert!(is_bootstrap_safe_command("/approvals"));
+        assert!(is_bootstrap_safe_command("/workspace_locks"));
+        assert!(is_bootstrap_safe_command("/provider_health"));
         assert!(!is_bootstrap_safe_command("reply only OK"));
     }
 
@@ -1881,6 +2911,7 @@ mod tests {
     fn parse_startup_mode_treats_admin_commands_as_runtime_commands() {
         for command in [
             "doctor",
+            "skills",
             "inspect",
             "explain",
             "--inspect-context",
@@ -1951,12 +2982,13 @@ mod tests {
 
     #[test]
     fn sidebar_tab_cycles_in_order() {
-        assert_eq!(SidebarTab::Summary.next(), SidebarTab::Agents);
+        assert_eq!(SidebarTab::Summary.next(), SidebarTab::Runs);
+        assert_eq!(SidebarTab::Runs.next(), SidebarTab::ToolsContext);
+        assert_eq!(SidebarTab::ToolsContext.next(), SidebarTab::SystemHealth);
+        assert_eq!(SidebarTab::SystemHealth.next(), SidebarTab::Agents);
         assert_eq!(SidebarTab::Agents.next(), SidebarTab::Approvals);
         assert_eq!(SidebarTab::Approvals.next(), SidebarTab::Notifications);
-        assert_eq!(SidebarTab::Notifications.next(), SidebarTab::Shortcuts);
-        assert_eq!(SidebarTab::Shortcuts.next(), SidebarTab::Session);
-        assert_eq!(SidebarTab::Session.next(), SidebarTab::Summary);
+        assert_eq!(SidebarTab::Notifications.next(), SidebarTab::Summary);
     }
 
     #[test]
@@ -1968,7 +3000,12 @@ mod tests {
             std::path::PathBuf::from("runtime.log"),
         );
         state.ingest_runtime_signal("Session override set to agent: researcher.");
-        state.ingest_runtime_signal("Stored pending approval 'abc' (handle: `apv-x`).");
+        state.ingest_runtime_signal(
+            "Approval required\n\nAction: browser action: click\nAgent: pending\nTarget: url=https://example.com\nRisk: high: side-effecting action\n\nArguments:\n{\n  \"action\": \"click\"\n}\n\nOptions: approve once, deny\n\nStored pending approval 'abc' (handle: `apv-x`).",
+        );
+        state.ingest_runtime_signal(
+            "Pending approvals:\n 1. browser action: click (url=https://example.com) [#apv-x | abc]",
+        );
         state.ingest_runtime_signal("Found 3 runs for current session.");
         state.ingest_runtime_signal(
             "Approved 'browser_act', but execution failed: tool error: browser session is paused",
@@ -1976,6 +3013,15 @@ mod tests {
         assert_eq!(state.active_agent, "researcher");
         assert_eq!(state.pending_approvals, 0);
         assert_eq!(state.recent_runs, 3);
+        assert!(state.approval_detail_cache.contains_key("apv-x"));
+        assert_eq!(
+            state
+                .approval_items
+                .first()
+                .and_then(|item| item.detail.as_ref())
+                .and_then(|detail| detail.risk_summary.as_deref()),
+            Some("high: side-effecting action")
+        );
         assert!(state
             .last_error
             .as_deref()
@@ -2013,17 +3059,77 @@ mod tests {
             approvals,
             vec![
                 ApprovalItem {
-                    summary: "browser action: click (body)".into(),
+                    summary: "browser action: click".into(),
                     handle: "apv-123".into(),
                     approval_id: "abc".into(),
+                    target_summary: Some("body".into()),
+                    detail: None,
                 },
                 ApprovalItem {
                     summary: "write file".into(),
                     handle: "apv-999".into(),
                     approval_id: "def".into(),
+                    target_summary: None,
+                    detail: None,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parse_approval_list_extracts_target_summary_when_present() {
+        let approvals = parse_approval_list(
+            "Pending approvals:\n 1. browser action: click (url=https://example.com) [#apv-123 | abc]",
+        );
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].summary, "browser action: click");
+        assert_eq!(
+            approvals[0].target_summary.as_deref(),
+            Some("url=https://example.com")
+        );
+    }
+
+    #[test]
+    fn parse_pending_approval_detail_reads_risk_target_and_arguments() {
+        let detail = parse_pending_approval_detail(
+            "Approval required\n\nAction: execute tool 'write_file'\nAgent: pending\nTarget: path=src/main.rs\nRisk: high: side-effecting action\n\nArguments:\n{\n  \"path\": \"src/main.rs\"\n}\n\nOptions: approve once, deny\n\nStored pending approval 'abc' (handle: `apv-123`). Inspect with `--inspect-approvals foo bar`.",
+        )
+        .expect("detail");
+        assert_eq!(detail.0, "apv-123");
+        assert_eq!(detail.1, "abc");
+        assert_eq!(detail.2.action_summary, "execute tool 'write_file'");
+        assert_eq!(detail.2.target_summary.as_deref(), Some("path=src/main.rs"));
+        assert_eq!(
+            detail.2.risk_summary.as_deref(),
+            Some("high: side-effecting action")
+        );
+        assert!(detail
+            .2
+            .arguments_preview
+            .as_deref()
+            .unwrap_or_default()
+            .contains("\"path\": \"src/main.rs\""));
+    }
+
+    #[test]
+    fn parse_workspace_lock_list_reads_holder_and_waiters() {
+        let rows = parse_workspace_lock_list(
+            "Workspace locks:\n - workspace:/repo [holder=run-a | waiters=1 | active=1]",
+        );
+        assert_eq!(rows, vec!["workspace:/repo [holder=run-a | waiters=1 | active=1]"]);
+        assert!(parse_workspace_lock_list("No active workspace locks.").is_empty());
+    }
+
+    #[test]
+    fn parse_provider_health_list_reads_circuit_rows() {
+        let rows = parse_provider_health_list(
+            "Provider health:\n - openrouter [open=true | failures=2 | backends=primary,fallback]",
+        );
+        assert_eq!(
+            rows,
+            vec!["openrouter [open=true | failures=2 | backends=primary,fallback]"]
+        );
+        assert!(parse_provider_health_list("No provider circuits are open.").is_empty());
     }
 
     #[test]
@@ -2090,7 +3196,33 @@ mod tests {
         state.handle_mouse_click(90, 4);
         assert_eq!(state.sidebar_tab, SidebarTab::Summary);
         state.handle_mouse_click(100, 4);
-        assert_eq!(state.sidebar_tab, SidebarTab::Agents);
+        assert_eq!(state.sidebar_tab, SidebarTab::Runs);
+    }
+
+    #[test]
+    fn ingest_runtime_signal_captures_tools_context_and_health_views() {
+        let mut state = TuiState::new(
+            "config.toml".into(),
+            1234,
+            TuiPreferences::default(),
+            std::path::PathBuf::from("runtime.log"),
+        );
+        state.ingest_runtime_signal("Executed browser action 'click'");
+        state.ingest_runtime_signal("Available agents:\n - omni [available]: main");
+        state.ingest_runtime_signal("Execution failed: timeout");
+        assert!(state
+            .recent_tool_events
+            .iter()
+            .any(|line| line.contains("Executed browser action")));
+        assert!(state
+            .recent_context_events
+            .iter()
+            .any(|line| line.contains("Available agents")));
+        assert!(state.error_events >= 1);
+        assert!(state
+            .recent_health_events
+            .iter()
+            .any(|line| line.to_ascii_lowercase().contains("failed")));
     }
 
     #[test]
@@ -2107,11 +3239,15 @@ mod tests {
                 summary: "one".into(),
                 handle: "apv-1".into(),
                 approval_id: "id-1".into(),
+                target_summary: None,
+                detail: None,
             },
             ApprovalItem {
                 summary: "two".into(),
                 handle: "apv-2".into(),
                 approval_id: "id-2".into(),
+                target_summary: None,
+                detail: None,
             },
         ];
         state.last_layout = Some(TuiLayout::new(120, 40, 3, 4, 85, 30, 32));
@@ -2153,6 +3289,14 @@ mod tests {
             summary: "write file".into(),
             handle: "apv-1".into(),
             approval_id: "id-1".into(),
+            target_summary: Some("path=src/main.rs".into()),
+            detail: Some(ApprovalDetail {
+                action_summary: "execute tool 'write_file'".into(),
+                target_summary: Some("path=src/main.rs".into()),
+                risk_summary: Some("high: side-effecting action".into()),
+                arguments_preview: Some("{\n  \"path\": \"src/main.rs\"\n}".into()),
+                options_summary: Some("approve once, deny".into()),
+            }),
         }];
         let toggle = Event::Key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
         assert!(state.handle_event(toggle.clone()).is_none());
@@ -2161,5 +3305,236 @@ mod tests {
             .handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
             .is_none());
         assert!(!state.show_approval_detail);
+    }
+
+    #[test]
+    fn ctrl_p_opens_command_palette_and_filters_commands() {
+        let mut state = TuiState::new(
+            "config.toml".into(),
+            1234,
+            TuiPreferences::default(),
+            std::path::PathBuf::from("runtime.log"),
+        );
+        assert!(state
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL,
+            )))
+            .is_none());
+        assert!(state.show_command_palette);
+
+        assert!(state
+            .handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+            )))
+            .is_none());
+        let filtered = state.filtered_palette_commands();
+        assert!(!filtered.is_empty());
+        assert!(filtered
+            .iter()
+            .all(|item| item.label.to_ascii_lowercase().contains('r') || item.hint.to_ascii_lowercase().contains('r')));
+    }
+
+    #[test]
+    fn command_palette_can_switch_tabs_and_send_actions() {
+        let mut state = TuiState::new(
+            "config.toml".into(),
+            1234,
+            TuiPreferences::default(),
+            std::path::PathBuf::from("runtime.log"),
+        );
+        state.show_command_palette = true;
+        state.command_palette_query = "system".into();
+        let action = state.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(action.is_none());
+        assert_eq!(state.sidebar_tab, SidebarTab::SystemHealth);
+        assert!(!state.show_command_palette);
+
+        state.show_command_palette = true;
+        state.command_palette_query = "runs".into();
+        let action = state.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        match action {
+            Some(TuiAction::Send(text)) => assert_eq!(text, "/runs"),
+            _ => panic!("expected palette send action"),
+        }
+        assert_eq!(state.sidebar_tab, SidebarTab::Runs);
+    }
+
+    #[test]
+    fn command_palette_includes_available_agent_switches() {
+        let mut state = TuiState::new(
+            "config.toml".into(),
+            1234,
+            TuiPreferences::default(),
+            std::path::PathBuf::from("runtime.log"),
+        );
+        state.available_agents = vec!["developer".into(), "researcher".into()];
+        state.show_command_palette = true;
+        state.command_palette_query = "researcher".into();
+        let action = state.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        match action {
+            Some(TuiAction::Send(text)) => assert_eq!(text, "/agent researcher"),
+            _ => panic!("expected agent switch action"),
+        }
+        assert_eq!(state.sidebar_tab, SidebarTab::Agents);
+    }
+
+    #[test]
+    fn summarize_run_rows_prioritizes_active_and_background_runs() {
+        let session_id = *uuid::Uuid::new_v4().as_bytes();
+        let rows = summarize_run_rows(&[
+            aria_core::AgentRunRecord {
+                run_id: "run-complete".into(),
+                parent_run_id: None,
+                    origin_kind: None,
+                    lineage_run_id: None,
+                session_id,
+                user_id: "u".into(),
+                requested_by_agent: None,
+                agent_id: "developer".into(),
+                status: aria_core::AgentRunStatus::Completed,
+                request_text: "finished task".into(),
+                inbox_on_completion: true,
+                max_runtime_seconds: None,
+                created_at_us: 1,
+                started_at_us: None,
+                finished_at_us: Some(2),
+                result: None,
+            },
+            aria_core::AgentRunRecord {
+                run_id: "run-active".into(),
+                parent_run_id: Some("parent-1".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
+                session_id,
+                user_id: "u".into(),
+                requested_by_agent: Some("omni".into()),
+                agent_id: "researcher".into(),
+                status: aria_core::AgentRunStatus::Running,
+                request_text: "search documentation".into(),
+                inbox_on_completion: true,
+                max_runtime_seconds: None,
+                created_at_us: 3,
+                started_at_us: Some(4),
+                finished_at_us: None,
+                result: None,
+            },
+        ]);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].starts_with("bg running researcher"));
+        assert!(rows[0].contains("search documentation"));
+        assert!(rows[1].starts_with("top completed developer"));
+    }
+
+    #[test]
+    fn tools_context_sidebar_prefers_operator_snapshot_rows() {
+        let mut state = TuiState::new(
+            "config.toml".into(),
+            1234,
+            TuiPreferences::default(),
+            std::path::PathBuf::from("runtime.log"),
+        );
+        state.sidebar_tab = SidebarTab::ToolsContext;
+        state.visible_tool_rows = vec!["- write_file".into(), "- search_web".into()];
+        state.hidden_tool_rows = vec!["- browser_act hidden: contract mismatch".into()];
+        state.context_plan_rows = vec![
+            "compact contract + retrieval".into(),
+            "Include WorkingSet (84)".into(),
+            "ambiguity Resolved".into(),
+        ];
+        let lines = state.sidebar_lines();
+        assert!(lines.contains("visible tools"));
+        assert!(lines.contains("- write_file"));
+        assert!(lines.contains("hidden tools"));
+        assert!(lines.contains("context plan"));
+        assert!(lines.contains("ambiguity Resolved"));
+    }
+
+    #[test]
+    fn system_health_sidebar_includes_provider_mcp_and_failure_sections() {
+        let mut state = TuiState::new(
+            "config.toml".into(),
+            1234,
+            TuiPreferences::default(),
+            std::path::PathBuf::from("runtime.log"),
+        );
+        state.sidebar_tab = SidebarTab::SystemHealth;
+        state.provider_health_rows = vec!["active backend gemini/gemini-3-flash-preview".into()];
+        state.provider_circuit_rows = vec!["openrouter [open=true | failures=2]".into()];
+        state.mcp_status_rows = vec!["chrome_devtools ready tools=29 bound=29".into()];
+        state.workspace_lock_rows = vec!["/repo holder=run-a waiters=1".into()];
+        state.failure_summary_rows = vec!["artifact-required contract was not satisfied".into()];
+        let lines = state.sidebar_lines();
+        assert!(lines.contains("provider health"));
+        assert!(lines.contains("provider circuits"));
+        assert!(lines.contains("mcp"));
+        assert!(lines.contains("workspace locks"));
+        assert!(lines.contains("why this happened"));
+    }
+
+    #[test]
+    fn ingest_runtime_signal_updates_workspace_lock_rows() {
+        let mut state = TuiState::new(
+            "config.toml".into(),
+            1234,
+            TuiPreferences::default(),
+            std::path::PathBuf::from("runtime.log"),
+        );
+        state.ingest_runtime_signal(
+            "Workspace locks:\n - workspace:/repo [holder=run-a | waiters=1 | active=1]",
+        );
+        assert_eq!(state.workspace_lock_rows.len(), 1);
+        assert!(state.workspace_lock_rows[0].contains("holder=run-a"));
+    }
+
+    #[test]
+    fn ingest_runtime_signal_updates_provider_circuit_rows() {
+        let mut state = TuiState::new(
+            "config.toml".into(),
+            1234,
+            TuiPreferences::default(),
+            std::path::PathBuf::from("runtime.log"),
+        );
+        state.ingest_runtime_signal(
+            "Provider health:\n - openrouter [open=true | failures=2 | backends=primary,fallback]",
+        );
+        assert_eq!(state.provider_circuit_rows.len(), 1);
+        assert!(state.provider_circuit_rows[0].contains("failures=2"));
+    }
+
+    #[test]
+    fn summarize_failure_rows_explains_common_operator_failures() {
+        let rows = summarize_failure_rows(
+            Some("MissingRequiredArtifact for schedule contract"),
+            &["write_file hidden: not selected for current contract".into()],
+            Some(&aria_core::ContextPlan {
+                summary: Some("working set resolved".into()),
+                block_records: vec![],
+                ambiguity: Some(aria_core::ReferenceResolution {
+                    query_text: "modify it".into(),
+                    matched_entry_ids: vec!["a".into(), "b".into()],
+                    outcome: aria_core::ReferenceResolutionOutcome::Ambiguous,
+                    active_target_entry_id: None,
+                    reason: Some("multiple recent files".into()),
+                }),
+            }),
+            2,
+        );
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("artifact-required contract")));
+        assert!(rows.iter().any(|row| row.contains("reference resolution")));
+        assert!(rows.iter().any(|row| row.contains("tool visibility")));
+        assert!(rows.iter().any(|row| row.contains("pending")));
     }
 }

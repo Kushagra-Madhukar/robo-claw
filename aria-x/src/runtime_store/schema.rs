@@ -168,6 +168,62 @@ CREATE TABLE IF NOT EXISTS skill_signatures (
     payload_json TEXT NOT NULL,
     created_at_us INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS computer_profiles (
+    profile_id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    updated_at_us INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS computer_sessions (
+    computer_session_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    profile_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    updated_at_us INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS computer_action_audits (
+    audit_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    profile_id TEXT,
+    payload_json TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS robot_runtime_states (
+    robot_id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    updated_at_us INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS robotics_simulations (
+    simulation_id TEXT PRIMARY KEY,
+    robot_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    session_id BLOB,
+    payload_json TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_robotics_simulations_robot
+    ON robotics_simulations (robot_id, created_at_us DESC);
+CREATE TABLE IF NOT EXISTS ros2_bridge_profiles (
+    profile_id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    updated_at_us INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS execution_backend_profiles (
+    backend_id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    updated_at_us INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS execution_workers (
+    worker_id TEXT PRIMARY KEY,
+    backend_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    updated_at_us INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_execution_workers_backend
+    ON execution_workers (backend_id, status, updated_at_us DESC);
 CREATE TABLE IF NOT EXISTS mcp_servers (
     server_id TEXT PRIMARY KEY,
     payload_json TEXT NOT NULL,
@@ -341,6 +397,15 @@ CREATE TABLE IF NOT EXISTS browser_artifacts (
     session_id BLOB NOT NULL,
     agent_id TEXT NOT NULL,
     profile_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS computer_artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    computer_session_id TEXT,
+    session_id BLOB NOT NULL,
+    agent_id TEXT NOT NULL,
+    profile_id TEXT,
     payload_json TEXT NOT NULL,
     created_at_us INTEGER NOT NULL
 );

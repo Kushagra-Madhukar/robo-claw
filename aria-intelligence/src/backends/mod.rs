@@ -390,6 +390,7 @@ pub(crate) fn render_context_blocks_for_message(context: &ExecutionContextPack) 
         let label = match block.kind {
             ContextBlockKind::Retrieval => "Retrieved Context",
             ContextBlockKind::ControlDocument => "Control Documents",
+            ContextBlockKind::RuleContext => "Active Rules",
             ContextBlockKind::DurableConstraint => "Durable Constraints",
             ContextBlockKind::SubAgentResult => "Sub-Agent Results",
             ContextBlockKind::ToolInstructions => "Tool Instructions",

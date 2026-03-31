@@ -287,6 +287,7 @@ impl PromptManager {
             ContextBlockKind::ControlDocument => {
                 format!("Control Documents [{}]:", block.label)
             }
+            ContextBlockKind::RuleContext => format!("Active Rules [{}]:", block.label),
             ContextBlockKind::DurableConstraint => {
                 format!("Durable Constraints [{}]:", block.label)
             }

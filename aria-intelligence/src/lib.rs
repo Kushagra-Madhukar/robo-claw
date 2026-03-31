@@ -39,9 +39,11 @@ pub use backends::{
 
 mod hardware;
 mod context_planner;
+mod lifecycle;
 mod middleware;
 mod orchestrator;
 mod prompting;
+mod remote_execution;
 mod router;
 mod runtime;
 mod scheduler;
@@ -53,12 +55,14 @@ mod tools;
 pub(crate) use hardware::render_tool_result_for_model;
 pub use context_planner::*;
 pub use hardware::*;
+pub use lifecycle::*;
 pub use middleware::*;
 #[cfg(test)]
 pub(crate) use orchestrator::maybe_finalize_after_scheduler_tools;
 pub use orchestrator::*;
 pub use orchestrator::{append_tool_results_to_context_pack, append_tool_results_to_prompt};
 pub use prompting::*;
+pub use remote_execution::*;
 pub use router::*;
 #[cfg(test)]
 pub(crate) use runtime::balance_json;

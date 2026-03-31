@@ -3,6 +3,7 @@ name = "aria-x"
 version = "0.1.0"
 edition = "2021"
 description = "HiveClaw orchestrator binary — wires all crates into the final agent runtime"
+autobins = false
 
 [features]
 default = ["standard-runtime"]
@@ -13,6 +14,10 @@ speech-runtime = []
 
 [[bin]]
 name = "aria-x"
+path = "src/main.rs"
+
+[[bin]]
+name = "hiveclaw"
 path = "src/main.rs"
 
 [dependencies]

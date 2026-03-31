@@ -14,10 +14,10 @@ adapter = "cli" # or "telegram" or "websocket"
 # Example: adapters = ["cli", "telegram"]
 # adapters = ["cli"]
 # Onboarding CLI:
-#   cargo run -p aria-x -- channels list
-#   cargo run -p aria-x -- channels add websocket
-#   cargo run -p aria-x -- channels status
-#   cargo run -p aria-x -- channels remove websocket
+#   cargo run -p aria-x --bin hiveclaw -- channels list
+#   cargo run -p aria-x --bin hiveclaw -- channels add websocket
+#   cargo run -p aria-x --bin hiveclaw -- channels status
+#   cargo run -p aria-x --bin hiveclaw -- channels remove websocket
 # Optional explicit cross-channel fanout:
 # [[gateway.fanout]]
 # source = "telegram"
@@ -116,6 +116,18 @@ backend = "none"           # "gazebo" | "mujoco" | "none"
 enabled = false
 log_level = "info"
 
+[telemetry.exporters]
+enabled = true
+output_dir = "../workspace/telemetry"
+write_json_bundle = true
+write_jsonl = true
+
+[telemetry.redaction]
+redact_secret_like_values = true
+redact_provider_payloads_in_shared_export = true
+redact_user_content_in_shared_export = true
+
 [ui]
 enabled = false
 bind_addr = "127.0.0.1:8080"
+default_agent = "developer"

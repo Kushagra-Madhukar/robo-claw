@@ -1,0 +1,38 @@
+{
+  "agent_id": "robotics_ctrl",
+  "connection_kind": "ros2",
+  "contract": {
+    "intent_id": "11111111-2222-3333-4444-555555555555",
+    "robot_id": "rover-ros2",
+    "requested_by_agent": "robotics_ctrl",
+    "kind": "report_state",
+    "reason": "ros2 profile simulation example",
+    "execution_mode": "simulation",
+    "timestamp_us": 71
+  },
+  "state": {
+    "robot_id": "rover-ros2",
+    "battery_percent": 91,
+    "active_faults": [],
+    "degraded_local_mode": false,
+    "last_heartbeat_us": 70
+  },
+  "safety_envelope": {
+    "max_abs_velocity": 0.2,
+    "allowed_actuator_ids": [1, 4, 7],
+    "motion_requires_approval": false,
+    "allow_capture": true
+  },
+  "ros2_profile": {
+    "profile_id": "ros2-lab",
+    "display_name": "Lab ROS2",
+    "namespace": "/robots/lab",
+    "command_topic": "cmd",
+    "telemetry_topic": "telemetry",
+    "image_topic": "camera",
+    "service_prefix": "svc",
+    "requires_approval": true,
+    "simulation_only": true
+  },
+  "namespace_override": "/robots/rover-ros2"
+}

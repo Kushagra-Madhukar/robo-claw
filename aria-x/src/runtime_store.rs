@@ -6,10 +6,14 @@ use aria_core::{
     AgentCapabilityProfile, AgentMailboxMessage, AgentRunEvent, AgentRunRecord, ApprovalRecord,
     BrowserActionAuditRecord, BrowserArtifactRecord, BrowserChallengeEvent,
     BrowserLoginStateRecord, BrowserProfile, BrowserProfileBindingRecord, BrowserSessionRecord,
-    BrowserSessionStateRecord, CompactionState, ControlDocumentEntry, CrawlJob,
-    DomainAccessDecision, ElevationGrant, ModelCapabilityProbeRecord, ModelCapabilityProfile,
-    OutboundEnvelope, ProviderCapabilityProfile, ScopeDenialRecord, SkillActivationRecord,
-    SkillBinding, SkillPackageManifest, WatchJobRecord, WebsiteMemoryRecord,
+    BrowserSessionStateRecord, CompactionState, ComputerActionAuditRecord,
+    ComputerArtifactRecord, ComputerExecutionProfile, ComputerSessionRecord,
+    ControlDocumentEntry, CrawlJob, DomainAccessDecision, ElevationGrant,
+    ExecutionBackendProfile, ExecutionWorkerRecord, RobotRuntimeRecord,
+    RoboticsSimulationRecord, Ros2BridgeProfile,
+    ModelCapabilityProbeRecord, ModelCapabilityProfile, OutboundEnvelope,
+    ProviderCapabilityProfile, ScopeDenialRecord, SkillActivationRecord, SkillBinding,
+    SkillPackageManifest, WatchJobRecord, WebsiteMemoryRecord,
 };
 #[cfg(feature = "mcp-runtime")]
 use aria_core::{
@@ -195,6 +199,7 @@ pub struct ShellExecutionAuditRecord {
     pub audit_id: String,
     pub session_id: Option<String>,
     pub agent_id: Option<String>,
+    pub execution_backend_id: Option<String>,
     pub command: String,
     pub cwd: Option<String>,
     pub os_containment_requested: bool,
@@ -254,6 +259,10 @@ mod approvals;
 mod audits;
 #[path = "runtime_store/browser.rs"]
 mod browser;
+#[path = "runtime_store/computer.rs"]
+mod computer;
+#[path = "runtime_store/execution_backends.rs"]
+mod execution_backends;
 #[path = "runtime_store/connection.rs"]
 mod connection;
 #[path = "runtime_store/control.rs"]
@@ -273,6 +282,8 @@ mod mcp;
 mod outbound;
 #[path = "runtime_store/queues.rs"]
 mod queues;
+#[path = "runtime_store/robotics.rs"]
+mod robotics;
 #[path = "runtime_store/runs.rs"]
 mod runs;
 #[path = "runtime_store/schema.rs"]

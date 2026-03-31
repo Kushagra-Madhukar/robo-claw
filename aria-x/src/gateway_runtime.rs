@@ -1037,6 +1037,7 @@ async fn process_one_telegram_update(state: &TelegramState, update_json: &str) {
         if let Some(output) = handle_shared_control_command(
             &req,
             &state.config,
+            state.llm_pool.as_ref(),
             state.agent_store.as_ref(),
             state.session_memory.as_ref(),
         ) {
@@ -1056,6 +1057,7 @@ async fn process_one_telegram_update(state: &TelegramState, update_json: &str) {
         if let Some(output) = handle_runtime_control_command(
             &req,
             &state.config,
+            state.llm_pool.as_ref(),
             state.session_memory.as_ref(),
             Some(state.session_steering_tx.as_ref()),
         )
@@ -1193,6 +1195,21 @@ async fn process_one_telegram_update(state: &TelegramState, update_json: &str) {
                     Err(e) => format!("Failed to list run events: {}", e),
                 }
             }
+        } else if text.starts_with("/run_tree ") {
+            let parts: Vec<&str> = text.split_whitespace().collect();
+            if parts.len() < 2 {
+                "Usage: /run_tree <session_id>".to_string()
+            } else {
+                match inspect_agent_run_tree_json(
+                    Path::new(&state.config.ssmu.sessions_dir),
+                    parts[1],
+                    None,
+                ) {
+                    Ok(tree) => serde_json::to_string_pretty(&tree)
+                        .unwrap_or_else(|_| tree.to_string()),
+                    Err((_, e)) => format!("Failed to inspect run tree: {}", e),
+                }
+            }
         } else if text.starts_with("/run_cancel ") {
             let parts: Vec<&str> = text.split_whitespace().collect();
             if parts.len() < 2 {
@@ -1201,9 +1218,17 @@ async fn process_one_telegram_update(state: &TelegramState, update_json: &str) {
                 let store =
                     RuntimeStore::for_sessions_dir(Path::new(&state.config.ssmu.sessions_dir));
                 let now_us = chrono::Utc::now().timestamp_micros() as u64;
-                match store.cancel_agent_run(parts[1], "cancelled by user command", now_us) {
-                    Ok(Some(run)) => format!("Run '{}' is now {:?}.", run.run_id, run.status),
-                    Ok(None) => format!("Run '{}' not found.", parts[1]),
+                match store.cancel_agent_run_tree(parts[1], "cancelled by user command", now_us) {
+                    Ok(updated) if updated.is_empty() => format!("Run '{}' not found.", parts[1]),
+                    Ok(updated) => {
+                        let root = updated.last().expect("non-empty updated list");
+                        format!(
+                            "Run tree rooted at '{}' is now {:?} ({} run(s) updated).",
+                            root.run_id,
+                            root.status,
+                            updated.len()
+                        )
+                    }
                     Err(e) => format!("Failed to cancel run: {}", e),
                 }
             }
@@ -1217,44 +1242,47 @@ async fn process_one_telegram_update(state: &TelegramState, update_json: &str) {
                 match store.read_agent_run(parts[1]) {
                     Ok(original) => {
                         let now_us = chrono::Utc::now().timestamp_micros() as u64;
-                        let new_run_id = format!("run-{}", uuid::Uuid::new_v4());
-                        let retried = AgentRunRecord {
-                            run_id: new_run_id.clone(),
-                            parent_run_id: original
-                                .parent_run_id
-                                .clone()
-                                .or_else(|| Some(original.run_id.clone())),
-                            session_id: original.session_id,
-                            user_id: original.user_id.clone(),
-                            requested_by_agent: original.requested_by_agent.clone(),
-                            agent_id: original.agent_id.clone(),
-                            status: AgentRunStatus::Queued,
-                            request_text: original.request_text.clone(),
-                            inbox_on_completion: original.inbox_on_completion,
-                            max_runtime_seconds: original.max_runtime_seconds,
-                            created_at_us: now_us,
-                            started_at_us: None,
-                            finished_at_us: None,
-                            result: None,
-                        };
-                        if let Err(e) = store.upsert_agent_run(&retried, now_us) {
-                            format!("Failed to queue retry run: {}", e)
-                        } else if let Err(e) = store.append_agent_run_event(&AgentRunEvent {
-                            event_id: format!("evt-{}", uuid::Uuid::new_v4()),
-                            run_id: retried.run_id.clone(),
-                            kind: AgentRunEventKind::Queued,
-                            summary: format!("Run retried from '{}'", original.run_id),
-                            created_at_us: now_us,
-                        }) {
-                            format!("Retry run queued but event write failed: {}", e)
-                        } else {
-                            format!(
+                        match store.retry_agent_run(
+                            parts[1],
+                            original.requested_by_agent.as_deref(),
+                            now_us,
+                        ) {
+                            Err(e) => format!("Failed to queue retry run: {}", e),
+                            Ok(Some(retried)) => format!(
                                 "Retry queued: new run '{}' created from '{}'.",
                                 retried.run_id, original.run_id
-                            )
+                            ),
+                            Ok(None) => format!("Run '{}' not found.", parts[1]),
                         }
                     }
                     Err(e) => format!("Retry lookup failed: {}", e),
+                }
+            }
+        } else if text.starts_with("/run_takeover ") {
+            let parts: Vec<&str> = text.split_whitespace().collect();
+            if parts.len() < 3 {
+                "Usage: /run_takeover <run_id> <agent_id>".to_string()
+            } else {
+                let store =
+                    RuntimeStore::for_sessions_dir(Path::new(&state.config.ssmu.sessions_dir));
+                match store.read_agent_run(parts[1]) {
+                    Ok(original) => {
+                        let now_us = chrono::Utc::now().timestamp_micros() as u64;
+                        match store.take_over_agent_run(
+                            parts[1],
+                            parts[2],
+                            original.requested_by_agent.as_deref(),
+                            now_us,
+                        ) {
+                            Err(e) => format!("Failed to queue takeover run: {}", e),
+                            Ok(Some(takeover)) => format!(
+                                "Takeover queued: new run '{}' created from '{}' for agent '{}'.",
+                                takeover.run_id, original.run_id, takeover.agent_id
+                            ),
+                            Ok(None) => format!("Run '{}' not found.", parts[1]),
+                        }
+                    }
+                    Err(e) => format!("Takeover lookup failed: {}", e),
                 }
             }
         } else if text.starts_with("/models") || text.starts_with("/model") {

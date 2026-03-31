@@ -1,0 +1,27 @@
+{
+  "agent_id": "robotics_ctrl",
+  "contract": {
+    "intent_id": "11111111-2222-3333-4444-555555555555",
+    "robot_id": "rover-1",
+    "requested_by_agent": "robotics_ctrl",
+    "kind": "move_actuator",
+    "actuator_id": 4,
+    "target_velocity": 0.15,
+    "reason": "simulation smoke test",
+    "execution_mode": "simulation",
+    "timestamp_us": 42
+  },
+  "state": {
+    "robot_id": "rover-1",
+    "battery_percent": 88,
+    "active_faults": [],
+    "degraded_local_mode": false,
+    "last_heartbeat_us": 41
+  },
+  "safety_envelope": {
+    "max_abs_velocity": 0.2,
+    "allowed_actuator_ids": [1, 4, 7],
+    "motion_requires_approval": false,
+    "allow_capture": true
+  }
+}

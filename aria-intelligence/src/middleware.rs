@@ -87,6 +87,8 @@ fn tool_class_for_name(name: &str) -> &'static str {
 fn artifact_kind_for_tool(name: &str) -> Option<ExecutionArtifactKind> {
     match name {
         "set_reminder" | "schedule_message" | "manage_cron" => Some(ExecutionArtifactKind::Schedule),
+        "computer_profile_list" | "computer_session_start" | "computer_session_list"
+        | "computer_capture" | "computer_act" => Some(ExecutionArtifactKind::Computer),
         "invoke_mcp_tool" | "render_mcp_prompt" | "read_mcp_resource" => {
             Some(ExecutionArtifactKind::Mcp)
         }

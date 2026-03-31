@@ -181,6 +181,10 @@ pub struct AgentCapabilityProfile {
     #[serde(default)]
     pub browser_action_scope: Option<BrowserActionScope>,
     #[serde(default)]
+    pub computer_profile_allowlist: Vec<String>,
+    #[serde(default)]
+    pub computer_action_scope: Option<ComputerActionScope>,
+    #[serde(default)]
     pub browser_session_scope: Option<BrowserSessionScope>,
     #[serde(default)]
     pub crawl_scope: Option<CrawlScope>,

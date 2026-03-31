@@ -1,0 +1,8 @@
+[[scenarios]]
+id = "file-create-success"
+task_fingerprint = "v1|agent=developer|mode=tool_assisted|text=create a file|tools=write_file"
+expected_outcome = "succeeded"
+min_samples = 1
+required_tools = ["write_file"]
+response_must_contain = ["created"]
+min_reward_score = 1

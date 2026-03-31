@@ -1,4 +1,9 @@
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+const PRIMARY_CLI_NAME: &str = "hiveclaw";
+const LEGACY_CLI_NAME: &str = "aria-x";
+const DEFAULT_BOOTSTRAP_POLICY: &str = include_str!("../../aria-policy/policies/default.cedar");
 
 // ---------------------------------------------------------------------------
 // Main
@@ -46,18 +51,169 @@ enum InstallMode {
     Copy,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct GoldenReplaySuite {
+    scenarios: Vec<GoldenReplayScenario>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GoldenReplayScenario {
+    id: String,
+    task_fingerprint: String,
+    expected_outcome: aria_learning::TraceOutcome,
+    #[serde(default = "default_golden_replay_min_samples")]
+    min_samples: usize,
+    #[serde(default)]
+    required_tools: Vec<String>,
+    #[serde(default)]
+    response_must_contain: Vec<String>,
+    #[serde(default)]
+    min_reward_score: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GoldenReplayScenarioResult {
+    id: String,
+    task_fingerprint: String,
+    sample_count: usize,
+    latest_request_id: Option<String>,
+    latest_outcome: Option<aria_learning::TraceOutcome>,
+    latest_reward_score: Option<i32>,
+    passed: bool,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GoldenReplayReport {
+    scenario_count: usize,
+    passed_count: usize,
+    failed_count: usize,
+    results: Vec<GoldenReplayScenarioResult>,
+}
+
+#[derive(Debug, Clone)]
+struct ContractRegressionScenario {
+    id: &'static str,
+    request_text: &'static str,
+    expected_kind: aria_core::ExecutionContractKind,
+    expected_required_artifacts: Vec<aria_core::ExecutionArtifactKind>,
+    expected_required_tools: Vec<&'static str>,
+    expected_approval_required: bool,
+    expected_tool_choice: Option<&'static str>,
+    satisfied_tool_names: Vec<&'static str>,
+    expected_plain_text_failure: Option<aria_core::ContractFailureReason>,
+    approval_probe: Option<ContractApprovalProbe>,
+}
+
+#[derive(Debug, Clone)]
+struct ContractApprovalProbe {
+    tool_name: &'static str,
+    arguments_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContractRegressionScenarioResult {
+    id: String,
+    contract_kind: aria_core::ExecutionContractKind,
+    passed: bool,
+    reasons: Vec<String>,
+    required_tools: Vec<String>,
+    tool_choice: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContractRegressionReport {
+    scenario_count: usize,
+    passed_count: usize,
+    failed_count: usize,
+    results: Vec<ContractRegressionScenarioResult>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProviderBenchmarkSuite {
+    scenarios: Vec<ProviderBenchmarkScenario>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProviderBenchmarkScenario {
+    id: String,
+    task_fingerprint: String,
+    #[serde(default = "default_provider_benchmark_min_samples")]
+    min_samples_per_provider: usize,
+    #[serde(default)]
+    required_providers: Vec<String>,
+    #[serde(default)]
+    require_fallback_visibility: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderBenchmarkProviderResult {
+    provider_id: String,
+    model_ref: String,
+    sample_count: usize,
+    success_count: usize,
+    failure_count: usize,
+    approval_required_count: usize,
+    clarification_required_count: usize,
+    average_latency_ms: f64,
+    average_prompt_tokens: f64,
+    fallback_outcomes: usize,
+    repair_fallback_calls: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderBenchmarkScenarioResult {
+    id: String,
+    task_fingerprint: String,
+    passed: bool,
+    reasons: Vec<String>,
+    providers: Vec<ProviderBenchmarkProviderResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProviderBenchmarkReport {
+    scenario_count: usize,
+    passed_count: usize,
+    failed_count: usize,
+    results: Vec<ProviderBenchmarkScenarioResult>,
+}
+
+fn default_golden_replay_min_samples() -> usize {
+    1
+}
+
+fn default_provider_benchmark_min_samples() -> usize {
+    1
+}
+
 fn render_cli_help(topic: Option<&str>) -> String {
     match topic.map(|value| value.trim().to_ascii_lowercase()) {
-        Some(topic) if topic == "doctor" => [
-            "aria-x doctor",
+        Some(topic) if topic == "init" => [
+            "hiveclaw init",
             "",
             "Usage:",
-            "  aria-x doctor",
-            "  aria-x doctor stt",
-            "  aria-x doctor env",
-            "  aria-x doctor gateway",
-            "  aria-x doctor browser",
-            "  aria-x doctor mcp [--live] [--mode <launch_managed|auto_connect>]",
+            "  hiveclaw init",
+            "  hiveclaw init <path>",
+            "  hiveclaw init <path> --preset <recommended|edge>",
+            "  hiveclaw init <path> --default-agent <agent_id>",
+            "  hiveclaw init <path> --non-interactive --overwrite",
+            "",
+            "Behavior:",
+            "  Bootstraps a local HiveClaw project in the target directory.",
+            "  Creates .hiveclaw/config.toml, local policies, workspace directories,",
+            "  and a HIVECLAW.md project guidance file.",
+        ]
+        .join("\n"),
+        Some(topic) if topic == "doctor" => [
+            "hiveclaw doctor",
+            "",
+            "Usage:",
+            "  hiveclaw doctor",
+            "  hiveclaw doctor stt",
+            "  hiveclaw doctor env",
+            "  hiveclaw doctor gateway",
+            "  hiveclaw doctor browser",
+            "  hiveclaw doctor mcp [--live] [--mode <launch_managed|auto_connect>]",
             "",
             "Commands:",
             "  doctor         Show a runtime/operator health summary.",
@@ -71,125 +227,232 @@ fn render_cli_help(topic: Option<&str>) -> String {
         ]
         .join("\n"),
         Some(topic) if topic == "install" => [
-            "aria-x install",
+            "hiveclaw install",
             "",
             "Usage:",
-            "  aria-x install",
-            "  aria-x install --bin-dir <path>",
-            "  aria-x install --with-default-config",
-            "  aria-x install --with-default-config --overwrite-config",
+            "  hiveclaw install",
+            "  hiveclaw install --bin-dir <path>",
+            "  hiveclaw install --with-default-config",
+            "  hiveclaw install --with-default-config --overwrite-config",
             "",
             "Behavior:",
-            "  Copies the current aria-x binary into a user-level bin directory.",
-            "  The default target is ~/.local/bin/aria-x.",
+            "  Copies the current HiveClaw executable into a user-level bin directory.",
+            "  The default target is ~/.local/bin/hiveclaw and also installs ~/.local/bin/aria-x for compatibility.",
             "  The command does not edit shell startup files automatically.",
             "  With --with-default-config it seeds the standard HiveClaw config path.",
         ]
         .join("\n"),
         Some(topic) if topic == "completion" => [
-            "aria-x completion",
+            "hiveclaw completion",
             "",
             "Usage:",
-            "  aria-x completion bash",
-            "  aria-x completion zsh",
-            "  aria-x completion fish",
+            "  hiveclaw completion bash",
+            "  hiveclaw completion zsh",
+            "  hiveclaw completion fish",
             "",
             "Prints shell completion scripts to stdout.",
         ]
         .join("\n"),
-        Some(topic) if topic == "channels" => [
-            "aria-x channels",
+        Some(topic) if topic == "skills" => [
+            "hiveclaw skills",
             "",
             "Usage:",
-            "  aria-x channels list",
-            "  aria-x channels status",
-            "  aria-x channels add <channel>",
-            "  aria-x channels remove <channel>",
+            "  hiveclaw skills list",
+            "  hiveclaw skills install --dir <skill_dir>",
+            "  hiveclaw skills install --codex-dir <skill_dir>",
+            "  hiveclaw skills install --signed-dir <skill_dir> [--public-key <hex>]",
+            "  hiveclaw skills install --manifest <skill.toml>",
+            "  hiveclaw skills update --dir <skill_dir>",
+            "  hiveclaw skills enable <skill_id>",
+            "  hiveclaw skills disable <skill_id>",
+            "  hiveclaw skills bind <skill_id> [--agent <agent_id>] [--policy <manual|auto_suggest|auto_load_low_risk|approval_required>] [--version <requirement>]",
+            "  hiveclaw skills unbind <skill_id> [--agent <agent_id>]",
+            "  hiveclaw skills export <skill_id> [--output-dir <path>] [--signing-key-hex <hex>] [--format <native|codex>]",
+            "  hiveclaw skills doctor [skill_id]",
+            "",
+            "Manages installed skills, bindings, trust/signature state, and export flows.",
+        ]
+        .join("\n"),
+        Some(topic) if topic == "channels" => [
+            "hiveclaw channels",
+            "",
+            "Usage:",
+            "  hiveclaw channels list",
+            "  hiveclaw channels status",
+            "  hiveclaw channels add <channel>",
+            "  hiveclaw channels remove <channel>",
         ]
         .join("\n"),
         Some(topic) if topic == "inspect" => [
-            "aria-x inspect",
+            "hiveclaw inspect",
             "",
             "Usage:",
-            "  aria-x inspect context [session_id] [agent_id]",
-            "  aria-x inspect provider-payloads [session_id] [agent_id]",
-            "  aria-x inspect provider-payload [session_id] [agent_id]",
+            "  hiveclaw inspect context [session_id] [agent_id]",
+            "  hiveclaw inspect benchmark-summary",
+            "  hiveclaw inspect runtime-profile",
+            "  hiveclaw inspect robot-state [robot_id]",
+            "  hiveclaw inspect ros2-profiles [profile_id]",
+            "  hiveclaw inspect robotics-runs [robot_id]",
+            "  hiveclaw inspect execution-backends",
+            "  hiveclaw inspect execution-workers [backend_id]",
+            "  hiveclaw inspect rules <workspace_root> [request_text] [target_path]",
+            "  hiveclaw inspect provider-payloads [session_id] [agent_id]",
+            "  hiveclaw inspect provider-payload [session_id] [agent_id]",
+            "  hiveclaw inspect runs <session_id>",
+            "  hiveclaw inspect run-tree <session_id> [root_run_id]",
+            "  hiveclaw inspect run-events <run_id>",
+            "  hiveclaw inspect mailbox <run_id>",
+            "  hiveclaw inspect workspace-locks",
+            "  hiveclaw inspect mcp-servers",
+            "  hiveclaw inspect mcp-imports <server_id>",
+            "  hiveclaw inspect mcp-bindings <agent_id>",
             "",
             "Renders JSON inspection output for persisted context and provider payload records.",
         ]
         .join("\n"),
         Some(topic) if topic == "explain" => [
-            "aria-x explain",
+            "hiveclaw explain",
             "",
             "Usage:",
-            "  aria-x explain context [session_id] [agent_id]",
-            "  aria-x explain provider-payloads [session_id] [agent_id]",
-            "  aria-x explain provider-payload [session_id] [agent_id]",
+            "  hiveclaw explain context [session_id] [agent_id]",
+            "  hiveclaw explain provider-payloads [session_id] [agent_id]",
+            "  hiveclaw explain provider-payload [session_id] [agent_id]",
             "",
             "Renders human-readable inspection output for persisted context and provider payload records.",
         ]
         .join("\n"),
         Some(topic) if topic == "run" => [
-            "aria-x run",
+            "hiveclaw run",
             "",
             "Usage:",
-            "  aria-x run [config]",
+            "  hiveclaw run [config]",
             "",
             "Starts the main runtime/gateway process. If config is omitted, the default",
             "project config path is used.",
         ]
         .join("\n"),
-        Some(topic) if topic == "tui" => [
-            "aria-x tui",
+        Some(topic) if topic == "replay" => [
+            "hiveclaw replay",
             "",
             "Usage:",
-            "  aria-x tui [config]",
-            "  aria-x tui [config] --attach ws://127.0.0.1:8090/ws",
+            "  hiveclaw replay golden <suite.toml>",
+            "  hiveclaw replay contracts",
+            "  hiveclaw replay providers <suite.toml>",
+            "  hiveclaw replay gate --golden <suite.toml> [--providers <suite.toml>]",
+            "",
+            "Runs deterministic golden replay checks, contract regression checks,",
+            "and provider comparison benchmark reports.",
+        ]
+        .join("\n"),
+        Some(topic) if topic == "telemetry" => [
+            "hiveclaw telemetry",
+            "",
+            "Usage:",
+            "  hiveclaw telemetry export [--scope <local|shared>] [--output-dir <path>]",
+            "",
+            "Exports local-first telemetry bundles and JSONL event streams.",
+        ]
+        .join("\n"),
+        Some(topic) if topic == "robotics" => [
+            "hiveclaw robotics",
+            "",
+            "Usage:",
+            "  hiveclaw robotics simulate <fixture.json>",
+            "  hiveclaw robotics ros2-simulate <fixture.json>",
+            "",
+            "Runs a deterministic robotics simulation from a fixture and persists",
+            "the resulting robot state and simulation record into the runtime store.",
+            "The ros2-simulate variant compiles through an explicit ROS2 bridge",
+            "profile instead of a generic tool invocation path.",
+        ]
+        .join("\n"),
+        Some(topic) if topic == "tui" => [
+            "hiveclaw tui",
+            "",
+            "Usage:",
+            "  hiveclaw tui [config]",
+            "  hiveclaw tui [config] --attach ws://127.0.0.1:8090/ws",
             "",
             "Starts the terminal UI. Without --attach it spawns a local runtime.",
         ]
         .join("\n"),
         Some(topic) if topic == "setup" => [
-            "aria-x setup",
+            "hiveclaw setup",
             "",
             "Usage:",
-            "  aria-x setup stt --local",
-            "  aria-x setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>]",
+            "  hiveclaw setup stt --local",
+            "  hiveclaw setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>]",
+            "  hiveclaw setup ssh-backend --backend-id <id> --host <host> [--user <user>] [--port <port>] [--identity-file <path>]",
             "",
             "Setup commands bootstrap optional runtime integrations.",
         ]
         .join("\n"),
-        _ => [
-            "aria-x",
+        Some(topic) if topic == "skills" => [
+            "hiveclaw skills",
             "",
             "Usage:",
-            "  aria-x run [config]",
-            "  aria-x tui [config] [--attach <ws-url>]",
-            "  aria-x status",
-            "  aria-x stop",
-            "  aria-x install [--bin-dir <path>]",
-            "  aria-x completion <bash|zsh|fish>",
-            "  aria-x doctor",
-            "  aria-x doctor stt",
-            "  aria-x doctor env",
-            "  aria-x doctor gateway",
-            "  aria-x doctor browser",
-            "  aria-x doctor mcp",
-            "  aria-x inspect context [session_id] [agent_id]",
-            "  aria-x inspect provider-payloads [session_id] [agent_id]",
-            "  aria-x inspect provider-payload [session_id] [agent_id]",
-            "  aria-x explain context [session_id] [agent_id]",
-            "  aria-x explain provider-payloads [session_id] [agent_id]",
-            "  aria-x explain provider-payload [session_id] [agent_id]",
-            "  aria-x --explain-context <session_id> [agent_id]",
-            "  aria-x --explain-provider-payloads <session_id> [agent_id]",
-            "  aria-x setup stt --local",
-            "  aria-x setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>]",
-            "  aria-x channels <list|status|add|remove> [channel]",
-            "  aria-x help [topic]",
+            "  hiveclaw skills list",
+            "  hiveclaw skills doctor [skill_id]",
+            "  hiveclaw skills install --dir <skill_dir>",
+            "  hiveclaw skills install --codex-dir <skill_dir>",
+            "  hiveclaw skills install --manifest <skill.toml>",
+            "  hiveclaw skills install --signed-dir <skill_dir> [--public-key <hex>]",
+            "  hiveclaw skills enable <skill_id>",
+            "  hiveclaw skills disable <skill_id>",
+            "  hiveclaw skills bind <skill_id> [--agent <agent_id>] [--policy <manual|auto_suggest|auto_load_low_risk|approval_required>] [--version <requirement>]",
+            "  hiveclaw skills unbind <skill_id> [--agent <agent_id>]",
+            "  hiveclaw skills export <skill_id> [--output-dir <path>] [--signing-key-hex <hex>] [--format <native|codex>]",
+            "",
+            "Manage installed skills, bindings, export packages, and trust state.",
+        ]
+        .join("\n"),
+        _ => [
+            "hiveclaw",
+            "",
+            "Usage:",
+            "  hiveclaw init [path]",
+            "  hiveclaw run [config]",
+            "  hiveclaw tui [config] [--attach <ws-url>]",
+            "  hiveclaw status",
+            "  hiveclaw stop",
+            "  hiveclaw install [--bin-dir <path>]",
+            "  hiveclaw completion <bash|zsh|fish>",
+            "  hiveclaw skills <list|install|update|enable|disable|bind|unbind|export|doctor> ...",
+            "  hiveclaw doctor",
+            "  hiveclaw doctor stt",
+            "  hiveclaw doctor env",
+            "  hiveclaw doctor gateway",
+            "  hiveclaw doctor browser",
+            "  hiveclaw doctor mcp",
+            "  hiveclaw inspect context [session_id] [agent_id]",
+            "  hiveclaw inspect benchmark-summary",
+            "  hiveclaw inspect rules <workspace_root> [request_text] [target_path]",
+            "  hiveclaw inspect provider-payloads [session_id] [agent_id]",
+            "  hiveclaw inspect provider-payload [session_id] [agent_id]",
+            "  hiveclaw inspect runs <session_id>",
+            "  hiveclaw inspect run-tree <session_id> [root_run_id]",
+            "  hiveclaw inspect run-events <run_id>",
+            "  hiveclaw inspect mailbox <run_id>",
+            "  hiveclaw inspect workspace-locks",
+            "  hiveclaw inspect mcp-servers",
+            "  hiveclaw inspect mcp-imports <server_id>",
+            "  hiveclaw inspect mcp-bindings <agent_id>",
+            "  hiveclaw explain context [session_id] [agent_id]",
+            "  hiveclaw explain provider-payloads [session_id] [agent_id]",
+            "  hiveclaw explain provider-payload [session_id] [agent_id]",
+            "  hiveclaw --explain-context <session_id> [agent_id]",
+            "  hiveclaw --explain-provider-payloads <session_id> [agent_id]",
+            "  hiveclaw setup stt --local",
+            "  hiveclaw setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>]",
+            "  hiveclaw channels <list|status|add|remove> [channel]",
+            "  hiveclaw help [topic]",
+            "  hiveclaw telemetry export [--scope <local|shared>] [--output-dir <path>]",
             "",
             "Common topics:",
-            "  run, tui, install, completion, doctor, setup, channels, inspect, explain",
+            "  init, run, tui, install, completion, skills, doctor, setup, channels, inspect, explain, replay, telemetry",
+            "",
+            "Compatibility:",
+            "  The legacy `aria-x` command remains available as an alias.",
         ]
         .join("\n"),
     }
@@ -212,7 +475,11 @@ fn path_contains_dir(path_var: &str, dir: &Path) -> bool {
 }
 
 fn install_target_path(bin_dir: &Path) -> PathBuf {
-    bin_dir.join("aria-x")
+    bin_dir.join(PRIMARY_CLI_NAME)
+}
+
+fn compatibility_install_target_path(bin_dir: &Path) -> PathBuf {
+    bin_dir.join(LEGACY_CLI_NAME)
 }
 
 fn install_binary(current_exe: &Path, target: &Path, mode: InstallMode) -> Result<(), String> {
@@ -261,7 +528,7 @@ fn run_install_command(args: &[String]) -> Result<String, String> {
             "--bin-dir" => {
                 let value = args
                     .get(idx + 1)
-                    .ok_or_else(|| "Usage: aria-x install [--bin-dir <path>]".to_string())?;
+                    .ok_or_else(|| "Usage: hiveclaw install [--bin-dir <path>]".to_string())?;
                 bin_dir = Some(PathBuf::from(value));
                 idx += 2;
             }
@@ -275,7 +542,7 @@ fn run_install_command(args: &[String]) -> Result<String, String> {
             }
             _ => {
                 return Err(
-                    "Usage: aria-x install [--bin-dir <path>] [--with-default-config] [--overwrite-config]"
+                    "Usage: hiveclaw install [--bin-dir <path>] [--with-default-config] [--overwrite-config]"
                         .into(),
                 )
             }
@@ -283,9 +550,13 @@ fn run_install_command(args: &[String]) -> Result<String, String> {
     }
     let bin_dir = bin_dir.unwrap_or(default_install_bin_dir()?);
     let target = install_target_path(&bin_dir);
+    let legacy_target = compatibility_install_target_path(&bin_dir);
     let current_exe = std::env::current_exe()
         .map_err(|e| format!("resolve current executable failed: {}", e))?;
     install_binary(&current_exe, &target, InstallMode::Copy)?;
+    if legacy_target != target {
+        install_binary(&current_exe, &legacy_target, InstallMode::Copy)?;
+    }
     let config_seed_status = if seed_default_config {
         Some(seed_default_runtime_config(overwrite_config)?)
     } else {
@@ -304,9 +575,10 @@ fn run_install_command(args: &[String]) -> Result<String, String> {
     };
 
     Ok(format!(
-        "Installed HiveClaw (aria-x binary).\nsource: {}\ntarget: {}\ninstall_mode: copy\n{}\n{}",
+        "Installed HiveClaw command(s).\nsource: {}\nprimary_target: {}\ncompatibility_alias: {}\ninstall_mode: copy\n{}\n{}",
         current_exe.display(),
         target.display(),
+        legacy_target.display(),
         config_seed_status.unwrap_or_else(|| "config_seed: skipped".to_string()),
         path_hint
     ))
@@ -359,14 +631,18 @@ fn seed_default_runtime_config_at(target: &Path, overwrite: bool) -> Result<Stri
 fn render_shell_completion(shell: &str) -> Result<String, String> {
     match shell.trim().to_ascii_lowercase().as_str() {
         "bash" => Ok(
-            r#"_aria_x_completions() {
+            r#"_hiveclaw_completions() {
     local cur prev words cword
     _init_completion || return
-    local commands="run tui status stop install completion doctor setup channels inspect explain help"
+    local commands="init run tui status stop install completion skills doctor setup channels inspect explain help"
     local doctor_topics="stt env gateway browser mcp"
     local completion_shells="bash zsh fish"
     local channel_subcommands="list status add remove"
+    local skill_subcommands="list install update enable disable bind unbind export doctor"
     case "${words[1]}" in
+        skills)
+            COMPREPLY=( $(compgen -W "${skill_subcommands}" -- "$cur") )
+            ;;
         doctor)
             COMPREPLY=( $(compgen -W "${doctor_topics}" -- "$cur") )
             ;;
@@ -384,21 +660,23 @@ fn render_shell_completion(shell: &str) -> Result<String, String> {
             ;;
     esac
 }
-complete -F _aria_x_completions aria-x
+complete -F _hiveclaw_completions hiveclaw
 "#
             .to_string(),
         ),
         "zsh" => Ok(
-            r#"#compdef aria-x
-_aria_x() {
+            r#"#compdef hiveclaw
+_hiveclaw() {
   local -a commands
   commands=(
+    'init:Bootstrap a local HiveClaw project'
     'run:Run the main runtime'
     'tui:Run the terminal UI'
     'status:Show runtime status'
     'stop:Stop the runtime'
-    'install:Install aria-x into a user bin directory'
+    'install:Install HiveClaw into a user bin directory'
     'completion:Print shell completion script'
+    'skills:Manage installed skills and bindings'
     'doctor:Run operator health checks'
     'setup:Run setup flows'
     'channels:Manage configured channels'
@@ -411,6 +689,9 @@ _aria_x() {
     return
   fi
   case "$words[2]" in
+    skills)
+      _values 'skills command' list install update enable disable bind unbind export doctor
+      ;;
     doctor)
       _values 'doctor topic' stt env gateway browser mcp
       ;;
@@ -425,28 +706,481 @@ _aria_x() {
       ;;
   esac
 }
-_aria_x
+_hiveclaw
 "#
             .to_string(),
         ),
         "fish" => Ok(
-            r#"complete -c aria-x -f
-complete -c aria-x -n '__fish_use_subcommand' -a 'run tui status stop install completion doctor setup channels inspect explain help'
-complete -c aria-x -n '__fish_seen_subcommand_from doctor' -a 'stt env gateway browser mcp'
-complete -c aria-x -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
-complete -c aria-x -n '__fish_seen_subcommand_from channels' -a 'list status add remove'
-complete -c aria-x -n '__fish_seen_subcommand_from inspect explain' -a 'context provider-payloads provider-payload'
+            r#"complete -c hiveclaw -f
+complete -c hiveclaw -n '__fish_use_subcommand' -a 'init run tui status stop install completion skills doctor setup channels inspect explain help'
+complete -c hiveclaw -n '__fish_seen_subcommand_from skills' -a 'list install update enable disable bind unbind export doctor'
+complete -c hiveclaw -n '__fish_seen_subcommand_from doctor' -a 'stt env gateway browser mcp'
+complete -c hiveclaw -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'
+complete -c hiveclaw -n '__fish_seen_subcommand_from channels' -a 'list status add remove'
+complete -c hiveclaw -n '__fish_seen_subcommand_from inspect explain' -a 'context provider-payloads provider-payload'
 "#
             .to_string(),
         ),
-        _ => Err("Usage: aria-x completion <bash|zsh|fish>".into()),
+        _ => Err("Usage: hiveclaw completion <bash|zsh|fish>".into()),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitPreset {
+    Recommended,
+    Edge,
+}
+
+impl InitPreset {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "recommended" | "default" => Some(Self::Recommended),
+            "edge" => Some(Self::Edge),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Recommended => "recommended",
+            Self::Edge => "edge",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuidanceImportMode {
+    Merge,
+    Reference,
+    Ignore,
+}
+
+impl GuidanceImportMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "merge" => Some(Self::Merge),
+            "reference" | "link" => Some(Self::Reference),
+            "ignore" | "none" => Some(Self::Ignore),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Reference => "reference",
+            Self::Ignore => "ignore",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InitPlan {
+    root_dir: PathBuf,
+    preset: InitPreset,
+    default_agent: String,
+    with_browser: bool,
+    suggest_chrome_mcp: bool,
+    import_mode: GuidanceImportMode,
+}
+
+fn prompt_line(label: &str, default: &str) -> Result<String, String> {
+    print!("{} [{}]: ", label, default);
+    std::io::stdout()
+        .flush()
+        .map_err(|e| format!("flush prompt failed: {}", e))?;
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| format!("read prompt input failed: {}", e))?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn prompt_bool(label: &str, default: bool) -> Result<bool, String> {
+    let default_str = if default { "Y/n" } else { "y/N" };
+    let value = prompt_line(label, default_str)?;
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() || normalized == default_str.to_ascii_lowercase() {
+        return Ok(default);
+    }
+    match normalized.as_str() {
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => Ok(default),
+    }
+}
+
+fn detect_bootstrap_provider() -> (&'static str, &'static str) {
+    let runtime = load_runtime_env_config().ok();
+    if runtime
+        .as_ref()
+        .and_then(|cfg| cfg.gemini_api_key.as_ref())
+        .is_some()
+    {
+        return ("gemini", "gemini-3-flash-preview");
+    }
+    if runtime
+        .as_ref()
+        .and_then(|cfg| cfg.openrouter_api_key.as_ref())
+        .is_some()
+    {
+        return ("openrouter", "openai/gpt-4o-mini");
+    }
+    if runtime
+        .as_ref()
+        .and_then(|cfg| cfg.openai_api_key.as_ref())
+        .is_some()
+    {
+        return ("openai", "gpt-4o-mini");
+    }
+    if runtime
+        .as_ref()
+        .and_then(|cfg| cfg.anthropic_api_key.as_ref())
+        .is_some()
+    {
+        return ("anthropic", "claude-3-7-sonnet");
+    }
+    ("gemini", "gemini-3-flash-preview")
+}
+
+fn build_bootstrap_config(plan: &InitPlan) -> String {
+    let (backend, model) = detect_bootstrap_provider();
+    let timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string());
+    let edge = matches!(plan.preset, InitPreset::Edge);
+    let max_tool_rounds = if edge { 4 } else { 6 };
+    let max_parallel_requests = if edge { 2 } else { 8 };
+    let wasm_max_memory_pages = if edge { 96 } else { 256 };
+    let retrieval_char_budget = if edge { 6_000 } else { 16_000 };
+    let browser_automation_enabled = if edge {
+        false
+    } else {
+        plan.with_browser
+    };
+    let learning_enabled = !edge;
+    let cluster_profile = if edge { "edge" } else { "node" };
+    format!(
+        "# HiveClaw project bootstrap\n\n\
+         [llm]\n\
+         backend = \"{backend}\"\n\
+         model = \"{model}\"\n\
+         max_tool_rounds = {max_tool_rounds}\n\n\
+         [policy]\n\
+         policy_path = \"./policies/default.cedar\"\n\n\
+         [gateway]\n\
+         adapter = \"cli\"\n\
+         adapters = [\"cli\"]\n\
+         session_scope_policy = \"main\"\n\n\
+         [mesh]\n\
+         mode = \"peer\"\n\
+         endpoints = []\n\n\
+         [agents_dir]\n\
+         path = \"./agents\"\n\n\
+         [router]\n\
+         confidence_threshold = 0.70\n\
+         tie_break_gap = 0.05\n\n\
+         [ssmu]\n\
+         sessions_dir = \"./workspace/sessions\"\n\
+         operator_skill_signature_max_rows = 5000\n\
+         operator_shell_exec_audit_max_rows = 20000\n\n\
+         [scheduler]\n\
+         enabled = false\n\
+         tick_seconds = 1\n\n\
+         [localization]\n\
+         default_timezone = \"{timezone}\"\n\
+         user_timezones = {{}}\n\n\
+         [node]\n\
+         id = \"orchestrator-1\"\n\
+         role = \"orchestrator\"\n\
+         tier = \"orchestrator\"\n\n\
+         [cluster]\n\
+         profile = \"{cluster_profile}\"\n\
+         runtime_store_backend = \"sqlite\"\n\
+         tenant_id = \"default\"\n\
+         workspace_scope = \"default\"\n\
+         scheduler_shards = 1\n\n\
+         [resource_budget]\n\
+         max_parallel_requests = {max_parallel_requests}\n\
+         wasm_max_memory_pages = {wasm_max_memory_pages}\n\
+         max_tool_rounds = {max_tool_rounds}\n\
+         retrieval_context_char_budget = {retrieval_char_budget}\n\
+         browser_automation_enabled = {browser_automation_enabled}\n\
+         learning_enabled = {learning_enabled}\n\n\
+         [ui]\n\
+         enabled = false\n\
+         bind_addr = \"127.0.0.1:8080\"\n\
+         default_agent = \"{default_agent}\"\n",
+        backend = backend,
+        model = model,
+        max_tool_rounds = max_tool_rounds,
+        timezone = timezone,
+        cluster_profile = cluster_profile,
+        max_parallel_requests = max_parallel_requests,
+        wasm_max_memory_pages = wasm_max_memory_pages,
+        retrieval_char_budget = retrieval_char_budget,
+        browser_automation_enabled = browser_automation_enabled,
+        learning_enabled = learning_enabled,
+        default_agent = plan.default_agent,
+    )
+}
+
+fn build_hiveclaw_md(
+    plan: &InitPlan,
+    agents_md: Option<&Path>,
+    claude_md: Option<&Path>,
+) -> Result<String, String> {
+    let mut sections = vec![
+        "# HiveClaw Project Guidance".to_string(),
+        "".to_string(),
+        format!("- preset: `{}`", plan.preset.as_str()),
+        format!("- default_agent: `{}`", plan.default_agent),
+        format!("- browser_runtime_suggested: `{}`", plan.with_browser),
+        format!(
+            "- chrome_devtools_mcp_suggested: `{}`",
+            plan.suggest_chrome_mcp
+        ),
+        "".to_string(),
+        "## Notes".to_string(),
+        "".to_string(),
+        "This file is the HiveClaw-local project bootstrap guidance file.".to_string(),
+        "Update it with project-specific workflow, tool, and review instructions as the project matures.".to_string(),
+        "".to_string(),
+    ];
+
+    match plan.import_mode {
+        GuidanceImportMode::Ignore => {
+            sections.push("## Imported Guidance".to_string());
+            sections.push("".to_string());
+            sections.push("No external project guidance was imported during bootstrap.".to_string());
+        }
+        GuidanceImportMode::Reference => {
+            sections.push("## Imported Guidance References".to_string());
+            sections.push("".to_string());
+            if let Some(path) = agents_md {
+                sections.push(format!("- AGENTS.md: `{}`", path.display()));
+            }
+            if let Some(path) = claude_md {
+                sections.push(format!("- CLAUDE.md: `{}`", path.display()));
+            }
+        }
+        GuidanceImportMode::Merge => {
+            sections.push("## Imported Guidance".to_string());
+            sections.push("".to_string());
+            if let Some(path) = agents_md {
+                sections.push("### Imported from AGENTS.md".to_string());
+                sections.push("".to_string());
+                sections.push(
+                    std::fs::read_to_string(path)
+                        .map_err(|e| format!("read '{}' failed: {}", path.display(), e))?,
+                );
+                sections.push("".to_string());
+            }
+            if let Some(path) = claude_md {
+                sections.push("### Imported from CLAUDE.md".to_string());
+                sections.push("".to_string());
+                sections.push(
+                    std::fs::read_to_string(path)
+                        .map_err(|e| format!("read '{}' failed: {}", path.display(), e))?,
+                );
+                sections.push("".to_string());
+            }
+            if agents_md.is_none() && claude_md.is_none() {
+                sections.push("No existing AGENTS.md or CLAUDE.md file was present.".to_string());
+            }
+        }
+    }
+
+    Ok(sections.join("\n"))
+}
+
+fn run_init_command(args: &[String]) -> Result<String, String> {
+    let mut root_dir = std::env::current_dir().map_err(|e| format!("resolve current dir failed: {}", e))?;
+    let mut preset = InitPreset::Recommended;
+    let mut default_agent = "developer".to_string();
+    let mut with_browser = true;
+    let mut suggest_chrome_mcp = true;
+    let mut import_mode = None;
+    let mut overwrite = false;
+    let mut non_interactive = false;
+    let mut idx = 2usize;
+    while let Some(arg) = args.get(idx) {
+        match arg.as_str() {
+            "--preset" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "Usage: hiveclaw init [path] [--preset <recommended|edge>]".to_string())?;
+                preset = InitPreset::parse(value)
+                    .ok_or_else(|| format!("unknown preset '{}'", value))?;
+                idx += 2;
+            }
+            "--default-agent" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "Usage: hiveclaw init [path] [--default-agent <agent_id>]".to_string())?;
+                default_agent = value.trim().to_string();
+                idx += 2;
+            }
+            "--with-browser" => {
+                with_browser = true;
+                idx += 1;
+            }
+            "--without-browser" => {
+                with_browser = false;
+                idx += 1;
+            }
+            "--with-chrome-mcp" => {
+                suggest_chrome_mcp = true;
+                idx += 1;
+            }
+            "--without-chrome-mcp" => {
+                suggest_chrome_mcp = false;
+                idx += 1;
+            }
+            "--import-guidance" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "Usage: hiveclaw init [path] [--import-guidance <merge|reference|ignore>]".to_string())?;
+                import_mode = GuidanceImportMode::parse(value);
+                if import_mode.is_none() {
+                    return Err(format!("unknown import guidance mode '{}'", value));
+                }
+                idx += 2;
+            }
+            "--overwrite" => {
+                overwrite = true;
+                idx += 1;
+            }
+            "--non-interactive" => {
+                non_interactive = true;
+                idx += 1;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown argument '{}'", other));
+            }
+            other => {
+                root_dir = PathBuf::from(other);
+                idx += 1;
+            }
+        }
+    }
+
+    let agents_md = root_dir.join("AGENTS.md");
+    let claude_md = root_dir.join("CLAUDE.md");
+    let guidance_present = agents_md.is_file() || claude_md.is_file();
+    let interactive = !non_interactive
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal();
+
+    if interactive {
+        let preset_value = prompt_line("Preset", preset.as_str())?;
+        if let Some(parsed) = InitPreset::parse(&preset_value) {
+            preset = parsed;
+        }
+        default_agent = prompt_line("Default agent", &default_agent)?;
+        with_browser = prompt_bool("Enable browser-friendly setup hints?", with_browser)?;
+        suggest_chrome_mcp =
+            prompt_bool("Suggest Chrome DevTools MCP setup in next steps?", suggest_chrome_mcp)?;
+        if guidance_present {
+            let import_default = import_mode.unwrap_or(GuidanceImportMode::Merge).as_str();
+            let import_value = prompt_line(
+                "Import existing AGENTS.md / CLAUDE.md into HIVECLAW.md (merge/reference/ignore)",
+                import_default,
+            )?;
+            if let Some(parsed) = GuidanceImportMode::parse(&import_value) {
+                import_mode = Some(parsed);
+            }
+        }
+    }
+
+    if matches!(preset, InitPreset::Edge) {
+        with_browser = false;
+        suggest_chrome_mcp = false;
+    }
+
+    let plan = InitPlan {
+        root_dir: root_dir.clone(),
+        preset,
+        default_agent,
+        with_browser,
+        suggest_chrome_mcp,
+        import_mode: import_mode.unwrap_or(if guidance_present {
+            GuidanceImportMode::Merge
+        } else {
+            GuidanceImportMode::Ignore
+        }),
+    };
+
+    let config_dir = root_dir.join(".hiveclaw");
+    let config_path = config_dir.join("config.toml");
+    let policy_dir = config_dir.join("policies");
+    let agents_dir = config_dir.join("agents");
+    let sessions_dir = config_dir.join("workspace").join("sessions");
+    let guidance_path = root_dir.join("HIVECLAW.md");
+
+    if !overwrite && (config_path.exists() || guidance_path.exists()) {
+        return Err(format!(
+            "bootstrap output already exists under '{}'. Re-run with --overwrite to replace it.",
+            config_dir.display()
+        ));
+    }
+
+    std::fs::create_dir_all(&policy_dir)
+        .map_err(|e| format!("create policy dir '{}' failed: {}", policy_dir.display(), e))?;
+    std::fs::create_dir_all(&agents_dir)
+        .map_err(|e| format!("create agents dir '{}' failed: {}", agents_dir.display(), e))?;
+    std::fs::create_dir_all(&sessions_dir)
+        .map_err(|e| format!("create sessions dir '{}' failed: {}", sessions_dir.display(), e))?;
+
+    std::fs::write(&policy_dir.join("default.cedar"), DEFAULT_BOOTSTRAP_POLICY)
+        .map_err(|e| format!("write bootstrap policy failed: {}", e))?;
+    std::fs::write(&config_path, build_bootstrap_config(&plan))
+        .map_err(|e| format!("write bootstrap config failed: {}", e))?;
+    std::fs::write(
+        agents_dir.join("README.md"),
+        "# HiveClaw agents\n\nPlace agent configuration files here as the project grows.\n",
+    )
+    .map_err(|e| format!("write agents readme failed: {}", e))?;
+    std::fs::write(
+        &guidance_path,
+        build_hiveclaw_md(
+            &plan,
+            agents_md.is_file().then_some(agents_md.as_path()),
+            claude_md.is_file().then_some(claude_md.as_path()),
+        )?,
+    )
+    .map_err(|e| format!("write HIVECLAW.md failed: {}", e))?;
+
+    let browser_note = if plan.suggest_chrome_mcp {
+        format!(
+            "next_step_browser: run `{}` to enable Chrome-backed browser tooling",
+            format!("{PRIMARY_CLI_NAME} setup chrome-devtools-mcp --agent {}", plan.default_agent)
+        )
+    } else {
+        "next_step_browser: browser tooling not suggested for this preset".to_string()
+    };
+
+    Ok(format!(
+        "HiveClaw project bootstrapped.\nroot: {}\nconfig: {}\npreset: {}\ndefault_agent: {}\nimport_guidance: {}\n{}\nnext_step_run: {} run {}",
+        plan.root_dir.display(),
+        config_path.display(),
+        plan.preset.as_str(),
+        plan.default_agent,
+        plan.import_mode.as_str(),
+        browser_note,
+        PRIMARY_CLI_NAME,
+        config_path.display(),
+    ))
 }
 
 fn run_preflight_cli_command(args: &[String]) -> Option<Result<String, String>> {
     match args.get(1).map(String::as_str) {
         Some("help") => Some(Ok(render_cli_help(args.get(2).map(String::as_str)))),
         Some("-h") | Some("--help") => Some(Ok(render_cli_help(None))),
+        Some("init") => Some(run_init_command(args)),
         Some("install") => Some(run_install_command(args)),
         Some("completion") => Some(render_shell_completion(
             args.get(2).map(String::as_str).unwrap_or_default(),
@@ -667,6 +1401,45 @@ async fn actual_main() {
         }
     }
 
+    if let Some(output) = run_replay_management_command(&config, &args) {
+        match output {
+            Ok(text) => {
+                println!("{}", text);
+                return;
+            }
+            Err(err) => {
+                eprintln!("[HiveClaw] Replay command failed: {}", err);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(output) = run_telemetry_management_command(&config, &args) {
+        match output {
+            Ok(text) => {
+                println!("{}", text);
+                return;
+            }
+            Err(err) => {
+                eprintln!("[HiveClaw] Telemetry command failed: {}", err);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if let Some(output) = run_skill_management_command(&config, &args) {
+        match output {
+            Ok(text) => {
+                println!("{}", text);
+                return;
+            }
+            Err(err) => {
+                eprintln!("[HiveClaw] Skills command failed: {}", err);
+                std::process::exit(1);
+            }
+        }
+    }
+
     if let Err(err) = validate_config(&config) {
         eprintln!("[HiveClaw] Config validation error: {}", err);
         eprintln!("[HiveClaw] For Telegram: set TELEGRAM_BOT_TOKEN or add telegram_token to config");
@@ -703,6 +1476,18 @@ async fn actual_main() {
             }
             Err(err) => {
                 eprintln!("[HiveClaw] Operator command failed: {}", err);
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(result) = run_robotics_command(&config, &args) {
+        match result {
+            Ok(text) => {
+                println!("{}", text);
+                return;
+            }
+            Err(err) => {
+                eprintln!("[HiveClaw] Robotics command failed: {}", err);
                 std::process::exit(1);
             }
         }
@@ -872,8 +1657,8 @@ async fn actual_main() {
                         r#"{"target": {"type":"string","description":"Crate or test name to run, or empty for all"}}"#,
                     ),
                     "run_shell" => (
-                        "Execute a shell command and return stdout/stderr output.",
-                        r#"{"command": {"type":"string","description":"Shell command to run"}}"#,
+                        "Execute a shell command and return stdout/stderr output. Can optionally target a configured execution backend such as local, docker, or ssh.",
+                        r#"{"command": {"type":"string","description":"Shell command to run"}, "backend_id": {"type":"string","description":"Optional execution backend id such as local-default, docker-sandbox, or a configured ssh backend profile"}, "docker_image": {"type":"string","description":"Optional docker image override when backend_id targets docker"}, "cwd": {"type":"string","description":"Optional working directory; required for docker backend and scoped filesystem execution, and mapped through remote workspace configuration for ssh backends"}, "allow_network_egress": {"type":"boolean","description":"Whether the selected backend may access the network if it supports egress"}}"#,
                     ),
                     "search_web" => (
                         "Search the web for information about a query. Returns a summary of top results.",
@@ -974,6 +1759,26 @@ async fn actual_main() {
                     "browser_download" => (
                         "Download a URL into a managed browser session artifact with audit.",
                         r#"{"browser_session_id": {"type":"string","description":"Managed browser session id"}, "url": {"type":"string","description":"URL to download"}, "filename": {"type":"string","description":"Optional output filename override"}}"#,
+                    ),
+                    "computer_profile_list" => (
+                        "List configured computer execution profiles and active computer sessions for the current session.",
+                        r#"{}"#,
+                    ),
+                    "computer_session_start" => (
+                        "Prepare or reuse a local computer-runtime session on a selected execution profile.",
+                        r#"{"profile_id":{"type":"string","description":"Optional computer execution profile id"}, "target_window_id":{"type":"string","description":"Optional initial target window id"}}"#,
+                    ),
+                    "computer_session_list" => (
+                        "List computer-runtime sessions for the current agent and session.",
+                        r#"{}"#,
+                    ),
+                    "computer_capture" | "computer_screenshot" => (
+                        "Capture a real screenshot from the local computer runtime and persist it as a computer artifact.",
+                        r#"{"computer_session_id":{"type":"string","description":"Optional computer session id to reuse"}, "profile_id":{"type":"string","description":"Optional computer execution profile id"}} "#,
+                    ),
+                    "computer_act" => (
+                        "Perform a desktop computer-runtime action such as pointer move, pointer click, keyboard typing, key press, clipboard read, or clipboard write. High-risk actions require approval.",
+                        r#"{"computer_session_id":{"type":"string","description":"Optional computer session id to reuse"}, "profile_id":{"type":"string","description":"Optional computer execution profile id"}, "target_window_id":{"type":"string","description":"Optional target window id for focused actions"}, "action":{"type":"string","enum":["pointer_move","pointer_click","keyboard_type","key_press","clipboard_read","clipboard_write"],"description":"Computer action to perform"}, "x":{"type":"integer","description":"Screen x coordinate for pointer actions"}, "y":{"type":"integer","description":"Screen y coordinate for pointer actions"}, "button":{"type":"string","enum":["left","right","middle"],"description":"Pointer button for clicks"}, "text":{"type":"string","description":"Text for keyboard_type or clipboard_write"}, "key":{"type":"string","description":"Key label for key_press"}}"#,
                     ),
                     "web_fetch" => (
                         "Fetch a URL over HTTP and return the response body and content type.",
@@ -1078,6 +1883,12 @@ async fn actual_main() {
         "browser_screenshot",
         "browser_act",
         "browser_download",
+        "computer_profile_list",
+        "computer_session_start",
+        "computer_session_list",
+        "computer_capture",
+        "computer_screenshot",
+        "computer_act",
         "crawl_page",
         "crawl_site",
         "watch_page",
@@ -1469,7 +2280,10 @@ async fn actual_main() {
                 "Plan: {:?}\nVector Context:\n{}\n\nCapability Index Context:\n{}\n\nDocument Index Context:\n{}",
                 hybrid.plan, vector_context, capability_context, document_context
             );
-            Ok(rag_context)
+            Ok(PromptHookAsset {
+                label: "legacy_hybrid_memory".into(),
+                content: rag_context,
+            })
         })
     }));
     let hooks = Arc::new(hooks);
@@ -2543,6 +3357,7 @@ async fn actual_main() {
         if let Some(output) = handle_runtime_control_command(
             &req,
             &shared_config,
+            &llm_pool,
             &session_memory,
             None,
         )
@@ -2555,6 +3370,7 @@ async fn actual_main() {
         if let Some(reply) = handle_cli_control_command(
             &req,
             &shared_config,
+            &llm_pool,
             &*agent_store,
             &session_memory,
         ) {
@@ -2746,7 +3562,7 @@ fn stop_runtime_process() -> Result<String, String> {
     #[cfg(not(unix))]
     {
         let _ = record;
-        Err("`aria-x stop` is currently only implemented on Unix-like systems.".into())
+        Err("`hiveclaw stop` is currently only implemented on Unix-like systems.".into())
     }
 }
 
@@ -2772,6 +3588,13 @@ async fn wait_for_runtime_shutdown(shutdown: Arc<ShutdownCoordinator>) {
         tokio::signal::ctrl_c().await.ok();
     }
     shutdown.signal_shutdown();
+}
+
+fn setup_ssh_backend_cli(
+    config: &ResolvedAppConfig,
+    args: &[String],
+) -> Result<String, String> {
+    setup_ssh_backend_cli_impl(config, args)
 }
 
 fn run_stt_management_command(
@@ -2800,13 +3623,1470 @@ fn run_stt_management_command(
             Some(if wants_local {
                 setup_local_stt_env(config)
             } else {
-                Err("Usage: aria-x setup stt --local".into())
+                Err("Usage: hiveclaw setup stt --local".into())
             })
         }
         (Some("setup"), Some("chrome-devtools-mcp")) => {
             Some(setup_chrome_devtools_mcp_cli(config, args))
         }
+        (Some("setup"), Some("ssh-backend")) => Some(setup_ssh_backend_cli(config, args)),
         _ => None,
+    }
+}
+
+fn run_replay_management_command(
+    config: &ResolvedAppConfig,
+    args: &[String],
+) -> Option<Result<String, String>> {
+    match (args.get(1).map(String::as_str), args.get(2).map(String::as_str)) {
+        (Some("replay"), Some("golden")) => Some(run_golden_replay_cli(config, args)),
+        (Some("replay"), Some("contracts")) => Some(run_contract_regression_cli(config)),
+        (Some("replay"), Some("providers")) => Some(run_provider_benchmark_cli(config, args)),
+        (Some("replay"), Some("gate")) => Some(run_release_gate_cli(config, args)),
+        _ => None,
+    }
+}
+
+fn run_telemetry_management_command(
+    config: &ResolvedAppConfig,
+    args: &[String],
+) -> Option<Result<String, String>> {
+    match (args.get(1).map(String::as_str), args.get(2).map(String::as_str)) {
+        (Some("telemetry"), Some("export")) => Some(run_telemetry_export_cli(config, args)),
+        _ => None,
+    }
+}
+
+fn run_telemetry_export_cli(config: &ResolvedAppConfig, args: &[String]) -> Result<String, String> {
+    let mut scope = TelemetryExportScope::Local;
+    let mut output_dir = None;
+    let mut idx = 3usize;
+    while let Some(arg) = args.get(idx) {
+        match arg.as_str() {
+            "--scope" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| {
+                        "Usage: hiveclaw telemetry export [--scope <local|shared>] [--output-dir <path>]".to_string()
+                    })?;
+                scope = match value.as_str() {
+                    "local" => TelemetryExportScope::Local,
+                    "shared" => TelemetryExportScope::Shared,
+                    _ => {
+                        return Err(
+                            "Usage: hiveclaw telemetry export [--scope <local|shared>] [--output-dir <path>]".into(),
+                        )
+                    }
+                };
+                idx += 2;
+            }
+            "--output-dir" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| {
+                        "Usage: hiveclaw telemetry export [--scope <local|shared>] [--output-dir <path>]".to_string()
+                    })?;
+                output_dir = Some(PathBuf::from(value));
+                idx += 2;
+            }
+            _ => {
+                return Err(
+                    "Usage: hiveclaw telemetry export [--scope <local|shared>] [--output-dir <path>]".into(),
+                )
+            }
+        }
+    }
+    export_telemetry_bundle(config, scope, output_dir.as_deref())
+}
+
+fn run_golden_replay_cli(config: &ResolvedAppConfig, args: &[String]) -> Result<String, String> {
+    let suite_path = args
+        .get(3)
+        .ok_or_else(|| "Usage: hiveclaw replay golden <suite.toml>".to_string())?;
+    let suite_body = std::fs::read_to_string(suite_path)
+        .map_err(|e| format!("read golden replay suite failed: {}", e))?;
+    let suite: GoldenReplaySuite = toml::from_str(&suite_body)
+        .map_err(|e| format!("parse golden replay suite failed: {}", e))?;
+    let report = evaluate_golden_replay_suite(
+        &RuntimeStore::for_sessions_dir(Path::new(&config.ssmu.sessions_dir)),
+        &suite,
+    )?;
+    if report.failed_count > 0 {
+        return Err(render_golden_replay_report(&report));
+    }
+    Ok(render_golden_replay_report(&report))
+}
+
+fn run_contract_regression_cli(config: &ResolvedAppConfig) -> Result<String, String> {
+    let report = evaluate_contract_regression_suite(Path::new(&config.ssmu.sessions_dir))?;
+    if report.failed_count > 0 {
+        return Err(render_contract_regression_report(&report));
+    }
+    Ok(render_contract_regression_report(&report))
+}
+
+fn evaluate_golden_replay_suite(
+    store: &RuntimeStore,
+    suite: &GoldenReplaySuite,
+) -> Result<GoldenReplayReport, String> {
+    let mut results = Vec::with_capacity(suite.scenarios.len());
+    for scenario in &suite.scenarios {
+        let samples = store.build_replay_samples_for_fingerprint(&scenario.task_fingerprint)?;
+        let latest = samples
+            .iter()
+            .max_by_key(|sample| sample.trace.recorded_at_us);
+        let mut reasons = Vec::new();
+
+        if samples.len() < scenario.min_samples {
+            reasons.push(format!(
+                "expected at least {} sample(s), found {}",
+                scenario.min_samples,
+                samples.len()
+            ));
+        }
+
+        if let Some(sample) = latest {
+            if sample.trace.outcome != scenario.expected_outcome {
+                reasons.push(format!(
+                    "expected outcome {:?}, got {:?}",
+                    scenario.expected_outcome, sample.trace.outcome
+                ));
+            }
+            for tool in &scenario.required_tools {
+                if !sample.trace.tool_names.iter().any(|name| name == tool) {
+                    reasons.push(format!("missing required tool '{}'", tool));
+                }
+            }
+            for needle in &scenario.response_must_contain {
+                if !sample.trace.response_summary.contains(needle) {
+                    reasons.push(format!(
+                        "response summary missing substring '{}'",
+                        needle
+                    ));
+                }
+            }
+            if let Some(min_reward_score) = scenario.min_reward_score {
+                if sample.reward_score < min_reward_score {
+                    reasons.push(format!(
+                        "expected reward score >= {}, got {}",
+                        min_reward_score, sample.reward_score
+                    ));
+                }
+            }
+        } else {
+            reasons.push("no replay samples found".into());
+        }
+
+        results.push(GoldenReplayScenarioResult {
+            id: scenario.id.clone(),
+            task_fingerprint: scenario.task_fingerprint.clone(),
+            sample_count: samples.len(),
+            latest_request_id: latest.map(|sample| sample.trace.request_id.clone()),
+            latest_outcome: latest.map(|sample| sample.trace.outcome),
+            latest_reward_score: latest.map(|sample| sample.reward_score),
+            passed: reasons.is_empty(),
+            reasons,
+        });
+    }
+
+    Ok(GoldenReplayReport {
+        scenario_count: results.len(),
+        passed_count: results.iter().filter(|result| result.passed).count(),
+        failed_count: results.iter().filter(|result| !result.passed).count(),
+        results,
+    })
+}
+
+fn default_contract_regression_scenarios() -> Vec<ContractRegressionScenario> {
+    vec![
+        ContractRegressionScenario {
+            id: "artifact-create-file",
+            request_text: "Create a hello.js file with console.log('hi')",
+            expected_kind: aria_core::ExecutionContractKind::ArtifactCreate,
+            expected_required_artifacts: vec![aria_core::ExecutionArtifactKind::File],
+            expected_required_tools: vec!["write_file"],
+            expected_approval_required: true,
+            expected_tool_choice: Some("specific:write_file"),
+            satisfied_tool_names: vec!["write_file"],
+            expected_plain_text_failure: Some(
+                aria_core::ContractFailureReason::MissingRequiredArtifact,
+            ),
+            approval_probe: Some(ContractApprovalProbe {
+                tool_name: "write_file",
+                arguments_json: serde_json::json!({
+                    "path": "./hello.js",
+                    "content": "console.log('hi');"
+                }),
+            }),
+        },
+        ContractRegressionScenario {
+            id: "schedule-create-reminder",
+            request_text: "Set a reminder in 2 minutes to stretch",
+            expected_kind: aria_core::ExecutionContractKind::ScheduleCreate,
+            expected_required_artifacts: vec![aria_core::ExecutionArtifactKind::Schedule],
+            expected_required_tools: vec!["schedule_message"],
+            expected_approval_required: false,
+            expected_tool_choice: Some("specific:schedule_message"),
+            satisfied_tool_names: vec!["schedule_message"],
+            expected_plain_text_failure: Some(
+                aria_core::ContractFailureReason::MissingRequiredArtifact,
+            ),
+            approval_probe: None,
+        },
+        ContractRegressionScenario {
+            id: "browser-read-screenshot",
+            request_text: "Open https://example.com and take a screenshot",
+            expected_kind: aria_core::ExecutionContractKind::BrowserRead,
+            expected_required_artifacts: vec![aria_core::ExecutionArtifactKind::Browser],
+            expected_required_tools: vec!["browser_screenshot"],
+            expected_approval_required: false,
+            expected_tool_choice: Some("required"),
+            satisfied_tool_names: vec!["browser_screenshot"],
+            expected_plain_text_failure: Some(
+                aria_core::ContractFailureReason::MissingRequiredArtifact,
+            ),
+            approval_probe: None,
+        },
+        ContractRegressionScenario {
+            id: "browser-act-click",
+            request_text: "Open https://example.com and click login",
+            expected_kind: aria_core::ExecutionContractKind::BrowserAct,
+            expected_required_artifacts: vec![aria_core::ExecutionArtifactKind::Browser],
+            expected_required_tools: vec!["browser_act"],
+            expected_approval_required: false,
+            expected_tool_choice: Some("specific:browser_act"),
+            satisfied_tool_names: vec!["browser_act"],
+            expected_plain_text_failure: Some(
+                aria_core::ContractFailureReason::MissingRequiredArtifact,
+            ),
+            approval_probe: None,
+        },
+        ContractRegressionScenario {
+            id: "mcp-invoke",
+            request_text: "Invoke mcp tool list_pages on server chrome_devtools",
+            expected_kind: aria_core::ExecutionContractKind::McpInvoke,
+            expected_required_artifacts: vec![aria_core::ExecutionArtifactKind::Mcp],
+            expected_required_tools: vec!["invoke_mcp_tool"],
+            expected_approval_required: false,
+            expected_tool_choice: None,
+            satisfied_tool_names: vec!["invoke_mcp_tool"],
+            expected_plain_text_failure: Some(
+                aria_core::ContractFailureReason::MissingRequiredArtifact,
+            ),
+            approval_probe: None,
+        },
+    ]
+}
+
+fn evaluate_contract_regression_suite(
+    sessions_dir: &Path,
+) -> Result<ContractRegressionReport, String> {
+    evaluate_contract_regression_scenarios(sessions_dir, &default_contract_regression_scenarios())
+}
+
+fn evaluate_contract_regression_scenarios(
+    sessions_dir: &Path,
+    scenarios: &[ContractRegressionScenario],
+) -> Result<ContractRegressionReport, String> {
+    let mut results = Vec::with_capacity(scenarios.len());
+    let now = chrono::Utc::now().with_timezone(&chrono_tz::Asia::Kolkata);
+    for scenario in scenarios {
+        let scheduling_intent = classify_scheduling_intent(scenario.request_text, now);
+        let contract = resolve_execution_contract(scenario.request_text, scheduling_intent.as_ref());
+        let mut reasons = Vec::new();
+        if contract.kind != scenario.expected_kind {
+            reasons.push(format!(
+                "expected contract {:?}, got {:?}",
+                scenario.expected_kind, contract.kind
+            ));
+        }
+        if contract.required_artifact_kinds != scenario.expected_required_artifacts {
+            reasons.push(format!(
+                "expected artifact kinds {:?}, got {:?}",
+                scenario.expected_required_artifacts, contract.required_artifact_kinds
+            ));
+        }
+        if contract.approval_required != scenario.expected_approval_required {
+            reasons.push(format!(
+                "expected approval_required={}, got {}",
+                scenario.expected_approval_required, contract.approval_required
+            ));
+        }
+
+        let required_tools = required_runtime_tool_names_for_contract(&contract)
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        for expected in &scenario.expected_required_tools {
+            if !required_tools.iter().any(|tool| tool == expected) {
+                reasons.push(format!("required tools missing '{}'", expected));
+            }
+        }
+
+        let req = AgentRequest {
+            request_id: [1; 16],
+            session_id: [2; 16],
+            channel: GatewayChannel::Cli,
+            user_id: "contract-regression".into(),
+            content: MessageContent::Text(scenario.request_text.to_string()),
+            tool_runtime_policy: None,
+            timestamp_us: 1,
+        };
+        let policy = effective_tool_runtime_policy_for_request(
+            &req,
+            scenario.request_text,
+            scheduling_intent.as_ref(),
+            &contract,
+        );
+        let tool_choice = policy
+            .as_ref()
+            .map(|policy| render_tool_choice_policy(&policy.tool_choice));
+        if let Some(expected_choice) = scenario.expected_tool_choice {
+            if tool_choice.as_deref() != Some(expected_choice) {
+                reasons.push(format!(
+                    "expected tool choice '{}', got {:?}",
+                    expected_choice, tool_choice
+                ));
+            }
+        }
+
+        let satisfied_artifacts = infer_execution_artifacts(
+            &scenario
+                .satisfied_tool_names
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<_>>(),
+            "",
+        );
+        if let Err(reason) = validate_execution_contract(&contract, &satisfied_artifacts) {
+            reasons.push(format!(
+                "happy-path artifacts failed contract validation: {:?}",
+                reason
+            ));
+        }
+
+        if let Some(expected_failure) = scenario.expected_plain_text_failure {
+            let plain_artifacts = infer_execution_artifacts(&[], "plain-text completion");
+            match validate_execution_contract(&contract, &plain_artifacts) {
+                Ok(_) => reasons.push("plain-text completion unexpectedly satisfied contract".into()),
+                Err(actual) if actual != expected_failure => reasons.push(format!(
+                    "expected plain-text failure {:?}, got {:?}",
+                    expected_failure, actual
+                )),
+                Err(_) => {}
+            }
+        }
+
+        if let Some(probe) = &scenario.approval_probe {
+            let req = AgentRequest {
+                request_id: *uuid::Uuid::new_v4().as_bytes(),
+                session_id: *uuid::Uuid::new_v4().as_bytes(),
+                channel: GatewayChannel::Cli,
+                user_id: "contract-regression".into(),
+                content: MessageContent::Text(scenario.request_text.to_string()),
+                tool_runtime_policy: policy.clone(),
+                timestamp_us: 1,
+            };
+            let call = ToolCall {
+                invocation_id: None,
+                name: probe.tool_name.to_string(),
+                arguments: probe.arguments_json.to_string(),
+            };
+            let approval_sessions = sessions_dir.join(format!(
+                "contract-regression-approval-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&approval_sessions).map_err(|e| {
+                format!(
+                    "create approval probe session dir '{}' failed: {}",
+                    approval_sessions.display(),
+                    e
+                )
+            })?;
+            match persist_pending_approval_for_tool_error(
+                &approval_sessions,
+                &req,
+                &call,
+                &format!("{}::{}", aria_intelligence::APPROVAL_REQUIRED_PREFIX, probe.tool_name),
+            ) {
+                Ok((record, _)) if record.tool_name != probe.tool_name => reasons.push(format!(
+                    "approval probe stored wrong tool '{}'",
+                    record.tool_name
+                )),
+                Ok(_) => {}
+                Err(err) => reasons.push(format!("approval probe failed: {}", err)),
+            }
+        }
+
+        results.push(ContractRegressionScenarioResult {
+            id: scenario.id.to_string(),
+            contract_kind: contract.kind,
+            passed: reasons.is_empty(),
+            reasons,
+            required_tools,
+            tool_choice,
+        });
+    }
+    let passed_count = results.iter().filter(|result| result.passed).count();
+    Ok(ContractRegressionReport {
+        scenario_count: results.len(),
+        passed_count,
+        failed_count: results.len().saturating_sub(passed_count),
+        results,
+    })
+}
+
+fn render_tool_choice_policy(policy: &aria_core::ToolChoicePolicy) -> String {
+    match policy {
+        aria_core::ToolChoicePolicy::Auto => "auto".into(),
+        aria_core::ToolChoicePolicy::None => "none".into(),
+        aria_core::ToolChoicePolicy::Required => "required".into(),
+        aria_core::ToolChoicePolicy::Specific(name) => format!("specific:{}", name),
+    }
+}
+
+fn render_golden_replay_report(report: &GoldenReplayReport) -> String {
+    let mut lines = vec![
+        "Golden replay report".to_string(),
+        format!("scenarios: {}", report.scenario_count),
+        format!("passed: {}", report.passed_count),
+        format!("failed: {}", report.failed_count),
+        String::new(),
+    ];
+    for result in &report.results {
+        lines.push(format!(
+            "- {}: {} (samples={}, latest_outcome={})",
+            result.id,
+            if result.passed { "PASS" } else { "FAIL" },
+            result.sample_count,
+            result
+                .latest_outcome
+                .map(|outcome| format!("{:?}", outcome).to_ascii_lowercase())
+                .unwrap_or_else(|| "none".into())
+        ));
+        if !result.reasons.is_empty() {
+            lines.push(format!("  reasons: {}", result.reasons.join("; ")));
+        }
+    }
+    lines.join("\n")
+}
+
+fn render_contract_regression_report(report: &ContractRegressionReport) -> String {
+    let mut lines = vec![
+        "Contract regression report".to_string(),
+        format!("scenarios: {}", report.scenario_count),
+        format!("passed: {}", report.passed_count),
+        format!("failed: {}", report.failed_count),
+        String::new(),
+    ];
+    for result in &report.results {
+        lines.push(format!(
+            "- {}: {} (contract={:?}, required_tools={}, tool_choice={})",
+            result.id,
+            if result.passed { "PASS" } else { "FAIL" },
+            result.contract_kind,
+            if result.required_tools.is_empty() {
+                "none".into()
+            } else {
+                result.required_tools.join(",")
+            },
+            result.tool_choice.as_deref().unwrap_or("none")
+        ));
+        if !result.reasons.is_empty() {
+            lines.push(format!("  reasons: {}", result.reasons.join("; ")));
+        }
+    }
+    lines.join("\n")
+}
+
+fn run_provider_benchmark_cli(config: &ResolvedAppConfig, args: &[String]) -> Result<String, String> {
+    let suite_path = args
+        .get(3)
+        .ok_or_else(|| "Usage: hiveclaw replay providers <suite.toml>".to_string())?;
+    let suite_body = std::fs::read_to_string(suite_path)
+        .map_err(|e| format!("read provider benchmark suite failed: {}", e))?;
+    let suite: ProviderBenchmarkSuite = toml::from_str(&suite_body)
+        .map_err(|e| format!("parse provider benchmark suite failed: {}", e))?;
+    let report =
+        evaluate_provider_benchmark_suite(Path::new(&config.ssmu.sessions_dir), &suite)?;
+    if report.failed_count > 0 {
+        return Err(render_provider_benchmark_report(&report));
+    }
+    Ok(render_provider_benchmark_report(&report))
+}
+
+fn run_release_gate_cli(config: &ResolvedAppConfig, args: &[String]) -> Result<String, String> {
+    let mut golden_suite = None;
+    let mut provider_suite = None;
+    let mut idx = 3usize;
+    while let Some(arg) = args.get(idx) {
+        match arg.as_str() {
+            "--golden" => {
+                golden_suite = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| {
+                            "Usage: hiveclaw replay gate --golden <suite.toml> [--providers <suite.toml>]".to_string()
+                        })?
+                        .clone(),
+                );
+                idx += 2;
+            }
+            "--providers" => {
+                provider_suite = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| {
+                            "Usage: hiveclaw replay gate --golden <suite.toml> [--providers <suite.toml>]".to_string()
+                        })?
+                        .clone(),
+                );
+                idx += 2;
+            }
+            _ => {
+                return Err(
+                    "Usage: hiveclaw replay gate --golden <suite.toml> [--providers <suite.toml>]".into(),
+                )
+            }
+        }
+    }
+    let golden_suite = golden_suite.ok_or_else(|| {
+        "Usage: hiveclaw replay gate --golden <suite.toml> [--providers <suite.toml>]".to_string()
+    })?;
+
+    let golden_body = std::fs::read_to_string(&golden_suite)
+        .map_err(|e| format!("read golden replay suite failed: {}", e))?;
+    let golden_suite: GoldenReplaySuite = toml::from_str(&golden_body)
+        .map_err(|e| format!("parse golden replay suite failed: {}", e))?;
+    let golden_report = evaluate_golden_replay_suite(
+        &RuntimeStore::for_sessions_dir(Path::new(&config.ssmu.sessions_dir)),
+        &golden_suite,
+    )?;
+    let contract_report = evaluate_contract_regression_suite(Path::new(&config.ssmu.sessions_dir))?;
+    let provider_report = if let Some(provider_suite_path) = provider_suite {
+        let body = std::fs::read_to_string(provider_suite_path)
+            .map_err(|e| format!("read provider benchmark suite failed: {}", e))?;
+        let suite: ProviderBenchmarkSuite = toml::from_str(&body)
+            .map_err(|e| format!("parse provider benchmark suite failed: {}", e))?;
+        Some(evaluate_provider_benchmark_suite(
+            Path::new(&config.ssmu.sessions_dir),
+            &suite,
+        )?)
+    } else {
+        None
+    };
+
+    let mut lines = vec![
+        "Release gate report".to_string(),
+        format!("golden_failed: {}", golden_report.failed_count),
+        format!("contracts_failed: {}", contract_report.failed_count),
+        format!(
+            "provider_benchmark_failed: {}",
+            provider_report.as_ref().map(|report| report.failed_count).unwrap_or(0)
+        ),
+        String::new(),
+    ];
+    lines.push(render_golden_replay_report(&golden_report));
+    lines.push(String::new());
+    lines.push(render_contract_regression_report(&contract_report));
+    if let Some(provider_report) = &provider_report {
+        lines.push(String::new());
+        lines.push(render_provider_benchmark_report(provider_report));
+    }
+
+    if golden_report.failed_count > 0
+        || contract_report.failed_count > 0
+        || provider_report
+            .as_ref()
+            .map(|report| report.failed_count > 0)
+            .unwrap_or(false)
+    {
+        return Err(lines.join("\n"));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn evaluate_provider_benchmark_suite(
+    sessions_dir: &Path,
+    suite: &ProviderBenchmarkSuite,
+) -> Result<ProviderBenchmarkReport, String> {
+    let store = RuntimeStore::for_sessions_dir(sessions_dir);
+    let context_records = store.list_context_inspections(None, None)?;
+    let streaming_audits = store.list_streaming_decision_audits(None, None)?;
+    let repair_fallback_audits = store.list_repair_fallback_audits(None, None)?;
+    let mut context_by_request: BTreeMap<String, Vec<aria_core::ContextInspectionRecord>> =
+        BTreeMap::new();
+    for record in context_records {
+        context_by_request
+            .entry(uuid::Uuid::from_bytes(record.request_id).to_string())
+            .or_default()
+            .push(record);
+    }
+    let mut streaming_by_request: BTreeMap<String, Vec<StreamingDecisionAuditRecord>> =
+        BTreeMap::new();
+    for audit in streaming_audits {
+        streaming_by_request
+            .entry(audit.request_id.clone())
+            .or_default()
+            .push(audit);
+    }
+    let mut repair_by_request: BTreeMap<String, Vec<RepairFallbackAuditRecord>> = BTreeMap::new();
+    for audit in repair_fallback_audits {
+        repair_by_request
+            .entry(audit.request_id.clone())
+            .or_default()
+            .push(audit);
+    }
+
+    let mut results = Vec::with_capacity(suite.scenarios.len());
+    for scenario in &suite.scenarios {
+        let traces = store.list_execution_traces_by_fingerprint(&scenario.task_fingerprint)?;
+        let mut grouped: BTreeMap<String, ProviderBenchmarkProviderAccumulator> = BTreeMap::new();
+        for trace in traces {
+            let provider_records = context_by_request
+                .get(&trace.request_id)
+                .cloned()
+                .unwrap_or_default();
+            if provider_records.is_empty() {
+                let key = "unknown/<unknown>".to_string();
+                let entry = grouped
+                    .entry(key.clone())
+                    .or_insert_with(|| ProviderBenchmarkProviderAccumulator::new("unknown", "<unknown>"));
+                entry.apply_trace(&trace, None);
+                continue;
+            }
+            for record in provider_records {
+                let model_ref = record
+                    .provider_model
+                    .clone()
+                    .unwrap_or_else(|| "unknown/<unknown>".into());
+                let provider_id = model_ref
+                    .split_once('/')
+                    .map(|(provider, _)| provider.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                let entry = grouped
+                    .entry(model_ref.clone())
+                    .or_insert_with(|| ProviderBenchmarkProviderAccumulator::new(&provider_id, &model_ref));
+                let streaming = streaming_by_request
+                    .get(&trace.request_id)
+                    .map(|events| events.as_slice())
+                    .unwrap_or(&[]);
+                let repair = repair_by_request
+                    .get(&trace.request_id)
+                    .map(|events| events.as_slice())
+                    .unwrap_or(&[]);
+                entry.apply_trace(&trace, Some(&record));
+                entry.apply_streaming(streaming);
+                entry.apply_repair(repair);
+            }
+        }
+
+        let providers = grouped
+            .into_values()
+            .map(|entry| entry.finish())
+            .collect::<Vec<_>>();
+        let mut reasons = Vec::new();
+        for required in &scenario.required_providers {
+            if !providers.iter().any(|provider| provider.provider_id == *required) {
+                reasons.push(format!("missing required provider '{}'", required));
+            }
+        }
+        for provider in &providers {
+            if provider.sample_count < scenario.min_samples_per_provider {
+                reasons.push(format!(
+                    "provider '{}' expected at least {} sample(s), found {}",
+                    provider.provider_id, scenario.min_samples_per_provider, provider.sample_count
+                ));
+            }
+        }
+        if scenario.require_fallback_visibility
+            && !providers.iter().any(|provider| {
+                provider.fallback_outcomes > 0 || provider.repair_fallback_calls > 0
+            })
+        {
+            reasons.push("expected at least one provider with fallback visibility".into());
+        }
+        if providers.is_empty() {
+            reasons.push("no provider benchmark samples found".into());
+        }
+
+        results.push(ProviderBenchmarkScenarioResult {
+            id: scenario.id.clone(),
+            task_fingerprint: scenario.task_fingerprint.clone(),
+            passed: reasons.is_empty(),
+            reasons,
+            providers,
+        });
+    }
+    let passed_count = results.iter().filter(|result| result.passed).count();
+    Ok(ProviderBenchmarkReport {
+        scenario_count: results.len(),
+        passed_count,
+        failed_count: results.len().saturating_sub(passed_count),
+        results,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct ProviderBenchmarkProviderAccumulator {
+    provider_id: String,
+    model_ref: String,
+    sample_count: usize,
+    success_count: usize,
+    failure_count: usize,
+    approval_required_count: usize,
+    clarification_required_count: usize,
+    latency_ms_total: u64,
+    prompt_tokens_total: u64,
+    fallback_outcomes: usize,
+    repair_fallback_calls: usize,
+}
+
+impl ProviderBenchmarkProviderAccumulator {
+    fn new(provider_id: &str, model_ref: &str) -> Self {
+        Self {
+            provider_id: provider_id.to_string(),
+            model_ref: model_ref.to_string(),
+            sample_count: 0,
+            success_count: 0,
+            failure_count: 0,
+            approval_required_count: 0,
+            clarification_required_count: 0,
+            latency_ms_total: 0,
+            prompt_tokens_total: 0,
+            fallback_outcomes: 0,
+            repair_fallback_calls: 0,
+        }
+    }
+
+    fn apply_trace(
+        &mut self,
+        trace: &aria_learning::ExecutionTrace,
+        inspection: Option<&aria_core::ContextInspectionRecord>,
+    ) {
+        self.sample_count += 1;
+        self.latency_ms_total += trace.latency_ms as u64;
+        match trace.outcome {
+            aria_learning::TraceOutcome::Succeeded => self.success_count += 1,
+            aria_learning::TraceOutcome::Failed => self.failure_count += 1,
+            aria_learning::TraceOutcome::ApprovalRequired => self.approval_required_count += 1,
+            aria_learning::TraceOutcome::ClarificationRequired => {
+                self.clarification_required_count += 1
+            }
+        }
+        if let Some(inspection) = inspection {
+            self.prompt_tokens_total += inspection.system_tokens as u64
+                + inspection.history_tokens as u64
+                + inspection.context_tokens as u64
+                + inspection.user_tokens as u64;
+        }
+    }
+
+    fn apply_streaming(&mut self, audits: &[StreamingDecisionAuditRecord]) {
+        let mut seen = BTreeSet::new();
+        for audit in audits {
+            if audit.model_ref.as_deref() != Some(self.model_ref.as_str()) {
+                continue;
+            }
+            if audit.mode == "fallback_used" && seen.insert((audit.request_id.clone(), audit.phase.clone())) {
+                self.fallback_outcomes += 1;
+            }
+        }
+    }
+
+    fn apply_repair(&mut self, audits: &[RepairFallbackAuditRecord]) {
+        self.repair_fallback_calls += audits
+            .iter()
+            .filter(|audit| audit.provider_id.as_deref() == Some(self.provider_id.as_str()))
+            .count();
+    }
+
+    fn finish(self) -> ProviderBenchmarkProviderResult {
+        ProviderBenchmarkProviderResult {
+            provider_id: self.provider_id,
+            model_ref: self.model_ref,
+            sample_count: self.sample_count,
+            success_count: self.success_count,
+            failure_count: self.failure_count,
+            approval_required_count: self.approval_required_count,
+            clarification_required_count: self.clarification_required_count,
+            average_latency_ms: if self.sample_count == 0 {
+                0.0
+            } else {
+                self.latency_ms_total as f64 / self.sample_count as f64
+            },
+            average_prompt_tokens: if self.sample_count == 0 {
+                0.0
+            } else {
+                self.prompt_tokens_total as f64 / self.sample_count as f64
+            },
+            fallback_outcomes: self.fallback_outcomes,
+            repair_fallback_calls: self.repair_fallback_calls,
+        }
+    }
+}
+
+fn render_provider_benchmark_report(report: &ProviderBenchmarkReport) -> String {
+    let mut lines = vec![
+        "Provider benchmark report".to_string(),
+        format!("scenarios: {}", report.scenario_count),
+        format!("passed: {}", report.passed_count),
+        format!("failed: {}", report.failed_count),
+        String::new(),
+    ];
+    for result in &report.results {
+        lines.push(format!(
+            "- {}: {} (providers={})",
+            result.id,
+            if result.passed { "PASS" } else { "FAIL" },
+            result.providers.len()
+        ));
+        for provider in &result.providers {
+            lines.push(format!(
+                "  {} [{}] samples={} success={} failure={} approval={} clarify={} avg_latency_ms={:.1} avg_prompt_tokens={:.1} fallback_outcomes={} repair_fallback_calls={}",
+                provider.provider_id,
+                provider.model_ref,
+                provider.sample_count,
+                provider.success_count,
+                provider.failure_count,
+                provider.approval_required_count,
+                provider.clarification_required_count,
+                provider.average_latency_ms,
+                provider.average_prompt_tokens,
+                provider.fallback_outcomes,
+                provider.repair_fallback_calls
+            ));
+        }
+        if !result.reasons.is_empty() {
+            lines.push(format!("  reasons: {}", result.reasons.join("; ")));
+        }
+    }
+    lines.join("\n")
+}
+
+fn run_skill_management_command(
+    config: &ResolvedAppConfig,
+    args: &[String],
+) -> Option<Result<String, String>> {
+    if args.get(1).map(String::as_str) != Some("skills") {
+        return None;
+    }
+
+    let sessions_dir = Path::new(&config.ssmu.sessions_dir);
+    let store = RuntimeStore::for_sessions_dir(sessions_dir);
+    let command = args.get(2).map(String::as_str).unwrap_or("list");
+
+    let result: Result<String, String> = match command {
+        "list" => render_skill_list(&store),
+        "doctor" => render_skill_doctor(&store, args.get(3).map(String::as_str)),
+        "install" | "update" => run_skill_install_like_command(
+            &store,
+            command,
+            &args[3..],
+            config.ui.default_agent.as_str(),
+        ),
+        "enable" => args
+            .get(3)
+            .ok_or_else(|| "Usage: hiveclaw skills enable <skill_id>".to_string())
+            .and_then(|skill_id| set_skill_enabled(&store, skill_id, true)),
+        "disable" => args
+            .get(3)
+            .ok_or_else(|| "Usage: hiveclaw skills disable <skill_id>".to_string())
+            .and_then(|skill_id| set_skill_enabled(&store, skill_id, false)),
+        "bind" => run_skill_bind_command(
+            &store,
+            &args[3..],
+            config.ui.default_agent.as_str(),
+        ),
+        "unbind" => run_skill_unbind_command(
+            &store,
+            &args[3..],
+            config.ui.default_agent.as_str(),
+        ),
+        "export" => run_skill_export_command(&store, &args[3..]),
+        other => Err(format!(
+            "Unknown skills command '{}'. Usage: hiveclaw skills <list|install|update|enable|disable|bind|unbind|export|doctor>",
+            other
+        )),
+    };
+
+    Some(result)
+}
+
+fn render_skill_list(store: &RuntimeStore) -> Result<String, String> {
+    let manifests = store.list_skill_packages()?;
+    if manifests.is_empty() {
+        return Ok("HiveClaw skills\ninstalled: 0".into());
+    }
+    let mut lines = vec![format!("HiveClaw skills\ninstalled: {}", manifests.len())];
+    for manifest in manifests {
+        let signatures = store.list_skill_signatures(Some(&manifest.skill_id))?;
+        lines.push(format!(
+            "- {} {} [{} | {} | {}]",
+            manifest.skill_id,
+            manifest.version,
+            if manifest.enabled { "enabled" } else { "disabled" },
+            skill_provenance_label(manifest.provenance.as_ref()),
+            skill_trust_state_label(manifest.provenance.as_ref(), &signatures)
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn render_skill_doctor(store: &RuntimeStore, skill_id: Option<&str>) -> Result<String, String> {
+    let manifests = store.list_skill_packages()?;
+    let manifests = if let Some(skill_id) = skill_id {
+        manifests
+            .into_iter()
+            .filter(|manifest| manifest.skill_id == skill_id)
+            .collect::<Vec<_>>()
+    } else {
+        manifests
+    };
+    if manifests.is_empty() {
+        return Ok(match skill_id {
+            Some(skill_id) => format!("HiveClaw skills doctor\nskill: {}\nstatus: missing", skill_id),
+            None => "HiveClaw skills doctor\nskills_total: 0".into(),
+        });
+    }
+
+    let mut trusted = 0usize;
+    let mut unsigned = 0usize;
+    let mut disabled = 0usize;
+    let mut sections = Vec::new();
+    for manifest in manifests {
+        let bindings = store.list_skill_bindings_for_skill(&manifest.skill_id)?;
+        let activations = store.list_skill_activations_for_skill(&manifest.skill_id)?;
+        let signatures = store.list_skill_signatures(Some(&manifest.skill_id))?;
+        let trust = skill_trust_state_label(manifest.provenance.as_ref(), &signatures);
+        if trust == "trusted" {
+            trusted += 1;
+        } else {
+            unsigned += 1;
+        }
+        if !manifest.enabled {
+            disabled += 1;
+        }
+        sections.push(format!(
+            "skill: {}\n  name: {}\n  version: {}\n  enabled: {}\n  provenance: {}\n  source: {}\n  trust_state: {}\n  verified_signatures: {}\n  bindings: {}\n  active_activations: {}\n  tool_names: {}",
+            manifest.skill_id,
+            manifest.name,
+            manifest.version,
+            manifest.enabled,
+            skill_provenance_label(manifest.provenance.as_ref()),
+            manifest
+                .provenance
+                .as_ref()
+                .and_then(|p| p.source_ref.clone())
+                .unwrap_or_else(|| "<unknown>".into()),
+            trust,
+            signatures.iter().filter(|record| record.verified).count(),
+            bindings.len(),
+            activations.iter().filter(|record| record.active).count(),
+            if manifest.tool_names.is_empty() {
+                "<none>".into()
+            } else {
+                manifest.tool_names.join(", ")
+            }
+        ));
+    }
+
+    Ok(format!(
+        "HiveClaw skills doctor\nskills_total: {}\ntrusted: {}\nunsigned: {}\ndisabled: {}\n\n{}",
+        trusted + unsigned,
+        trusted,
+        unsigned,
+        disabled,
+        sections.join("\n\n")
+    ))
+}
+
+fn run_skill_install_like_command(
+    store: &RuntimeStore,
+    verb: &str,
+    args: &[String],
+    _default_agent: &str,
+) -> Result<String, String> {
+    let mut dir: Option<String> = None;
+    let mut signed_dir: Option<String> = None;
+    let mut manifest_path: Option<String> = None;
+    let mut codex_dir: Option<String> = None;
+    let mut public_key: Option<String> = None;
+    let mut idx = 0usize;
+    while let Some(arg) = args.get(idx) {
+        match arg.as_str() {
+            "--dir" => {
+                dir = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| format!("Usage: hiveclaw skills {verb} --dir <skill_dir>"))?
+                        .clone(),
+                );
+                idx += 2;
+            }
+            "--signed-dir" => {
+                signed_dir = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| format!("Usage: hiveclaw skills {verb} --signed-dir <skill_dir> [--public-key <hex>]"))?
+                        .clone(),
+                );
+                idx += 2;
+            }
+            "--manifest" => {
+                manifest_path = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| format!("Usage: hiveclaw skills {verb} --manifest <skill.toml>"))?
+                        .clone(),
+                );
+                idx += 2;
+            }
+            "--codex-dir" => {
+                codex_dir = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| format!("Usage: hiveclaw skills {verb} --codex-dir <skill_dir>"))?
+                        .clone(),
+                );
+                idx += 2;
+            }
+            "--public-key" => {
+                public_key = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| format!("Usage: hiveclaw skills {verb} --signed-dir <skill_dir> [--public-key <hex>]"))?
+                        .clone(),
+                );
+                idx += 2;
+            }
+            other => {
+                return Err(format!("Unknown argument '{}'. See `hiveclaw help skills`.", other));
+            }
+        }
+    }
+
+    let now_us = chrono::Utc::now().timestamp_micros() as u64;
+    let (manifest, trust_note) = if let Some(skill_dir) = dir {
+        let mut manifest = aria_skill_runtime::load_skill_manifest_from_dir(Path::new(&skill_dir))
+            .map_err(|e| e.to_string())?;
+        manifest.provenance = Some(skill_provenance_from_install(
+            aria_core::SkillProvenanceKind::Local,
+            Some(skill_dir.clone()),
+            now_us,
+        ));
+        (manifest, "unsigned local".to_string())
+    } else if let Some(skill_dir) = signed_dir {
+        let skill_dir_path = Path::new(&skill_dir);
+        let manifest_path = skill_dir_path.join("skill.toml");
+        let signature_path = skill_dir_path.join("skill.sig.json");
+        let manifest_bytes = std::fs::read(&manifest_path)
+            .map_err(|e| format!("read '{}': {}", manifest_path.display(), e))?;
+        let signature_bytes = std::fs::read(&signature_path)
+            .map_err(|e| format!("read '{}': {}", signature_path.display(), e))?;
+        let signature: SkillManifestSignature =
+            serde_json::from_slice(&signature_bytes).map_err(|e| {
+                format!(
+                    "invalid signature envelope '{}': {}",
+                    signature_path.display(),
+                    e
+                )
+            })?;
+        verify_signed_skill_manifest(&manifest_bytes, &signature, public_key.as_deref())
+            .map_err(|e| e.to_string())?;
+        let mut manifest =
+            aria_skill_runtime::load_skill_manifest_from_dir(skill_dir_path).map_err(|e| e.to_string())?;
+        manifest.provenance = Some(skill_provenance_from_install(
+            aria_core::SkillProvenanceKind::Imported,
+            Some(skill_dir.clone()),
+            now_us,
+        ));
+        store.append_skill_signature(&SkillSignatureRecord {
+            record_id: format!("sig-{}", uuid::Uuid::new_v4()),
+            skill_id: manifest.skill_id.clone(),
+            version: manifest.version.clone(),
+            algorithm: signature.algorithm.clone(),
+            payload_sha256_hex: signature.payload_sha256_hex.clone(),
+            public_key_hex: signature.public_key_hex.clone(),
+            signature_hex: signature.signature_hex.clone(),
+            source: format!("cli_{}_signed_dir", verb),
+            verified: true,
+            created_at_us: now_us,
+        })?;
+        (manifest, "trusted signed import".to_string())
+    } else if let Some(manifest_path) = manifest_path {
+        let manifest_toml =
+            std::fs::read_to_string(&manifest_path).map_err(|e| format!("read '{}': {}", manifest_path, e))?;
+        let mut manifest =
+            aria_skill_runtime::parse_skill_manifest_toml(&manifest_toml).map_err(|e| e.to_string())?;
+        manifest.provenance = Some(skill_provenance_from_install(
+            aria_core::SkillProvenanceKind::Imported,
+            Some(manifest_path.clone()),
+            now_us,
+        ));
+        (manifest, "unsigned imported".to_string())
+    } else if let Some(skill_dir) = codex_dir {
+        let mut manifest =
+            load_codex_compat_skill_manifest(Path::new(&skill_dir)).map_err(|e| e.to_string())?;
+        manifest.provenance = Some(skill_provenance_from_install(
+            aria_core::SkillProvenanceKind::CompatibilityImport,
+            Some(skill_dir.clone()),
+            now_us,
+        ));
+        (manifest, "compatibility import".to_string())
+    } else {
+        return Err(format!(
+            "Usage: hiveclaw skills {verb} --dir <skill_dir> | --signed-dir <skill_dir> [--public-key <hex>] | --manifest <skill.toml> | --codex-dir <skill_dir>"
+        ));
+    };
+
+    let existing = store
+        .list_skill_packages()?
+        .into_iter()
+        .find(|item| item.skill_id == manifest.skill_id);
+    let action = if existing.is_some() { "Updated" } else { "Installed" };
+    store.upsert_skill_package(&manifest, now_us)?;
+    Ok(format!(
+        "{} skill '{}'.\nversion: {}\nprovenance: {}\ntrust_state: {}",
+        action,
+        manifest.skill_id,
+        manifest.version,
+        skill_provenance_label(manifest.provenance.as_ref()),
+        trust_note
+    ))
+}
+
+fn set_skill_enabled(store: &RuntimeStore, skill_id: &str, enabled: bool) -> Result<String, String> {
+    let mut manifest = store
+        .list_skill_packages()?
+        .into_iter()
+        .find(|manifest| manifest.skill_id == skill_id)
+        .ok_or_else(|| format!("Unknown skill '{}'.", skill_id))?;
+    manifest.enabled = enabled;
+    store.upsert_skill_package(&manifest, chrono::Utc::now().timestamp_micros() as u64)?;
+    Ok(format!(
+        "{} skill '{}'.",
+        if enabled { "Enabled" } else { "Disabled" },
+        skill_id
+    ))
+}
+
+fn run_skill_bind_command(
+    store: &RuntimeStore,
+    args: &[String],
+    default_agent: &str,
+) -> Result<String, String> {
+    let skill_id = args
+        .first()
+        .ok_or_else(|| "Usage: hiveclaw skills bind <skill_id> [--agent <agent_id>] [--policy <manual|auto_suggest|auto_load_low_risk|approval_required>] [--version <requirement>]".to_string())?
+        .clone();
+    let mut agent_id = default_agent.to_string();
+    let mut policy = aria_core::SkillActivationPolicy::Manual;
+    let mut required_version: Option<String> = None;
+    let mut idx = 1usize;
+    while let Some(arg) = args.get(idx) {
+        match arg.as_str() {
+            "--agent" => {
+                agent_id = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "Missing value for --agent".to_string())?
+                    .clone();
+                idx += 2;
+            }
+            "--policy" => {
+                let value = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "Missing value for --policy".to_string())?;
+                policy = parse_skill_activation_policy(value).map_err(|e| e.to_string())?;
+                idx += 2;
+            }
+            "--version" => {
+                required_version = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| "Missing value for --version".to_string())?
+                        .clone(),
+                );
+                idx += 2;
+            }
+            other => return Err(format!("Unknown argument '{}'. See `hiveclaw help skills`.", other)),
+        }
+    }
+
+    let manifest = store
+        .list_skill_packages()?
+        .into_iter()
+        .find(|manifest| manifest.skill_id == skill_id)
+        .ok_or_else(|| format!("Unknown skill '{}'.", skill_id))?;
+    if let Some(required_version) = &required_version {
+        if !version_satisfies_requirement(&manifest.version, required_version) {
+            return Err(format!(
+                "Installed skill '{}' version '{}' does not satisfy '{}'.",
+                manifest.skill_id, manifest.version, required_version
+            ));
+        }
+    }
+    let binding = aria_core::SkillBinding {
+        binding_id: format!("skill-binding-{}", uuid::Uuid::new_v4()),
+        agent_id: agent_id.clone(),
+        skill_id: skill_id.clone(),
+        activation_policy: policy,
+        created_at_us: chrono::Utc::now().timestamp_micros() as u64,
+    };
+    store.upsert_skill_binding(&binding)?;
+    Ok(format!(
+        "Bound skill '{}' to agent '{}'.\nactivation_policy: {}",
+        skill_id,
+        agent_id,
+        format!("{:?}", policy).to_ascii_lowercase()
+    ))
+}
+
+fn run_skill_unbind_command(
+    store: &RuntimeStore,
+    args: &[String],
+    default_agent: &str,
+) -> Result<String, String> {
+    let skill_id = args
+        .first()
+        .ok_or_else(|| "Usage: hiveclaw skills unbind <skill_id> [--agent <agent_id>]".to_string())?
+        .clone();
+    let mut agent_id = default_agent.to_string();
+    let mut idx = 1usize;
+    while let Some(arg) = args.get(idx) {
+        match arg.as_str() {
+            "--agent" => {
+                agent_id = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "Missing value for --agent".to_string())?
+                    .clone();
+                idx += 2;
+            }
+            other => return Err(format!("Unknown argument '{}'. See `hiveclaw help skills`.", other)),
+        }
+    }
+    let deleted = store.delete_skill_binding(&agent_id, &skill_id)?;
+    if deleted == 0 {
+        return Err(format!(
+            "No binding found for skill '{}' on agent '{}'.",
+            skill_id, agent_id
+        ));
+    }
+    Ok(format!("Unbound skill '{}' from agent '{}'.", skill_id, agent_id))
+}
+
+fn run_skill_export_command(store: &RuntimeStore, args: &[String]) -> Result<String, String> {
+    let skill_id = args
+        .first()
+        .ok_or_else(|| "Usage: hiveclaw skills export <skill_id> [--output-dir <path>] [--signing-key-hex <hex>]".to_string())?
+        .clone();
+    let mut output_dir = String::from("./skills");
+    let mut signing_key_hex: Option<String> = None;
+    let mut format = String::from("native");
+    let mut idx = 1usize;
+    while let Some(arg) = args.get(idx) {
+        match arg.as_str() {
+            "--output-dir" => {
+                output_dir = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "Missing value for --output-dir".to_string())?
+                    .clone();
+                idx += 2;
+            }
+            "--signing-key-hex" => {
+                signing_key_hex = Some(
+                    args.get(idx + 1)
+                        .ok_or_else(|| "Missing value for --signing-key-hex".to_string())?
+                        .clone(),
+                );
+                idx += 2;
+            }
+            "--format" => {
+                format = args
+                    .get(idx + 1)
+                    .ok_or_else(|| "Missing value for --format".to_string())?
+                    .clone();
+                idx += 2;
+            }
+            other => return Err(format!("Unknown argument '{}'. See `hiveclaw help skills`.", other)),
+        }
+    }
+
+    let manifest = store
+        .list_skill_packages()?
+        .into_iter()
+        .find(|manifest| manifest.skill_id == skill_id)
+        .ok_or_else(|| format!("Unknown skill '{}'.", skill_id))?;
+    let skill_dir = Path::new(&output_dir).join(&skill_id);
+    std::fs::create_dir_all(&skill_dir)
+        .map_err(|e| format!("create '{}': {}", skill_dir.display(), e))?;
+    if format.eq_ignore_ascii_case("codex") {
+        let source_root = manifest
+            .provenance
+            .as_ref()
+            .and_then(|item| item.source_ref.as_deref())
+            .map(PathBuf::from);
+        export_codex_compat_skill(&manifest, source_root.as_deref(), &skill_dir)
+            .map_err(|e| e.to_string())?;
+        return Ok(format!(
+            "Exported Codex-compatible skill '{}'.\npath: {}",
+            skill_id,
+            skill_dir.display()
+        ));
+    }
+    let manifest_toml = toml::to_string_pretty(&manifest)
+        .map_err(|e| format!("serialize manifest failed: {}", e))?;
+    let manifest_path = skill_dir.join("skill.toml");
+    std::fs::write(&manifest_path, &manifest_toml)
+        .map_err(|e| format!("write '{}': {}", manifest_path.display(), e))?;
+
+    if let Some(signing_key_hex) = signing_key_hex {
+        let signing_key = parse_signing_key_hex(&signing_key_hex).map_err(|e| e.to_string())?;
+        let signature = sign_skill_manifest_bytes(&manifest, manifest_toml.as_bytes(), &signing_key);
+        let signature_path = skill_dir.join("skill.sig.json");
+        let signature_json = serde_json::to_vec_pretty(&signature)
+            .map_err(|e| format!("serialize signature failed: {}", e))?;
+        std::fs::write(&signature_path, signature_json)
+            .map_err(|e| format!("write '{}': {}", signature_path.display(), e))?;
+        return Ok(format!(
+            "Exported and signed skill '{}'.\nmanifest: {}\nsignature: {}",
+            skill_id,
+            manifest_path.display(),
+            signature_path.display()
+        ));
+    }
+
+    Ok(format!(
+        "Exported skill '{}'.\nmanifest: {}",
+        skill_id,
+        manifest_path.display()
+    ))
+}
+
+fn split_skill_markdown_frontmatter(markdown: &str) -> (&str, &str) {
+    let trimmed = markdown.trim_start();
+    let Some(rest) = trimmed.strip_prefix("---\n") else {
+        return ("", markdown);
+    };
+    if let Some(idx) = rest.find("\n---\n") {
+        let frontmatter = &rest[..idx];
+        let body = &rest[idx + 5..];
+        (frontmatter, body)
+    } else {
+        ("", markdown)
+    }
+}
+
+fn parse_simple_frontmatter_field(frontmatter: &str, key: &str) -> Option<String> {
+    frontmatter.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let (lhs, rhs) = trimmed.split_once(':')?;
+        if lhs.trim() != key {
+            return None;
+        }
+        Some(rhs.trim().trim_matches('"').trim_matches('\'').to_string())
+    })
+}
+
+fn derive_skill_id_from_path(skill_dir: &Path) -> String {
+    skill_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("compat_skill")
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | '0'..='9' => ch,
+            'A'..='Z' => ch.to_ascii_lowercase(),
+            _ => '_',
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+fn load_codex_compat_skill_manifest(skill_dir: &Path) -> Result<aria_core::SkillPackageManifest, String> {
+    let skill_path = skill_dir.join("SKILL.md");
+    let markdown =
+        std::fs::read_to_string(&skill_path).map_err(|e| format!("read '{}': {}", skill_path.display(), e))?;
+    let (frontmatter, body) = split_skill_markdown_frontmatter(&markdown);
+    let skill_id = derive_skill_id_from_path(skill_dir);
+    let name = parse_simple_frontmatter_field(frontmatter, "name").unwrap_or_else(|| skill_id.clone());
+    let description = parse_simple_frontmatter_field(frontmatter, "description")
+        .or_else(|| {
+            body.lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(|line| truncate_trace_text(line, 160))
+        })
+        .unwrap_or_else(|| format!("Imported Codex skill '{}'", skill_id));
+    Ok(aria_core::SkillPackageManifest {
+        skill_id,
+        name,
+        description,
+        version: "0.1.0".into(),
+        entry_document: "SKILL.md".into(),
+        tool_names: Vec::new(),
+        mcp_server_dependencies: Vec::new(),
+        retrieval_hints: Vec::new(),
+        wasm_module_ref: None,
+        config_schema: None,
+        enabled: true,
+        provenance: None,
+    })
+}
+
+fn export_codex_compat_skill(
+    manifest: &aria_core::SkillPackageManifest,
+    source_root: Option<&Path>,
+    output_dir: &Path,
+) -> Result<(), String> {
+    let body = if let Some(source_root) = source_root {
+        let candidate = if source_root.is_dir() {
+            source_root.join(&manifest.entry_document)
+        } else {
+            source_root
+                .parent()
+                .unwrap_or(source_root)
+                .join(&manifest.entry_document)
+        };
+        std::fs::read_to_string(&candidate).unwrap_or_else(|_| {
+            format!(
+                "# {}\n\n{}\n",
+                manifest.name,
+                manifest.description
+            )
+        })
+    } else {
+        format!("# {}\n\n{}\n", manifest.name, manifest.description)
+    };
+    let (_, body_without_frontmatter) = split_skill_markdown_frontmatter(&body);
+    let skill_markdown = format!(
+        "---\nname: \"{}\"\ndescription: \"{}\"\n---\n\n{}",
+        manifest.name.replace('"', "'"),
+        manifest.description.replace('"', "'"),
+        body_without_frontmatter.trim()
+    );
+    std::fs::write(output_dir.join("SKILL.md"), skill_markdown)
+        .map_err(|e| format!("write '{}': {}", output_dir.join("SKILL.md").display(), e))?;
+    Ok(())
+}
+
+fn skill_provenance_label(provenance: Option<&aria_core::SkillProvenance>) -> &'static str {
+    match provenance.map(|item| item.kind) {
+        Some(aria_core::SkillProvenanceKind::Local) => "local",
+        Some(aria_core::SkillProvenanceKind::Imported) => "imported",
+        Some(aria_core::SkillProvenanceKind::Generated) => "generated",
+        Some(aria_core::SkillProvenanceKind::CompatibilityImport) => "compatibility_import",
+        None => "unknown",
+    }
+}
+
+fn skill_trust_state_label(
+    provenance: Option<&aria_core::SkillProvenance>,
+    signatures: &[SkillSignatureRecord],
+) -> &'static str {
+    if signatures.iter().any(|record| record.verified) {
+        "trusted"
+    } else {
+        match provenance.map(|item| item.kind) {
+            Some(aria_core::SkillProvenanceKind::Imported)
+            | Some(aria_core::SkillProvenanceKind::CompatibilityImport) => "unsigned_imported",
+            Some(aria_core::SkillProvenanceKind::Local)
+            | Some(aria_core::SkillProvenanceKind::Generated) => "unsigned_local",
+            None => "unsigned",
+        }
     }
 }
 
@@ -2868,6 +5148,49 @@ fn render_doctor_summary(config: &ResolvedAppConfig) -> String {
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false),
     )
+}
+
+fn run_robotics_command(
+    config: &ResolvedAppConfig,
+    args: &[String],
+) -> Option<Result<String, String>> {
+    match (args.get(1).map(String::as_str), args.get(2).map(String::as_str)) {
+        (Some("robotics"), Some("simulate")) => Some(run_robotics_simulation_command(config, args)),
+        (Some("robotics"), Some("ros2-simulate")) => {
+            Some(run_robotics_ros2_simulation_command(config, args))
+        }
+        _ => None,
+    }
+}
+
+fn run_robotics_simulation_command(
+    config: &ResolvedAppConfig,
+    args: &[String],
+) -> Result<String, String> {
+    let fixture_path = args
+        .get(3)
+        .ok_or_else(|| "Usage: hiveclaw robotics simulate <fixture.json>".to_string())?;
+    let fixture_text = std::fs::read_to_string(fixture_path)
+        .map_err(|e| format!("read robotics fixture failed: {}", e))?;
+    let fixture = crate::robotics_runtime::RoboticsSimulationFixture::from_json_str(&fixture_text)?;
+    let store = RuntimeStore::for_sessions_dir(Path::new(&config.ssmu.sessions_dir));
+    let record = crate::robotics_runtime::execute_robotics_simulation(&store, fixture)?;
+    serde_json::to_string_pretty(&record).map_err(|e| format!("serialize failed: {}", e))
+}
+
+fn run_robotics_ros2_simulation_command(
+    config: &ResolvedAppConfig,
+    args: &[String],
+) -> Result<String, String> {
+    let fixture_path = args
+        .get(3)
+        .ok_or_else(|| "Usage: hiveclaw robotics ros2-simulate <fixture.json>".to_string())?;
+    let fixture_text = std::fs::read_to_string(fixture_path)
+        .map_err(|e| format!("read ros2 robotics fixture failed: {}", e))?;
+    let fixture = crate::robotics_runtime::Ros2SimulationFixture::from_json_str(&fixture_text)?;
+    let store = RuntimeStore::for_sessions_dir(Path::new(&config.ssmu.sessions_dir));
+    let record = crate::robotics_runtime::execute_ros2_simulation(&store, fixture)?;
+    serde_json::to_string_pretty(&record).map_err(|e| format!("serialize failed: {}", e))
 }
 
 fn indent_block(text: &str, prefix: &str) -> String {
@@ -3025,7 +5348,7 @@ fn render_mcp_doctor(config: &ResolvedAppConfig, live: bool, live_mode: Option<&
              chrome_devtools_imported_prompts: {}\n\
              chrome_devtools_imported_resources: {}\n\
              developer_agent_bindings: {}\n\
-             note: use `aria-x setup chrome-devtools-mcp` for managed launch, or `--mode auto_connect` to attach to an existing Chrome session.\n",
+             note: use `hiveclaw setup chrome-devtools-mcp` for managed launch, or `--mode auto_connect` to attach to an existing Chrome session.\n",
             npx_bin,
             chrome_bin,
             servers.len(),
@@ -3394,6 +5717,139 @@ fn bootstrap_build_chrome_devtools_mcp_endpoint(
     parts.join(" ")
 }
 
+fn setup_ssh_backend_cli_impl(config: &ResolvedAppConfig, args: &[String]) -> Result<String, String> {
+    let mut backend_id: Option<String> = None;
+    let mut display_name: Option<String> = None;
+    let mut host: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut port: u16 = 22;
+    let mut identity_file: Option<String> = None;
+    let mut remote_workspace_root: Option<String> = None;
+    let mut known_hosts_policy = aria_core::ExecutionBackendKnownHostsPolicy::Strict;
+    let mut allow_network_egress = true;
+    let mut is_default = false;
+    let mut trust_level = aria_core::ExecutionBackendTrustLevel::RemoteBounded;
+
+    let usage = "Usage: hiveclaw setup ssh-backend --backend-id <id> --host <host> [--user <user>] [--port <port>] [--identity-file <path>] [--remote-workspace-root <path>] [--known-hosts-policy <strict|accept_new|insecure_ignore>] [--default] [--no-network-egress] [--trust <remote_bounded|remote_privileged>]".to_string();
+    let mut idx = 3usize;
+    while let Some(arg) = args.get(idx) {
+        match arg.as_str() {
+            "--backend-id" => {
+                backend_id = Some(args.get(idx + 1).ok_or_else(|| usage.clone())?.clone());
+                idx += 2;
+            }
+            "--display-name" => {
+                display_name = Some(args.get(idx + 1).ok_or_else(|| usage.clone())?.clone());
+                idx += 2;
+            }
+            "--host" => {
+                host = Some(args.get(idx + 1).ok_or_else(|| usage.clone())?.clone());
+                idx += 2;
+            }
+            "--user" => {
+                user = Some(args.get(idx + 1).ok_or_else(|| usage.clone())?.clone());
+                idx += 2;
+            }
+            "--port" => {
+                port = args
+                    .get(idx + 1)
+                    .ok_or_else(|| usage.clone())?
+                    .parse::<u16>()
+                    .map_err(|_| usage.clone())?;
+                idx += 2;
+            }
+            "--identity-file" => {
+                identity_file = Some(args.get(idx + 1).ok_or_else(|| usage.clone())?.clone());
+                idx += 2;
+            }
+            "--remote-workspace-root" => {
+                remote_workspace_root =
+                    Some(args.get(idx + 1).ok_or_else(|| usage.clone())?.clone());
+                idx += 2;
+            }
+            "--known-hosts-policy" => {
+                let value = args.get(idx + 1).ok_or_else(|| usage.clone())?;
+                known_hosts_policy = match value.as_str() {
+                    "strict" => aria_core::ExecutionBackendKnownHostsPolicy::Strict,
+                    "accept_new" => aria_core::ExecutionBackendKnownHostsPolicy::AcceptNew,
+                    "insecure_ignore" => {
+                        aria_core::ExecutionBackendKnownHostsPolicy::InsecureIgnore
+                    }
+                    _ => return Err(usage.clone()),
+                };
+                idx += 2;
+            }
+            "--trust" => {
+                let value = args.get(idx + 1).ok_or_else(|| usage.clone())?;
+                trust_level = match value.as_str() {
+                    "remote_bounded" => aria_core::ExecutionBackendTrustLevel::RemoteBounded,
+                    "remote_privileged" => {
+                        aria_core::ExecutionBackendTrustLevel::RemotePrivileged
+                    }
+                    _ => return Err(usage.clone()),
+                };
+                idx += 2;
+            }
+            "--default" => {
+                is_default = true;
+                idx += 1;
+            }
+            "--no-network-egress" => {
+                allow_network_egress = false;
+                idx += 1;
+            }
+            other => {
+                return Err(format!("Unknown argument '{}'. {}", other, usage));
+            }
+        }
+    }
+
+    let backend_id = backend_id.ok_or_else(|| usage.clone())?;
+    let host = host.ok_or_else(|| usage.clone())?;
+    let sessions_dir = Path::new(&config.ssmu.sessions_dir);
+    let store = RuntimeStore::for_sessions_dir(sessions_dir);
+    ensure_default_execution_backend_profiles(sessions_dir)?;
+    let now_us = chrono::Utc::now().timestamp_micros() as u64;
+    let profile = aria_core::ExecutionBackendProfile {
+        backend_id: backend_id.clone(),
+        display_name: display_name.unwrap_or_else(|| format!("SSH {}", host)),
+        kind: aria_core::ExecutionBackendKind::Ssh,
+        config: Some(aria_core::ExecutionBackendConfig::Ssh(
+            aria_core::ExecutionBackendSshConfig {
+                host: host.clone(),
+                port,
+                user: user.clone(),
+                identity_file: identity_file.clone(),
+                remote_workspace_root: remote_workspace_root.clone(),
+                known_hosts_policy,
+            },
+        )),
+        is_default,
+        requires_approval: true,
+        supports_workspace_mount: true,
+        supports_browser: false,
+        supports_desktop: false,
+        supports_artifact_return: true,
+        supports_network_egress: allow_network_egress,
+        trust_level,
+    };
+    store.upsert_execution_backend_profile(&profile, now_us)?;
+    Ok(format!(
+        "Registered SSH backend '{}' for {}:{}{}{}",
+        backend_id,
+        host,
+        port,
+        user
+            .as_deref()
+            .map(|value| format!(" as {}", value))
+            .unwrap_or_default(),
+        remote_workspace_root
+            .as_deref()
+            .map(|value| format!(" with remote workspace root {}", value))
+            .unwrap_or_default()
+    ))
+}
+
 #[cfg(feature = "mcp-runtime")]
 fn setup_chrome_devtools_mcp_cli(config: &ResolvedAppConfig, args: &[String]) -> Result<String, String> {
     let mut agent_id = "developer".to_string();
@@ -3406,21 +5862,21 @@ fn setup_chrome_devtools_mcp_cli(config: &ResolvedAppConfig, args: &[String]) ->
         match arg.as_str() {
             "--agent" => {
                 let value = args.get(idx + 1).ok_or_else(|| {
-                    "Usage: aria-x setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>] [--bind-prompts] [--bind-resources]".to_string()
+                    "Usage: hiveclaw setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>] [--bind-prompts] [--bind-resources]".to_string()
                 })?;
                 agent_id = value.clone();
                 idx += 2;
             }
             "--mode" => {
                 let value = args.get(idx + 1).ok_or_else(|| {
-                    "Usage: aria-x setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>] [--bind-prompts] [--bind-resources]".to_string()
+                    "Usage: hiveclaw setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>] [--bind-prompts] [--bind-resources]".to_string()
                 })?;
                 mode = value.clone();
                 idx += 2;
             }
             "--channel" => {
                 let value = args.get(idx + 1).ok_or_else(|| {
-                    "Usage: aria-x setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>] [--bind-prompts] [--bind-resources]".to_string()
+                    "Usage: hiveclaw setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>] [--bind-prompts] [--bind-resources]".to_string()
                 })?;
                 channel = value.clone();
                 idx += 2;
@@ -3435,7 +5891,7 @@ fn setup_chrome_devtools_mcp_cli(config: &ResolvedAppConfig, args: &[String]) ->
             }
             other => {
                 return Err(format!(
-                    "Unknown argument '{}'. Usage: aria-x setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>] [--bind-prompts] [--bind-resources]",
+                    "Unknown argument '{}'. Usage: hiveclaw setup chrome-devtools-mcp [--agent <agent_id>] [--mode <launch_managed|auto_connect>] [--channel <stable|beta|dev|canary>] [--bind-prompts] [--bind-resources]",
                     other
                 ));
             }
@@ -3591,7 +6047,7 @@ fn bootstrap_local_stt_binaries() -> Result<Vec<String>, String> {
         return Ok(vec!["installed ffmpeg and whisper-cpp via Homebrew".to_string()]);
     }
     Err(
-        "automatic local STT bootstrap currently supports Homebrew-based environments only. Install ffmpeg and whisper.cpp, then rerun `aria-x setup stt --local`."
+        "automatic local STT bootstrap currently supports Homebrew-based environments only. Install ffmpeg and whisper.cpp, then rerun `hiveclaw setup stt --local`."
             .to_string(),
     )
 }
@@ -3620,7 +6076,7 @@ fn download_default_local_whisper_model(model_path: &Path) -> Result<String, Str
         ));
     }
     Err(
-        "curl is required to download the default whisper model automatically. Install curl or download the model manually, then rerun `aria-x setup stt --local`."
+        "curl is required to download the default whisper model automatically. Install curl or download the model manually, then rerun `hiveclaw setup stt --local`."
             .to_string(),
     )
 }
@@ -3800,12 +6256,12 @@ async fn process_cli_ingress_request(
         return;
     }
 
-    if let Some(reply) = handle_cli_control_command(req, config, agent_store, session_memory) {
+    if let Some(reply) = handle_cli_control_command(req, config, llm_pool, agent_store, session_memory) {
         send_universal_response(req, &reply, config).await;
         return;
     }
 
-    if let Some(output) = handle_runtime_control_command(req, config, session_memory, None).await {
+    if let Some(output) = handle_runtime_control_command(req, config, llm_pool, session_memory, None).await {
         send_universal_response(req, &output.text, config).await;
         return;
     }
@@ -3965,6 +6421,11 @@ fn register_discoverable_tool(
         "browser_screenshot" => ("Capture a screenshot artifact for a URL or browser session.", r#"{"browser_session_id":{"type":"string"},"url":{"type":"string"}}"#),
         "browser_act" => ("Perform a typed browser action like navigate, click, type, select, scroll, or wait.", r#"{"browser_session_id":{"type":"string"},"action":{"type":"string"},"selector":{"type":"string"},"value":{"type":"string"},"url":{"type":"string"}}"#),
         "browser_download" => ("Download remote content through a managed browser workflow.", r#"{"browser_session_id":{"type":"string"},"url":{"type":"string"}}"#),
+        "computer_profile_list" => ("List configured computer execution profiles.", r#"{}"#),
+        "computer_session_start" => ("Prepare or reuse a computer-runtime session.", r#"{"profile_id":{"type":"string"},"target_window_id":{"type":"string"}}"#),
+        "computer_session_list" => ("List computer-runtime sessions for the current agent.", r#"{}"#),
+        "computer_capture" | "computer_screenshot" => ("Capture a screenshot artifact from the local computer runtime.", r#"{"computer_session_id":{"type":"string"},"profile_id":{"type":"string"}}"#),
+        "computer_act" => ("Perform a local desktop computer-runtime action such as pointer move, pointer click, keyboard typing, key press, clipboard read, or clipboard write.", r#"{"computer_session_id":{"type":"string"},"profile_id":{"type":"string"},"target_window_id":{"type":"string"},"action":{"type":"string","enum":["pointer_move","pointer_click","keyboard_type","key_press","clipboard_read","clipboard_write"]},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"string","enum":["left","right","middle"]},"text":{"type":"string"},"key":{"type":"string"}}"#),
         "crawl_page" => ("Crawl a single page, extract content, and update website memory.", r#"{"url":{"type":"string"},"capture_screenshots":{"type":"boolean"},"change_detection":{"type":"boolean"}}"#),
         "crawl_site" => ("Crawl a site within the requested scope and update website memory.", r#"{"url":{"type":"string"},"scope":{"type":"string"},"allowed_domains":{"type":"array","items":{"type":"string"}},"max_depth":{"type":"integer"},"max_pages":{"type":"integer"},"capture_screenshots":{"type":"boolean"},"change_detection":{"type":"boolean"}}"#),
         "watch_page" => ("Schedule periodic monitoring for a single page.", r#"{"url":{"type":"string"},"schedule":{"type":"object"},"agent_id":{"type":"string"},"capture_screenshots":{"type":"boolean"},"change_detection":{"type":"boolean"}}"#),
@@ -4000,15 +6461,18 @@ fn register_discoverable_tool(
 fn handle_cli_control_command(
     req: &AgentRequest,
     config: &Config,
+    llm_pool: &LlmBackendPool,
     agent_store: &AgentConfigStore,
     session_memory: &aria_ssmu::SessionMemory,
 ) -> Option<String> {
-    handle_shared_control_command(req, config, agent_store, session_memory).map(|output| output.text)
+    handle_shared_control_command(req, config, llm_pool, agent_store, session_memory)
+        .map(|output| output.text)
 }
 
 async fn handle_runtime_control_command(
     req: &AgentRequest,
     config: &Config,
+    llm_pool: &LlmBackendPool,
     session_memory: &aria_ssmu::SessionMemory,
     session_steering_tx: Option<
         &dashmap::DashMap<
@@ -4048,6 +6512,16 @@ async fn handle_runtime_control_command(
                 plain(lines.join("\n"))
             }
             Err(err) => plain(format!("Failed to list runs: {}", err)),
+        }),
+        aria_core::ControlIntent::InspectRunTree { session_id } => Some(match session_id {
+            None => plain("Usage: /run_tree <session_id>".into()),
+            Some(session_id) => match inspect_agent_run_tree_json(sessions_dir, &session_id, None) {
+                Ok(tree) => plain(
+                    serde_json::to_string_pretty(&tree)
+                        .unwrap_or_else(|_| tree.to_string()),
+                ),
+                Err((_, err)) => plain(format!("Failed to inspect run tree: {}", err)),
+            },
         }),
         aria_core::ControlIntent::InspectRun { run_id } => Some(match run_id {
             None => plain("Usage: /run <run_id>".into()),
@@ -4117,9 +6591,17 @@ async fn handle_runtime_control_command(
             None => plain("Usage: /run_cancel <run_id>".into()),
             Some(run_id) => {
                 let now_us = chrono::Utc::now().timestamp_micros() as u64;
-                match store.cancel_agent_run(&run_id, "cancelled by user command", now_us) {
-                    Ok(Some(run)) => plain(format!("Run '{}' is now {:?}.", run.run_id, run.status)),
-                    Ok(None) => plain(format!("Run '{}' not found.", run_id)),
+                match store.cancel_agent_run_tree(&run_id, "cancelled by user command", now_us) {
+                    Ok(updated) if updated.is_empty() => plain(format!("Run '{}' not found.", run_id)),
+                    Ok(updated) => {
+                        let root = updated.last().expect("non-empty updated list");
+                        plain(format!(
+                            "Run tree rooted at '{}' is now {:?} ({} run(s) updated).",
+                            root.run_id,
+                            root.status,
+                            updated.len()
+                        ))
+                    }
                     Err(err) => plain(format!("Failed to cancel run: {}", err)),
                 }
             }
@@ -4129,46 +6611,50 @@ async fn handle_runtime_control_command(
             Some(run_id) => match store.read_agent_run(&run_id) {
                 Ok(original) => {
                     let now_us = chrono::Utc::now().timestamp_micros() as u64;
-                    let new_run_id = format!("run-{}", uuid::Uuid::new_v4());
-                    let retried = AgentRunRecord {
-                        run_id: new_run_id.clone(),
-                        parent_run_id: original
-                            .parent_run_id
-                            .clone()
-                            .or_else(|| Some(original.run_id.clone())),
-                        session_id: original.session_id,
-                        user_id: original.user_id.clone(),
-                        requested_by_agent: original.requested_by_agent.clone(),
-                        agent_id: original.agent_id.clone(),
-                        status: AgentRunStatus::Queued,
-                        request_text: original.request_text.clone(),
-                        inbox_on_completion: original.inbox_on_completion,
-                        max_runtime_seconds: original.max_runtime_seconds,
-                        created_at_us: now_us,
-                        started_at_us: None,
-                        finished_at_us: None,
-                        result: None,
-                    };
-                    match store.upsert_agent_run(&retried, now_us) {
+                    match store.retry_agent_run(
+                        &run_id,
+                        original.requested_by_agent.as_deref(),
+                        now_us,
+                    ) {
                         Err(err) => plain(format!("Failed to queue retry run: {}", err)),
-                        Ok(()) => match store.append_agent_run_event(&AgentRunEvent {
-                            event_id: format!("evt-{}", uuid::Uuid::new_v4()),
-                            run_id: retried.run_id.clone(),
-                            kind: AgentRunEventKind::Queued,
-                            summary: format!("Run retried from '{}'", original.run_id),
-                            created_at_us: now_us,
-                        }) {
-                            Err(err) => plain(format!("Retry run queued but event write failed: {}", err)),
-                            Ok(()) => plain(format!(
-                                "Retry queued: new run '{}' created from '{}'.",
-                                retried.run_id, original.run_id
-                            )),
-                        },
+                        Ok(Some(retried)) => plain(format!(
+                            "Retry queued: new run '{}' created from '{}'.",
+                            retried.run_id, original.run_id
+                        )),
+                        Ok(None) => plain(format!("Run '{}' not found.", run_id)),
                     }
                 }
                 Err(err) => plain(format!("Retry lookup failed: {}", err)),
             },
         }),
+        aria_core::ControlIntent::TakeoverRun { run_id, agent_id } => Some(match (run_id, agent_id) {
+            (None, _) | (_, None) => plain("Usage: /run_takeover <run_id> <agent_id>".into()),
+            (Some(run_id), Some(agent_id)) => match store.read_agent_run(&run_id) {
+                Ok(original) => {
+                    let now_us = chrono::Utc::now().timestamp_micros() as u64;
+                    match store.take_over_agent_run(
+                        &run_id,
+                        &agent_id,
+                        original.requested_by_agent.as_deref(),
+                        now_us,
+                    ) {
+                        Err(err) => plain(format!("Failed to queue takeover run: {}", err)),
+                        Ok(Some(takeover)) => plain(format!(
+                            "Takeover queued: new run '{}' created from '{}' for agent '{}'.",
+                            takeover.run_id, original.run_id, takeover.agent_id
+                        )),
+                        Ok(None) => plain(format!("Run '{}' not found.", run_id)),
+                    }
+                }
+                Err(err) => plain(format!("Takeover lookup failed: {}", err)),
+            },
+        }),
+        aria_core::ControlIntent::ListProviderHealth => {
+            Some(render_provider_health_for_channel(req.channel, llm_pool))
+        }
+        aria_core::ControlIntent::ListWorkspaceLocks => Some(render_workspace_locks_for_channel(
+            req.channel,
+        )),
         aria_core::ControlIntent::InstallSkill { signed_module_json } => {
             Some(match signed_module_json {
                 None => plain("Usage: /install_skill <SignedModule JSON>".into()),
@@ -4426,9 +6912,126 @@ fn render_pending_approvals_for_channel(
     }
 }
 
+fn render_workspace_locks_for_channel(channel: GatewayChannel) -> ControlCommandOutput {
+    let locks = workspace_lock_manager().snapshot();
+    match channel {
+        GatewayChannel::Telegram => {
+            if locks.is_empty() {
+                return ControlCommandOutput {
+                    text: "<b>Workspace locks:</b>\nNo active workspace locks.".into(),
+                    parse_mode: Some("HTML"),
+                    reply_markup: None,
+                };
+            }
+            let mut lines = vec!["<b>Workspace locks:</b>".to_string()];
+            for lock in locks.iter().take(8) {
+                let holder = lock.current_holder.as_deref().unwrap_or("unknown");
+                lines.push(format!(
+                    "• <code>{}</code> holder=<code>{}</code> waiters={} active={}",
+                    escape_html_fragment(&lock.workspace_key),
+                    escape_html_fragment(holder),
+                    lock.waiting_runs,
+                    lock.active_holders
+                ));
+            }
+            ControlCommandOutput {
+                text: lines.join("\n"),
+                parse_mode: Some("HTML"),
+                reply_markup: None,
+            }
+        }
+        _ => {
+            if locks.is_empty() {
+                return ControlCommandOutput {
+                    text: "Workspace locks:\nNo active workspace locks.".into(),
+                    parse_mode: None,
+                    reply_markup: None,
+                };
+            }
+            let mut lines = vec!["Workspace locks:".to_string()];
+            for lock in locks.iter().take(8) {
+                let holder = lock.current_holder.as_deref().unwrap_or("unknown");
+                lines.push(format!(
+                    " - {} [holder={} | waiters={} | active={}]",
+                    lock.workspace_key, holder, lock.waiting_runs, lock.active_holders
+                ));
+            }
+            ControlCommandOutput {
+                text: lines.join("\n"),
+                parse_mode: None,
+                reply_markup: None,
+            }
+        }
+    }
+}
+
+fn escape_html_fragment(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn render_provider_health_for_channel(
+    channel: GatewayChannel,
+    llm_pool: &LlmBackendPool,
+) -> ControlCommandOutput {
+    let states = llm_pool.provider_circuit_state();
+    match channel {
+        GatewayChannel::Telegram => {
+            if states.is_empty() {
+                return ControlCommandOutput {
+                    text: "<b>Provider health:</b>\nNo provider circuits are open.".into(),
+                    parse_mode: Some("HTML"),
+                    reply_markup: None,
+                };
+            }
+            let mut lines = vec!["<b>Provider health:</b>".to_string()];
+            for state in states.iter().take(8) {
+                lines.push(format!(
+                    "• <code>{}</code> open={} failures={} backends=<code>{}</code>",
+                    escape_html_fragment(&state.provider_family),
+                    state.circuit_open,
+                    state.consecutive_failures,
+                    escape_html_fragment(&state.impacted_backends.join(","))
+                ));
+            }
+            ControlCommandOutput {
+                text: lines.join("\n"),
+                parse_mode: Some("HTML"),
+                reply_markup: None,
+            }
+        }
+        _ => {
+            if states.is_empty() {
+                return ControlCommandOutput {
+                    text: "Provider health:\nNo provider circuits are open.".into(),
+                    parse_mode: None,
+                    reply_markup: None,
+                };
+            }
+            let mut lines = vec!["Provider health:".to_string()];
+            for state in states.iter().take(8) {
+                lines.push(format!(
+                    " - {} [open={} | failures={} | backends={}]",
+                    state.provider_family,
+                    state.circuit_open,
+                    state.consecutive_failures,
+                    state.impacted_backends.join(",")
+                ));
+            }
+            ControlCommandOutput {
+                text: lines.join("\n"),
+                parse_mode: None,
+                reply_markup: None,
+            }
+        }
+    }
+}
+
 fn handle_shared_control_command(
     req: &AgentRequest,
     config: &Config,
+    llm_pool: &LlmBackendPool,
     agent_store: &AgentConfigStore,
     session_memory: &aria_ssmu::SessionMemory,
 ) -> Option<ControlCommandOutput> {
@@ -4498,6 +7101,12 @@ fn handle_shared_control_command(
                 &req.user_id,
             );
             return Some(render_pending_approvals_for_channel(req.channel, pending));
+        }
+        aria_core::ControlIntent::ListProviderHealth => {
+            return Some(render_provider_health_for_channel(req.channel, llm_pool));
+        }
+        aria_core::ControlIntent::ListWorkspaceLocks => {
+            return Some(render_workspace_locks_for_channel(req.channel));
         }
         aria_core::ControlIntent::SwitchAgent {
             agent_id: Some(agent_name),

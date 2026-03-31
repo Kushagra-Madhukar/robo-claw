@@ -401,6 +401,8 @@ mod tests {
         let run = AgentRunRecord {
             run_id: "run-1".into(),
             parent_run_id: Some("parent-1".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
             session_id: *session_id.as_bytes(),
             user_id: "u1".into(),
             requested_by_agent: Some("omni".into()),
@@ -468,6 +470,8 @@ mod tests {
         let first = AgentRunRecord {
             run_id: "run-1".into(),
             parent_run_id: Some("parent".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
             session_id: *uuid::Uuid::new_v4().as_bytes(),
             user_id: "u1".into(),
             requested_by_agent: Some("omni".into()),
@@ -484,6 +488,8 @@ mod tests {
         let second = AgentRunRecord {
             run_id: "run-2".into(),
             parent_run_id: Some("parent".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
             session_id: *uuid::Uuid::new_v4().as_bytes(),
             user_id: "u1".into(),
             requested_by_agent: Some("omni".into()),
@@ -535,6 +541,8 @@ mod tests {
                     &AgentRunRecord {
                         run_id: run_id.into(),
                         parent_run_id: Some("parent-1".into()),
+                    origin_kind: None,
+                    lineage_run_id: None,
                         session_id,
                         user_id: "u1".into(),
                         requested_by_agent: Some("omni".into()),
@@ -596,6 +604,7 @@ mod tests {
             wasm_module_ref: None,
             config_schema: Some("{}".into()),
             enabled: true,
+            provenance: None,
         };
         store
             .upsert_skill_package(&skill, 20)
@@ -671,6 +680,7 @@ mod tests {
             endpoint: "npx @modelcontextprotocol/server-github".into(),
             auth_ref: Some("vault:github".into()),
             enabled: true,
+        provenance: None,
         };
         store
             .upsert_mcp_server(&server, 30)
@@ -797,6 +807,7 @@ mod tests {
             audit_id: "shell-1".into(),
             session_id: Some(session_id.to_string()),
             agent_id: Some("developer".into()),
+            execution_backend_id: Some("local-default".into()),
             command: "echo hello".into(),
             cwd: Some("/workspace".into()),
             os_containment_requested: true,
@@ -957,6 +968,7 @@ mod tests {
                     audit_id: format!("shell-{}", idx),
                     session_id: Some("sess-1".into()),
                     agent_id: Some("agent-1".into()),
+                    execution_backend_id: Some("local-default".into()),
                     command: format!("echo {}", idx),
                     cwd: Some("/workspace".into()),
                     os_containment_requested: false,
@@ -1028,6 +1040,7 @@ mod tests {
                     audit_id: format!("shell-cfg-{}", idx),
                     session_id: Some("sess-2".into()),
                     agent_id: Some("agent-2".into()),
+                    execution_backend_id: Some("local-default".into()),
                     command: format!("echo {}", idx),
                     cwd: Some("/workspace".into()),
                     os_containment_requested: false,
@@ -1870,6 +1883,8 @@ mod tests {
             web_domain_blocklist: vec![],
             browser_profile_allowlist: vec![],
             browser_action_scope: None,
+        computer_profile_allowlist: vec![],
+        computer_action_scope: None,
             browser_session_scope: None,
             crawl_scope: None,
             web_approval_policy: None,

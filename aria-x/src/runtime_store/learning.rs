@@ -177,6 +177,29 @@ impl RuntimeStore {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+    pub fn list_all_execution_traces(&self) -> Result<Vec<ExecutionTrace>, String> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM execution_traces
+                 ORDER BY recorded_at_us ASC",
+            )
+            .map_err(|e| format!("prepare list all execution traces failed: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("query all execution traces failed: {}", e))?;
+
+        let mut traces = Vec::new();
+        for row in rows {
+            let payload = row.map_err(|e| format!("read execution trace row failed: {}", e))?;
+            let trace = serde_json::from_str(&payload)
+                .map_err(|e| format!("parse execution trace failed: {}", e))?;
+            traces.push(trace);
+        }
+        Ok(traces)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn list_execution_traces_by_session_and_fingerprint(
         &self,
         session_id: &str,
@@ -296,6 +319,29 @@ impl RuntimeStore {
         let rows = stmt
             .query_map(params![request_id], |row| row.get::<_, String>(0))
             .map_err(|e| format!("query reward events failed: {}", e))?;
+
+        let mut rewards = Vec::new();
+        for row in rows {
+            let payload = row.map_err(|e| format!("read reward event row failed: {}", e))?;
+            let reward = serde_json::from_str(&payload)
+                .map_err(|e| format!("parse reward event failed: {}", e))?;
+            rewards.push(reward);
+        }
+        Ok(rewards)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn list_all_reward_events(&self) -> Result<Vec<RewardEvent>, String> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM reward_events
+                 ORDER BY recorded_at_us ASC",
+            )
+            .map_err(|e| format!("prepare list all reward events failed: {}", e))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| format!("query all reward events failed: {}", e))?;
 
         let mut rewards = Vec::new();
         for row in rows {

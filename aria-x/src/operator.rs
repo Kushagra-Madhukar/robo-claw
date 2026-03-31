@@ -22,6 +22,14 @@ pub(crate) fn run_admin_inspect_command(
             .map(Some)
             .map_err(|(_, e)| e);
     }
+    if let Some(pos) = command("--inspect-rules") {
+        let workspace_root = required("--inspect-rules", pos)?;
+        let request_text = args.get(pos + 2).map(String::as_str);
+        let target_path = args.get(pos + 3).map(String::as_str);
+        return inspect_rule_resolution_json(&workspace_root, request_text, target_path)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
     if let Some(pos) = command("--inspect-retrieval-traces") {
         let session_id = args.get(pos + 1).map(String::as_str);
         let agent_id = args.get(pos + 2).map(String::as_str);
@@ -48,6 +56,16 @@ pub(crate) fn run_admin_inspect_command(
         return inspect_agent_runs_json(sessions_dir, &session_id)
             .map(Some)
             .map_err(|(_, e)| e);
+    }
+    if let Some(pos) = command("--inspect-run-tree") {
+        let session_id = required("--inspect-run-tree", pos)?;
+        let root_run_id = args.get(pos + 2).map(String::as_str);
+        return inspect_agent_run_tree_json(sessions_dir, &session_id, root_run_id)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
+    if command("--inspect-workspace-locks").is_some() {
+        return inspect_workspace_locks_json().map(Some).map_err(|(_, e)| e);
     }
     if command("--inspect-agent-presence").is_some() {
         return inspect_agent_presence_json(sessions_dir)
@@ -145,6 +163,16 @@ pub(crate) fn run_admin_inspect_command(
     }
     if command("--inspect-learning-metrics").is_some() {
         return inspect_learning_metrics_json(sessions_dir)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
+    if command("--inspect-benchmark-summary").is_some() {
+        return inspect_benchmark_summary_json(sessions_dir)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
+    if command("--inspect-runtime-profile").is_some() {
+        return inspect_runtime_profile_json(config)
             .map(Some)
             .map_err(|(_, e)| e);
     }
@@ -247,6 +275,61 @@ pub(crate) fn run_admin_inspect_command(
             .map(Some)
             .map_err(|(_, e)| e);
     }
+    if command("--inspect-computer-profiles").is_some() {
+        return inspect_computer_profiles_json(sessions_dir)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
+    if let Some(pos) = command("--inspect-robot-state") {
+        let robot_id = args.get(pos + 1).map(String::as_str);
+        return inspect_robot_runtime_states_json(sessions_dir, robot_id)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
+    if let Some(pos) = command("--inspect-ros2-profiles") {
+        let profile_id = args.get(pos + 1).map(String::as_str);
+        return inspect_ros2_bridge_profiles_json(sessions_dir, profile_id)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
+    if let Some(pos) = command("--inspect-robotics-runs") {
+        let robot_id = args.get(pos + 1).map(String::as_str);
+        return inspect_robotics_simulations_json(sessions_dir, robot_id)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
+    if let Some(pos) = command("--inspect-computer-sessions") {
+        let session_id = args.get(pos + 1).map(String::as_str);
+        let agent_id = args.get(pos + 2).map(String::as_str);
+        return inspect_computer_sessions_json(sessions_dir, session_id, agent_id)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
+    if let Some(pos) = command("--inspect-computer-artifacts") {
+        let session_id = args.get(pos + 1).map(String::as_str);
+        let agent_id = args.get(pos + 2).map(String::as_str);
+        return inspect_computer_artifacts_json(sessions_dir, session_id, agent_id)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
+    if let Some(pos) = command("--inspect-computer-action-audits") {
+        let session_id = args.get(pos + 1).map(String::as_str);
+        let agent_id = args.get(pos + 2).map(String::as_str);
+        return inspect_computer_action_audits_json(sessions_dir, session_id, agent_id)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
+    if command("--inspect-execution-backends").is_some() {
+        return inspect_execution_backends_json(sessions_dir)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
+    if let Some(pos) = command("--inspect-execution-workers") {
+        let backend_id = args.get(pos + 1).map(String::as_str);
+        return inspect_execution_workers_json(sessions_dir, backend_id)
+            .map(Some)
+            .map_err(|(_, e)| e);
+    }
     if let Some(pos) = command("--inspect-browser-challenge-events") {
         let session_id = args.get(pos + 1).map(String::as_str);
         let agent_id = args.get(pos + 2).map(String::as_str);
@@ -344,6 +427,51 @@ pub(crate) fn run_admin_inspect_command(
     Ok(None)
 }
 
+fn inspect_runtime_profile_json(
+    config: &Config,
+) -> Result<serde_json::Value, (u16, String)> {
+    let budget = runtime_resource_budget();
+    let deployment_profile = runtime_deployment_profile();
+    let intended_hardware = match deployment_profile {
+        DeploymentProfile::Edge => {
+            "low-end CPU / memory nodes, embedded controllers, robot-side support processes"
+        }
+        DeploymentProfile::Node => {
+            "single workstation, developer machine, or modest self-hosted node"
+        }
+        DeploymentProfile::Cluster => {
+            "multi-node deployment with shared scheduling and runtime services"
+        }
+    };
+    Ok(serde_json::json!({
+        "deployment_profile": deployment_profile,
+        "runtime_store_backend": config.cluster.runtime_store_backend,
+        "resource_budget": {
+            "max_parallel_requests": budget.max_parallel_requests,
+            "wasm_max_memory_pages": budget.wasm_max_memory_pages,
+            "max_tool_rounds": budget.max_tool_rounds,
+            "retrieval_context_char_budget": budget.retrieval_context_char_budget,
+            "browser_automation_enabled": budget.browser_automation_enabled,
+            "learning_enabled": budget.learning_enabled,
+        },
+        "intended_hardware_class": intended_hardware,
+        "constraints": match deployment_profile {
+            DeploymentProfile::Edge => serde_json::json!([
+                "browser automation disabled by default",
+                "learning trace persistence disabled by default",
+                "parallel request budget clamped",
+                "retrieval and tool-round budgets clamped",
+            ]),
+            DeploymentProfile::Node => serde_json::json!([
+                "balanced defaults for local-first workstation operation"
+            ]),
+            DeploymentProfile::Cluster => serde_json::json!([
+                "shared runtime-store and scheduling concerns take precedence over single-node caps"
+            ]),
+        }
+    }))
+}
+
 pub(crate) fn run_admin_explain_command(
     config: &Config,
     args: &[String],
@@ -386,6 +514,25 @@ pub(crate) fn run_operator_cli_command(
                     })
             }))
         }
+        (Some("inspect"), Some("rules")) => {
+            let mut forwarded = vec![args[0].clone(), "--inspect-rules".into()];
+            if let Some(workspace_root) = args.get(3) {
+                forwarded.push(workspace_root.clone());
+            }
+            if let Some(request_text) = args.get(4) {
+                forwarded.push(request_text.clone());
+            }
+            if let Some(target_path) = args.get(5) {
+                forwarded.push(target_path.clone());
+            }
+            Some(run_admin_inspect_command(config, &forwarded).and_then(|json| {
+                json.ok_or_else(|| "no rules found".to_string())
+                    .and_then(|value| {
+                        serde_json::to_string_pretty(&value)
+                            .map_err(|e| format!("serialize failed: {}", e))
+                    })
+            }))
+        }
         (Some("inspect"), Some("provider-payloads" | "provider-payload")) => {
             let mut forwarded = vec![args[0].clone(), "--inspect-provider-payloads".into()];
             if let Some(session_id) = args.get(3) {
@@ -397,6 +544,166 @@ pub(crate) fn run_operator_cli_command(
             Some(run_admin_inspect_command(config, &forwarded)
             .and_then(|json| {
                 json.ok_or_else(|| "no provider payload inspections found".to_string())
+                    .and_then(|value| {
+                        serde_json::to_string_pretty(&value)
+                            .map_err(|e| format!("serialize failed: {}", e))
+                    })
+            }))
+        }
+        (Some("inspect"), Some("runs")) => {
+            let mut forwarded = vec![args[0].clone(), "--inspect-runs".into()];
+            if let Some(session_id) = args.get(3) {
+                forwarded.push(session_id.clone());
+            }
+            Some(run_admin_inspect_command(config, &forwarded).and_then(|json| {
+                json.ok_or_else(|| "no agent runs found".to_string())
+                    .and_then(|value| {
+                        serde_json::to_string_pretty(&value)
+                            .map_err(|e| format!("serialize failed: {}", e))
+                    })
+            }))
+        }
+        (Some("inspect"), Some("run-tree")) => {
+            let mut forwarded = vec![args[0].clone(), "--inspect-run-tree".into()];
+            if let Some(session_id) = args.get(3) {
+                forwarded.push(session_id.clone());
+            }
+            if let Some(root_run_id) = args.get(4) {
+                forwarded.push(root_run_id.clone());
+            }
+            Some(run_admin_inspect_command(config, &forwarded).and_then(|json| {
+                json.ok_or_else(|| "no agent run tree found".to_string())
+                    .and_then(|value| {
+                        serde_json::to_string_pretty(&value)
+                            .map_err(|e| format!("serialize failed: {}", e))
+                    })
+            }))
+        }
+        (Some("inspect"), Some("run-events")) => {
+            let mut forwarded = vec![args[0].clone(), "--inspect-run-events".into()];
+            if let Some(run_id) = args.get(3) {
+                forwarded.push(run_id.clone());
+            }
+            Some(run_admin_inspect_command(config, &forwarded).and_then(|json| {
+                json.ok_or_else(|| "no agent run events found".to_string())
+                    .and_then(|value| {
+                        serde_json::to_string_pretty(&value)
+                            .map_err(|e| format!("serialize failed: {}", e))
+                    })
+            }))
+        }
+        (Some("inspect"), Some("mailbox")) => {
+            let mut forwarded = vec![args[0].clone(), "--inspect-mailbox".into()];
+            if let Some(run_id) = args.get(3) {
+                forwarded.push(run_id.clone());
+            }
+            Some(run_admin_inspect_command(config, &forwarded).and_then(|json| {
+                json.ok_or_else(|| "no agent mailbox messages found".to_string())
+                    .and_then(|value| {
+                        serde_json::to_string_pretty(&value)
+                            .map_err(|e| format!("serialize failed: {}", e))
+                    })
+            }))
+        }
+        (Some("inspect"), Some("workspace-locks")) => Some(
+            run_admin_inspect_command(config, &[args[0].clone(), "--inspect-workspace-locks".into()])
+                .and_then(|json| {
+                    json.ok_or_else(|| "no workspace lock state found".to_string())
+                        .and_then(|value| {
+                            serde_json::to_string_pretty(&value)
+                                .map_err(|e| format!("serialize failed: {}", e))
+                        })
+                }),
+        ),
+        (Some("inspect"), Some("benchmark-summary")) => Some(
+            run_admin_inspect_command(config, &[args[0].clone(), "--inspect-benchmark-summary".into()])
+                .and_then(|json| {
+                    json.ok_or_else(|| "no benchmark summary found".to_string())
+                        .and_then(|value| {
+                            serde_json::to_string_pretty(&value)
+                                .map_err(|e| format!("serialize failed: {}", e))
+                        })
+                }),
+        ),
+        (Some("inspect"), Some("runtime-profile")) => Some(
+            run_admin_inspect_command(config, &[args[0].clone(), "--inspect-runtime-profile".into()])
+                .and_then(|json| {
+                    json.ok_or_else(|| "no runtime profile found".to_string())
+                        .and_then(|value| {
+                            serde_json::to_string_pretty(&value)
+                                .map_err(|e| format!("serialize failed: {}", e))
+                        })
+                }),
+        ),
+        (Some("inspect"), Some("robot-state")) => {
+            let mut forwarded = vec![args[0].clone(), "--inspect-robot-state".into()];
+            if let Some(robot_id) = args.get(3) {
+                forwarded.push(robot_id.clone());
+            }
+            Some(run_admin_inspect_command(config, &forwarded).and_then(|json| {
+                json.ok_or_else(|| "no robot runtime state found".to_string())
+                    .and_then(|value| {
+                        serde_json::to_string_pretty(&value)
+                            .map_err(|e| format!("serialize failed: {}", e))
+                    })
+            }))
+        }
+        (Some("inspect"), Some("ros2-profiles")) => {
+            let mut forwarded = vec![args[0].clone(), "--inspect-ros2-profiles".into()];
+            if let Some(profile_id) = args.get(3) {
+                forwarded.push(profile_id.clone());
+            }
+            Some(run_admin_inspect_command(config, &forwarded).and_then(|json| {
+                json.ok_or_else(|| "no ros2 bridge profiles found".to_string())
+                    .and_then(|value| {
+                        serde_json::to_string_pretty(&value)
+                            .map_err(|e| format!("serialize failed: {}", e))
+                    })
+            }))
+        }
+        (Some("inspect"), Some("robotics-runs")) => {
+            let mut forwarded = vec![args[0].clone(), "--inspect-robotics-runs".into()];
+            if let Some(robot_id) = args.get(3) {
+                forwarded.push(robot_id.clone());
+            }
+            Some(run_admin_inspect_command(config, &forwarded).and_then(|json| {
+                json.ok_or_else(|| "no robotics simulations found".to_string())
+                    .and_then(|value| {
+                        serde_json::to_string_pretty(&value)
+                            .map_err(|e| format!("serialize failed: {}", e))
+                    })
+            }))
+        }
+        (Some("inspect"), Some("mcp-servers")) => Some(
+            run_admin_inspect_command(config, &[args[0].clone(), "--inspect-mcp-servers".into()])
+                .and_then(|json| {
+                    json.ok_or_else(|| "no mcp server state found".to_string())
+                        .and_then(|value| {
+                            serde_json::to_string_pretty(&value)
+                                .map_err(|e| format!("serialize failed: {}", e))
+                        })
+                }),
+        ),
+        (Some("inspect"), Some("mcp-imports")) => {
+            let mut forwarded = vec![args[0].clone(), "--inspect-mcp-imports".into()];
+            if let Some(server_id) = args.get(3) {
+                forwarded.push(server_id.clone());
+            }
+            Some(run_admin_inspect_command(config, &forwarded).and_then(|json| {
+                json.ok_or_else(|| "no mcp imports found".to_string())
+                    .and_then(|value| {
+                        serde_json::to_string_pretty(&value)
+                            .map_err(|e| format!("serialize failed: {}", e))
+                    })
+            }))
+        }
+        (Some("inspect"), Some("mcp-bindings")) => {
+            let mut forwarded = vec![args[0].clone(), "--inspect-mcp-bindings".into()];
+            if let Some(agent_id) = args.get(3) {
+                forwarded.push(agent_id.clone());
+            }
+            Some(run_admin_inspect_command(config, &forwarded).and_then(|json| {
+                json.ok_or_else(|| "no mcp bindings found".to_string())
                     .and_then(|value| {
                         serde_json::to_string_pretty(&value)
                             .map_err(|e| format!("serialize failed: {}", e))
@@ -528,12 +835,23 @@ fn inspect_context_inspections_json(
     let records = RuntimeStore::for_sessions_dir(sessions_dir)
         .list_context_inspections(session_id, agent_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    serde_json::to_value(records).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("serialize failed: {}", e),
-        )
-    })
+    let redaction = TelemetryRedactionConfig::default();
+    let values = records
+        .into_iter()
+        .map(|record| {
+            serde_json::to_value(record)
+                .map(|value| {
+                    redact_json_value(
+                        &value,
+                        TelemetryRedactionProfile::TrustedLocalInspect,
+                        &redaction,
+                    )
+                })
+                .map_err(|e| format!("serialize failed: {}", e))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(serde_json::Value::Array(values))
 }
 
 fn inspect_provider_payloads_json(
@@ -547,7 +865,7 @@ fn inspect_provider_payloads_json(
     let payloads = records
         .into_iter()
         .map(|record| {
-            serde_json::json!({
+            let value = serde_json::json!({
                 "context_id": record.context_id,
                 "request_id": record.request_id,
                 "session_id": record.session_id,
@@ -561,7 +879,12 @@ fn inspect_provider_payloads_json(
                 "emitted_artifacts": record.emitted_artifacts,
                 "tool_provider_readiness": record.tool_provider_readiness,
                 "provider_request_payload": record.provider_request_payload,
-            })
+            });
+            redact_json_value(
+                &value,
+                TelemetryRedactionProfile::TrustedLocalInspect,
+                &TelemetryRedactionConfig::default(),
+            )
         })
         .collect::<Vec<_>>();
     serde_json::to_value(payloads).map_err(|e| {
@@ -682,7 +1005,15 @@ fn explain_provider_payloads(
     for record in records {
         let payload = record
             .provider_request_payload
-            .map(|value| serde_json::to_string_pretty(&value).unwrap_or_else(|_| "<serialize failed>".into()))
+            .map(|value| {
+                let redacted = redact_json_value(
+                    &value,
+                    TelemetryRedactionProfile::TrustedLocalInspect,
+                    &TelemetryRedactionConfig::default(),
+                );
+                serde_json::to_string_pretty(&redacted)
+                    .unwrap_or_else(|_| "<serialize failed>".into())
+            })
             .unwrap_or_else(|| "<none>".into());
         sections.push(format!(
             "Context {} | agent={} | model={}\nSelected tools: {}\nProvider bindings: {}\nEmitted artifacts: {}\nPayload:\n{}",
@@ -745,6 +1076,157 @@ fn inspect_agent_runs_json(
             format!("serialize failed: {}", e),
         )
     })
+}
+
+fn inspect_agent_run_tree_json(
+    sessions_dir: &Path,
+    session_id: &str,
+    root_run_id: Option<&str>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let parsed = uuid::Uuid::parse_str(session_id).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid session_id: {}", e),
+        )
+    })?;
+    let store = RuntimeStore::for_sessions_dir(sessions_dir);
+    let runs = store
+        .list_agent_runs_for_session(parsed)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let snapshot = store
+        .build_agent_run_tree_snapshot(parsed)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let run_index: std::collections::BTreeMap<String, AgentRunRecord> = runs
+        .iter()
+        .cloned()
+        .map(|run| (run.run_id.clone(), run))
+        .collect();
+    let mut children_by_parent: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut continuations_by_source: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for run in &runs {
+        if let Some(parent_run_id) = run.parent_run_id.clone() {
+            children_by_parent
+                .entry(parent_run_id)
+                .or_default()
+                .push(run.run_id.clone());
+        }
+        if let Some(lineage_run_id) = run.lineage_run_id.clone() {
+            continuations_by_source
+                .entry(lineage_run_id)
+                .or_default()
+                .push(run.run_id.clone());
+        }
+    }
+
+    fn build_run_tree_node(
+        store: &RuntimeStore,
+        run_id: &str,
+        run_index: &std::collections::BTreeMap<String, AgentRunRecord>,
+        children_by_parent: &std::collections::BTreeMap<String, Vec<String>>,
+        continuations_by_source: &std::collections::BTreeMap<String, Vec<String>>,
+        visited: &mut std::collections::BTreeSet<String>,
+    ) -> Result<serde_json::Value, (StatusCode, String)> {
+        if !visited.insert(run_id.to_string()) {
+            return Ok(serde_json::json!({
+                "run_id": run_id,
+                "cycle_detected": true,
+            }));
+        }
+        let run = run_index.get(run_id).cloned().ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("run '{}' not found in session tree", run_id),
+            )
+        })?;
+        let events = store
+            .list_agent_run_events(run_id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let mailbox = store
+            .list_agent_mailbox_messages(run_id)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+        let mut child_nodes = Vec::new();
+        if let Some(child_ids) = children_by_parent.get(run_id) {
+            for child_id in child_ids {
+                child_nodes.push(build_run_tree_node(
+                    store,
+                    child_id,
+                    run_index,
+                    children_by_parent,
+                    continuations_by_source,
+                    visited,
+                )?);
+            }
+        }
+        let mut continuation_nodes = Vec::new();
+        if let Some(continuation_ids) = continuations_by_source.get(run_id) {
+            for continuation_id in continuation_ids {
+                continuation_nodes.push(build_run_tree_node(
+                    store,
+                    continuation_id,
+                    run_index,
+                    children_by_parent,
+                    continuations_by_source,
+                    visited,
+                )?);
+            }
+        }
+
+        Ok(serde_json::json!({
+            "run": run,
+            "event_count": events.len(),
+            "events": events,
+            "mailbox_count": mailbox.len(),
+            "mailbox": mailbox,
+            "children": child_nodes,
+            "continuations": continuation_nodes,
+        }))
+    }
+
+    let mut visited = std::collections::BTreeSet::new();
+    let roots = if let Some(root_run_id) = root_run_id {
+        vec![build_run_tree_node(
+            &store,
+            root_run_id,
+            &run_index,
+            &children_by_parent,
+            &continuations_by_source,
+            &mut visited,
+        )?]
+    } else {
+        let mut root_ids = Vec::new();
+        for run in &runs {
+            let parent_missing = run
+                .parent_run_id
+                .as_ref()
+                .map(|id| !run_index.contains_key(id))
+                .unwrap_or(true);
+            if parent_missing && run.lineage_run_id.is_none() {
+                root_ids.push(run.run_id.clone());
+            }
+        }
+        let mut nodes = Vec::new();
+        for root_id in root_ids {
+            nodes.push(build_run_tree_node(
+                &store,
+                &root_id,
+                &run_index,
+                &children_by_parent,
+                &continuations_by_source,
+                &mut visited,
+            )?);
+        }
+        nodes
+    };
+
+    Ok(serde_json::json!({
+        "session_id": session_id,
+        "root_run_id": root_run_id,
+        "snapshot": snapshot,
+        "roots": roots,
+    }))
 }
 
 fn inspect_agent_presence_json(
@@ -1134,6 +1616,85 @@ fn inspect_learning_metrics_json(
     })
 }
 
+fn inspect_benchmark_summary_json(
+    sessions_dir: &Path,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let store = RuntimeStore::for_sessions_dir(sessions_dir);
+    let traces = store
+        .list_all_execution_traces()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut success_count = 0u64;
+    let mut failure_count = 0u64;
+    let mut approval_required_count = 0u64;
+    let mut clarification_required_count = 0u64;
+    let mut total_latency_ms = 0u64;
+    let mut tool_usage: BTreeMap<String, u64> = BTreeMap::new();
+    for trace in &traces {
+        total_latency_ms += trace.latency_ms as u64;
+        match trace.outcome {
+            aria_learning::TraceOutcome::Succeeded => success_count += 1,
+            aria_learning::TraceOutcome::Failed => failure_count += 1,
+            aria_learning::TraceOutcome::ApprovalRequired => approval_required_count += 1,
+            aria_learning::TraceOutcome::ClarificationRequired => clarification_required_count += 1,
+        }
+        for tool in &trace.tool_names {
+            *tool_usage.entry(tool.clone()).or_default() += 1;
+        }
+    }
+
+    let context_inspections = store
+        .list_context_inspections(None, None)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let mut provider_usage: BTreeMap<String, u64> = BTreeMap::new();
+    let mut total_prompt_tokens = 0u64;
+    for record in &context_inspections {
+        let provider = record
+            .provider_model
+            .as_deref()
+            .and_then(|value| value.split_once('/').map(|(provider, _)| provider))
+            .unwrap_or("unknown");
+        *provider_usage.entry(provider.to_string()).or_default() += 1;
+        total_prompt_tokens += record.system_tokens as u64
+            + record.history_tokens as u64
+            + record.context_tokens as u64
+            + record.user_tokens as u64;
+    }
+
+    let streaming_metrics = inspect_streaming_metrics_json(sessions_dir, None, None)?;
+    let learning_metrics = store
+        .learning_metrics_snapshot()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let repair_fallback_audit_count = store
+        .list_repair_fallback_audits(None, None)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .len();
+
+    Ok(serde_json::json!({
+        "learning_metrics": learning_metrics,
+        "trace_summary": {
+            "trace_count": traces.len(),
+            "success_count": success_count,
+            "failure_count": failure_count,
+            "approval_required_count": approval_required_count,
+            "clarification_required_count": clarification_required_count,
+            "average_latency_ms": if traces.is_empty() {
+                0.0
+            } else {
+                total_latency_ms as f64 / traces.len() as f64
+            },
+            "average_prompt_tokens": if context_inspections.is_empty() {
+                0.0
+            } else {
+                total_prompt_tokens as f64 / context_inspections.len() as f64
+            },
+        },
+        "streaming_metrics": streaming_metrics,
+        "repair_fallback_audit_count": repair_fallback_audit_count,
+        "provider_usage": provider_usage,
+        "tool_usage": tool_usage,
+    }))
+}
+
 fn inspect_learning_derivatives_json(
     sessions_dir: &Path,
     fingerprint: &str,
@@ -1156,12 +1717,23 @@ fn inspect_learning_traces_json(
     let traces = RuntimeStore::for_sessions_dir(sessions_dir)
         .list_execution_traces_by_session(session_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    serde_json::to_value(traces).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("serialize failed: {}", e),
-        )
-    })
+    let redaction = TelemetryRedactionConfig::default();
+    let values = traces
+        .into_iter()
+        .map(|trace| {
+            serde_json::to_value(trace)
+                .map(|value| {
+                    redact_json_value(
+                        &value,
+                        TelemetryRedactionProfile::TrustedLocalInspect,
+                        &redaction,
+                    )
+                })
+                .map_err(|e| format!("serialize failed: {}", e))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(serde_json::Value::Array(values))
 }
 
 fn inspect_scope_denials_json(
@@ -1403,6 +1975,183 @@ fn inspect_browser_action_audits_json(
         .list_browser_action_audits(parsed_session_id, agent_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     serde_json::to_value(audits).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize failed: {}", e),
+        )
+    })
+}
+
+fn inspect_computer_profiles_json(
+    sessions_dir: &Path,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let profiles = RuntimeStore::for_sessions_dir(sessions_dir)
+        .list_computer_profiles()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    serde_json::to_value(profiles).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize failed: {}", e),
+        )
+    })
+}
+
+fn inspect_robot_runtime_states_json(
+    sessions_dir: &Path,
+    robot_id: Option<&str>,
+) -> Result<serde_json::Value, (u16, String)> {
+    let states = RuntimeStore::for_sessions_dir(sessions_dir)
+        .list_robot_runtime_states(robot_id)
+        .map_err(|e| (500u16, e))?;
+    let rows = states
+        .into_iter()
+        .map(|record| {
+            serde_json::json!({
+                "robot_id": record.robot_id,
+                "execution_mode": record.execution_mode,
+                "connection_kind": record.connection_kind,
+                "bridge_profile_id": record.bridge_profile_id,
+                "battery_percent": record.state.battery_percent,
+                "active_faults": record.state.active_faults,
+                "degraded_local_mode": record.state.degraded_local_mode,
+                "last_heartbeat_us": record.state.last_heartbeat_us,
+                "safety_envelope": record.safety_envelope,
+                "updated_at_us": record.updated_at_us,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "count": rows.len(),
+        "rows": rows,
+    }))
+}
+
+fn inspect_ros2_bridge_profiles_json(
+    sessions_dir: &Path,
+    profile_id: Option<&str>,
+) -> Result<serde_json::Value, (u16, String)> {
+    let rows = RuntimeStore::for_sessions_dir(sessions_dir)
+        .list_ros2_bridge_profiles(profile_id)
+        .map_err(|e| (500u16, e))?;
+    Ok(serde_json::json!({
+        "count": rows.len(),
+        "rows": rows,
+    }))
+}
+
+fn inspect_robotics_simulations_json(
+    sessions_dir: &Path,
+    robot_id: Option<&str>,
+) -> Result<serde_json::Value, (u16, String)> {
+    let rows = RuntimeStore::for_sessions_dir(sessions_dir)
+        .list_robotics_simulations(robot_id)
+        .map_err(|e| (500u16, e))?
+        .into_iter()
+        .map(|record| {
+            serde_json::json!({
+                "simulation_id": record.simulation_id,
+                "session_id": record.session_id.map(|id| uuid::Uuid::from_bytes(id).to_string()),
+                "agent_id": record.agent_id,
+                "robot_id": record.robot_id,
+                "outcome": record.outcome,
+                "ros2_profile_id": record.ros2_profile_id,
+                "safety_events": record.safety_events,
+                "directive": record.directive_json,
+                "rejection_reason": record.rejection_reason,
+                "contract": record.contract,
+                "state": record.state,
+                "safety_envelope": record.safety_envelope,
+                "created_at_us": record.created_at_us,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "count": rows.len(),
+        "rows": rows,
+    }))
+}
+
+fn inspect_execution_backends_json(
+    sessions_dir: &Path,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let profiles = ensure_default_execution_backend_profiles(sessions_dir)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    serde_json::to_value(profiles).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize failed: {}", e),
+        )
+    })
+}
+
+fn inspect_computer_sessions_json(
+    sessions_dir: &Path,
+    session_id: Option<&str>,
+    agent_id: Option<&str>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let parsed_session_id = session_id
+        .map(|value| uuid::Uuid::parse_str(value).map(|id| *id.as_bytes()))
+        .transpose()
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid session_id: {}", e)))?;
+    let sessions = RuntimeStore::for_sessions_dir(sessions_dir)
+        .list_computer_sessions(parsed_session_id, agent_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    serde_json::to_value(sessions).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize failed: {}", e),
+        )
+    })
+}
+
+fn inspect_computer_artifacts_json(
+    sessions_dir: &Path,
+    session_id: Option<&str>,
+    agent_id: Option<&str>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let parsed_session_id = session_id
+        .map(|value| uuid::Uuid::parse_str(value).map(|id| *id.as_bytes()))
+        .transpose()
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid session_id: {}", e)))?;
+    let artifacts = RuntimeStore::for_sessions_dir(sessions_dir)
+        .list_computer_artifacts(parsed_session_id, agent_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    serde_json::to_value(artifacts).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize failed: {}", e),
+        )
+    })
+}
+
+fn inspect_computer_action_audits_json(
+    sessions_dir: &Path,
+    session_id: Option<&str>,
+    agent_id: Option<&str>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let parsed_session_id = session_id
+        .map(|value| uuid::Uuid::parse_str(value).map(|id| *id.as_bytes()))
+        .transpose()
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid session_id: {}", e)))?;
+    let audits = RuntimeStore::for_sessions_dir(sessions_dir)
+        .list_computer_action_audits(parsed_session_id, agent_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    serde_json::to_value(audits).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize failed: {}", e),
+        )
+    })
+}
+
+fn inspect_execution_workers_json(
+    sessions_dir: &Path,
+    backend_id: Option<&str>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    let workers = RuntimeStore::for_sessions_dir(sessions_dir)
+        .list_execution_workers(backend_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    serde_json::to_value(workers).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("serialize failed: {}", e),

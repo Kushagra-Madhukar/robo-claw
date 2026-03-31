@@ -208,7 +208,7 @@ fn write_approval_record(
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err))
 }
 
-fn ensure_approval_handle(
+pub(crate) fn ensure_approval_handle(
     sessions_dir: &Path,
     record: &aria_core::ApprovalRecord,
 ) -> io::Result<String> {
@@ -314,7 +314,7 @@ fn approval_options_for_tool(tool_name: &str) -> Vec<&'static str> {
     }
 }
 
-fn build_approval_descriptor(record: &aria_core::ApprovalRecord) -> ApprovalDisplayDescriptor {
+pub(crate) fn build_approval_descriptor(record: &aria_core::ApprovalRecord) -> ApprovalDisplayDescriptor {
     let args = serde_json::from_str::<serde_json::Value>(&record.arguments_json)
         .unwrap_or_else(|_| serde_json::json!({}));
     let target_summary = args
@@ -335,6 +335,20 @@ fn build_approval_descriptor(record: &aria_core::ApprovalRecord) -> ApprovalDisp
             args.get("agent_id")
                 .and_then(|v| v.as_str())
                 .map(|v| format!("agent={}", v))
+        })
+        .or_else(|| {
+            match (
+                args.get("x").and_then(|v| v.as_i64()),
+                args.get("y").and_then(|v| v.as_i64()),
+            ) {
+                (Some(x), Some(y)) => Some(format!("point={},{}", x, y)),
+                _ => None,
+            }
+        })
+        .or_else(|| {
+            args.get("profile_id")
+                .and_then(|v| v.as_str())
+                .map(|v| format!("profile={}", v))
         });
     let action_summary = match record.tool_name.as_str() {
         AGENT_ELEVATION_TOOL_NAME => "elevate agent privileges".to_string(),
@@ -344,12 +358,23 @@ fn build_approval_descriptor(record: &aria_core::ApprovalRecord) -> ApprovalDisp
             .and_then(|v| v.as_str())
             .map(|action| format!("browser action: {}", action))
             .unwrap_or_else(|| "browser action".to_string()),
+        "computer_act" => args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .map(|action| format!("computer action: {}", action))
+            .unwrap_or_else(|| "computer action".to_string()),
+        "computer_capture" | "computer_screenshot" => "capture desktop screenshot".to_string(),
         "set_domain_access_decision" => "change stored domain access policy".to_string(),
         other => format!("execute tool '{}'", other),
     };
     let risk_summary = match record.tool_name.as_str() {
         AGENT_ELEVATION_TOOL_NAME => "high: privileged agent access".to_string(),
-        "run_shell" | "write_file" | "browser_act" => "high: side-effecting action".to_string(),
+        "run_shell" | "write_file" | "browser_act" | "computer_act" => {
+            "high: side-effecting action".to_string()
+        }
+        "computer_capture" | "computer_screenshot" => {
+            "medium: desktop observation and artifact persistence".to_string()
+        }
         "browser_download" => "medium: artifact persistence and content ingestion".to_string(),
         "set_domain_access_decision" => "medium: changes future trust decisions".to_string(),
         _ => "medium: explicit human approval required".to_string(),
@@ -377,6 +402,19 @@ fn approval_arguments_preview(tool_name: &str, args: &serde_json::Value) -> Stri
             vec!["task", "schedule", "mode", "deferred_prompt", "agent_id"]
         }
         "browser_act" => vec!["action", "url", "selector", "text", "value", "millis"],
+        "computer_act" => vec![
+            "action",
+            "profile_id",
+            "target_window_id",
+            "x",
+            "y",
+            "button",
+            "text",
+            "key",
+        ],
+        "computer_capture" | "computer_screenshot" => {
+            vec!["computer_session_id", "profile_id"]
+        }
         "browser_download" | "browser_open" | "browser_snapshot" | "browser_extract" | "browser_screenshot" => {
             vec!["url", "filename", "browser_session_id", "profile_id"]
         }

@@ -113,6 +113,7 @@ pub fn parse_skill_manifest_toml(input: &str) -> Result<SkillPackageManifest, Ru
         wasm_module_ref: parsed.wasm_module_ref,
         config_schema: parsed.config_schema,
         enabled: parsed.enabled,
+        provenance: None,
     };
     validate_skill_manifest(&manifest)?;
     Ok(manifest)
@@ -1797,6 +1798,7 @@ version = "0.1.0"
                 wasm_module_ref: None,
                 config_schema: None,
                 enabled: true,
+                provenance: None,
             })
             .expect("install skill");
         registry

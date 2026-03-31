@@ -15,6 +15,8 @@ pub enum ScopeDenialKind {
     BrowserProfileScope,
     BrowserSessionScope,
     BrowserActionScope,
+    ComputerProfileScope,
+    ComputerActionScope,
     CrawlScope,
     McpToolScope,
     McpPromptScope,
@@ -38,6 +40,8 @@ impl ScopeDenialKind {
             Self::BrowserProfileScope => "browser_profile_scope",
             Self::BrowserSessionScope => "browser_session_scope",
             Self::BrowserActionScope => "browser_action_scope",
+            Self::ComputerProfileScope => "computer_profile_scope",
+            Self::ComputerActionScope => "computer_action_scope",
             Self::CrawlScope => "crawl_scope",
             Self::McpToolScope => "mcp_tool_scope",
             Self::McpPromptScope => "mcp_prompt_scope",
@@ -108,6 +112,7 @@ pub struct RetrievalTraceRecord {
 pub enum ContextBlockKind {
     Retrieval,
     ControlDocument,
+    RuleContext,
     DurableConstraint,
     SubAgentResult,
     ToolInstructions,
@@ -186,6 +191,7 @@ pub struct ExecutionContract {
 pub enum ExecutionArtifactKind {
     Schedule,
     Browser,
+    Computer,
     File,
     Mcp,
     SubAgent,
@@ -788,6 +794,9 @@ pub enum ControlIntent {
         agent_id: Option<String>,
     },
     ListRuns,
+    InspectRunTree {
+        session_id: Option<String>,
+    },
     InspectRun {
         run_id: Option<String>,
     },
@@ -799,6 +808,10 @@ pub enum ControlIntent {
     },
     RetryRun {
         run_id: Option<String>,
+    },
+    TakeoverRun {
+        run_id: Option<String>,
+        agent_id: Option<String>,
     },
     InspectMailbox {
         run_id: Option<String>,
@@ -819,6 +832,8 @@ pub enum ControlIntent {
     },
     InspectSession,
     ClearSession,
+    ListProviderHealth,
+    ListWorkspaceLocks,
     ListApprovals,
     ResolveApproval {
         decision: ApprovalResolutionDecision,
@@ -863,6 +878,9 @@ pub fn parse_control_intent(text: &str, channel: GatewayChannel) -> Option<Contr
             agent_id: parts.next().map(ToString::to_string),
         }),
         "/runs" => Some(ControlIntent::ListRuns),
+        "/run_tree" => Some(ControlIntent::InspectRunTree {
+            session_id: parts.next().map(ToString::to_string),
+        }),
         "/run" => Some(ControlIntent::InspectRun {
             run_id: parts.next().map(ToString::to_string),
         }),
@@ -874,6 +892,10 @@ pub fn parse_control_intent(text: &str, channel: GatewayChannel) -> Option<Contr
         }),
         "/run_retry" => Some(ControlIntent::RetryRun {
             run_id: parts.next().map(ToString::to_string),
+        }),
+        "/run_takeover" => Some(ControlIntent::TakeoverRun {
+            run_id: parts.next().map(ToString::to_string),
+            agent_id: parts.next().map(ToString::to_string),
         }),
         "/mailbox" => Some(ControlIntent::InspectMailbox {
             run_id: parts.next().map(ToString::to_string),
@@ -904,6 +926,8 @@ pub fn parse_control_intent(text: &str, channel: GatewayChannel) -> Option<Contr
             Some(arg) if matches!(arg, "clear" | "reset") => Some(ControlIntent::ClearSession),
             _ => Some(ControlIntent::InspectSession),
         },
+        "/provider_health" | "/providers" => Some(ControlIntent::ListProviderHealth),
+        "/workspace_locks" | "/locks" => Some(ControlIntent::ListWorkspaceLocks),
         "/approvals" => Some(ControlIntent::ListApprovals),
         "/approve" => Some(ControlIntent::ResolveApproval {
             decision: ApprovalResolutionDecision::Approve,

@@ -165,6 +165,25 @@ mod tests {
             }
         );
 
+        let run_tree =
+            parse_control_intent("/run_tree session-1", GatewayChannel::Cli).expect("run_tree");
+        assert_eq!(
+            run_tree,
+            ControlIntent::InspectRunTree {
+                session_id: Some(String::from("session-1"))
+            }
+        );
+
+        let takeover = parse_control_intent("/run_takeover run-1 developer", GatewayChannel::Cli)
+            .expect("takeover");
+        assert_eq!(
+            takeover,
+            ControlIntent::TakeoverRun {
+                run_id: Some(String::from("run-1")),
+                agent_id: Some(String::from("developer"))
+            }
+        );
+
         let stop = parse_control_intent("/stop", GatewayChannel::Telegram).expect("stop");
         assert_eq!(stop, ControlIntent::StopCurrent);
 
@@ -190,6 +209,14 @@ mod tests {
         let session_clear = parse_control_intent("/session clear", GatewayChannel::Telegram)
             .expect("session clear");
         assert_eq!(session_clear, ControlIntent::ClearSession);
+
+        let locks = parse_control_intent("/workspace_locks", GatewayChannel::Cli)
+            .expect("workspace locks");
+        assert_eq!(locks, ControlIntent::ListWorkspaceLocks);
+
+        let provider_health = parse_control_intent("/provider_health", GatewayChannel::Cli)
+            .expect("provider health");
+        assert_eq!(provider_health, ControlIntent::ListProviderHealth);
     }
 
     #[test]
@@ -705,6 +732,24 @@ mod tests {
     }
 
     #[test]
+    fn ros2_bridge_profile_round_trip_json() {
+        let profile = Ros2BridgeProfile {
+            profile_id: String::from("ros2-lab"),
+            display_name: String::from("Lab ROS2"),
+            namespace: String::from("/robots/lab"),
+            command_topic: String::from("cmd"),
+            telemetry_topic: String::from("telemetry"),
+            image_topic: Some(String::from("camera")),
+            service_prefix: Some(String::from("svc")),
+            requires_approval: true,
+            simulation_only: false,
+        };
+        let json = serde_json::to_string(&profile).expect("to json");
+        let decoded: Ros2BridgeProfile = serde_json::from_str(&json).expect("from json");
+        assert_eq!(decoded, profile);
+    }
+
+    #[test]
     fn agent_capability_profile_round_trip_with_expanded_scopes() {
         let profile = AgentCapabilityProfile {
             agent_id: String::from("omni"),
@@ -732,6 +777,8 @@ mod tests {
             web_domain_blocklist: vec![String::from("evil.example")],
             browser_profile_allowlist: vec![String::from("work-profile")],
             browser_action_scope: Some(BrowserActionScope::InteractiveNonAuth),
+            computer_profile_allowlist: vec![String::from("local-mac")],
+            computer_action_scope: Some(ComputerActionScope::PointerAndKeyboard),
             browser_session_scope: Some(BrowserSessionScope::ManagedProfileOnly),
             crawl_scope: Some(CrawlScope::AllowlistedDomains),
             web_approval_policy: Some(WebApprovalPolicy::PromptOnUnknownDomain),
@@ -786,6 +833,67 @@ mod tests {
         let decoded_decision: DomainAccessDecision =
             serde_json::from_str(&decision_json).expect("deserialize decision");
         assert_eq!(decoded_decision, decision);
+    }
+
+    #[test]
+    fn computer_runtime_types_round_trip_json() {
+        let profile = ComputerExecutionProfile {
+            profile_id: String::from("desktop-safe"),
+            display_name: String::from("Desktop Safe"),
+            runtime_kind: ComputerRuntimeKind::ManagedVm,
+            isolated: true,
+            headless: false,
+            allow_clipboard: false,
+            allow_keyboard: true,
+            allow_pointer: true,
+            allowed_windows: vec![String::from("Calculator"), String::from("Notes")],
+            created_at_us: 21,
+        };
+        let session = ComputerSessionRecord {
+            computer_session_id: String::from("computer-session-1"),
+            session_id: make_uuid(),
+            agent_id: String::from("developer"),
+            profile_id: profile.profile_id.clone(),
+            runtime_kind: ComputerRuntimeKind::ManagedVm,
+            selected_window_id: Some(String::from("Calculator")),
+            created_at_us: 22,
+            updated_at_us: 23,
+        };
+        let action = ComputerActionRequest {
+            computer_session_id: Some(session.computer_session_id.clone()),
+            profile_id: Some(profile.profile_id.clone()),
+            target_window_id: Some(String::from("Calculator")),
+            action: ComputerActionKind::PointerClick,
+            x: Some(100),
+            y: Some(200),
+            button: Some(ComputerPointerButton::Left),
+            text: None,
+            key: None,
+        };
+        let artifact = ComputerArtifactRecord {
+            artifact_id: String::from("computer-artifact-1"),
+            session_id: make_uuid(),
+            agent_id: String::from("developer"),
+            computer_session_id: Some(session.computer_session_id.clone()),
+            profile_id: Some(profile.profile_id.clone()),
+            kind: ComputerArtifactKind::Screenshot,
+            mime_type: String::from("image/png"),
+            storage_path: String::from("/tmp/computer-shot.png"),
+            metadata: serde_json::json!({"window":"Calculator"}),
+            created_at_us: 24,
+        };
+
+        let payload = serde_json::json!({
+            "profile": profile,
+            "session": session,
+            "action": action,
+            "artifact": artifact,
+        });
+        let json = serde_json::to_string(&payload).expect("serialize computer payload");
+        let decoded: serde_json::Value = serde_json::from_str(&json).expect("deserialize computer payload");
+        assert_eq!(decoded["profile"]["runtime_kind"], "managed_vm");
+        assert_eq!(decoded["action"]["action"], "pointer_click");
+        assert_eq!(decoded["artifact"]["kind"], "screenshot");
     }
 
     #[test]
@@ -879,6 +987,8 @@ mod tests {
         let record = AgentRunRecord {
             run_id: String::from("run-1"),
             parent_run_id: Some(String::from("run-parent")),
+                    origin_kind: None,
+                    lineage_run_id: None,
             session_id: make_uuid(),
             user_id: String::from("u1"),
             requested_by_agent: Some(String::from("omni")),
@@ -926,6 +1036,7 @@ mod tests {
             wasm_module_ref: None,
             config_schema: Some(String::from("{}")),
             enabled: true,
+            provenance: None,
         };
         let server = McpServerProfile {
             server_id: String::from("github"),

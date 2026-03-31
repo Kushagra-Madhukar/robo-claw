@@ -13,11 +13,11 @@ fi
 RUN_ID="$(date +"%Y%m%d-%H%M%S")"
 LOG_DIR="${HIVECLAW_LOG_DIR:-${ARIA_LOG_DIR:-./logs/dev}}"
 mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/aria-x-$RUN_ID.log"
+LOG_FILE="$LOG_DIR/hiveclaw-$RUN_ID.log"
 ln -sfn "$(basename "$LOG_FILE")" "$LOG_DIR/latest.log"
 echo "[dev.sh] logging to $LOG_FILE"
 
-cargo build -p aria-x 2>&1 | tee "$LOG_FILE"
+cargo build -p aria-x --bin hiveclaw --bin aria-x 2>&1 | tee "$LOG_FILE"
 
 # Cap ONNX Runtime threads to avoid thermal throttle on Apple Silicon.
 # Without these, fastembed/MiniLM-L6 will consume all CPU cores during inference.
@@ -25,4 +25,11 @@ export ORT_NUM_THREADS="${ORT_NUM_THREADS:-2}"
 export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-2}"
 export RUST_LOG="${RUST_LOG:-debug}"
 
-./target/debug/aria-x "${1:-aria-x/config.toml}" "${@:2}" 2>&1 | tee -a "$LOG_FILE"
+PRIMARY_BIN="./target/debug/hiveclaw"
+LEGACY_BIN="./target/debug/aria-x"
+CLI_BIN="${HIVECLAW_BIN:-$PRIMARY_BIN}"
+if [[ ! -x "$CLI_BIN" ]]; then
+  CLI_BIN="$LEGACY_BIN"
+fi
+
+"$CLI_BIN" "${1:-aria-x/config.toml}" "${@:2}" 2>&1 | tee -a "$LOG_FILE"

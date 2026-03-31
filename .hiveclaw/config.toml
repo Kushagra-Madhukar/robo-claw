@@ -1,0 +1,63 @@
+# HiveClaw project bootstrap
+
+[llm]
+backend = "gemini"
+model = "gemini-3-flash-preview"
+max_tool_rounds = 6
+
+[policy]
+policy_path = "./policies/default.cedar"
+
+[gateway]
+adapter = "cli"
+adapters = ["cli"]
+session_scope_policy = "main"
+
+[mesh]
+mode = "peer"
+endpoints = []
+
+[agents_dir]
+path = "./agents"
+
+[router]
+confidence_threshold = 0.70
+tie_break_gap = 0.05
+
+[ssmu]
+sessions_dir = "./workspace/sessions"
+operator_skill_signature_max_rows = 5000
+operator_shell_exec_audit_max_rows = 20000
+
+[scheduler]
+enabled = false
+tick_seconds = 1
+
+[localization]
+default_timezone = "Asia/Kolkata"
+user_timezones = {}
+
+[node]
+id = "orchestrator-1"
+role = "orchestrator"
+tier = "orchestrator"
+
+[cluster]
+profile = "node"
+runtime_store_backend = "sqlite"
+tenant_id = "default"
+workspace_scope = "default"
+scheduler_shards = 1
+
+[resource_budget]
+max_parallel_requests = 8
+wasm_max_memory_pages = 256
+max_tool_rounds = 6
+retrieval_context_char_budget = 16000
+browser_automation_enabled = true
+learning_enabled = true
+
+[ui]
+enabled = false
+bind_addr = "127.0.0.1:8080"
+default_agent = "yes"

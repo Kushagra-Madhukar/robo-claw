@@ -313,11 +313,11 @@ See [docs/CHROME_DEVTOOLS_MCP.md](docs/CHROME_DEVTOOLS_MCP.md) for the setup flo
 Operator commands:
 
 ```bash
-aria-x doctor mcp
-aria-x doctor mcp --live
-aria-x doctor mcp --live --mode auto_connect
-aria-x setup chrome-devtools-mcp --agent developer
-aria-x setup chrome-devtools-mcp --mode auto_connect --agent developer
+hiveclaw doctor mcp
+hiveclaw doctor mcp --live
+hiveclaw doctor mcp --live --mode auto_connect
+hiveclaw setup chrome-devtools-mcp --agent developer
+hiveclaw setup chrome-devtools-mcp --mode auto_connect --agent developer
 ```
 
 ### Scheduling and background work
@@ -383,13 +383,20 @@ Adapter maturity is not uniform. The core validated local runtime path today is 
 The project now includes a real terminal UI with:
 
 - transcript pane
-- sidebar tabs
+- operator workbench tabs for runs, approvals, tools/context, and system health
 - approval picker
 - agent switcher
+- searchable command palette
+- inspect/explain shortcuts for context, provider payloads, MCP, and workspace diagnostics
+- failure summaries that explain common operator-visible issues without hiding raw logs
 - runtime status summaries
 - runtime log tail
 - persisted context inspection records for prompt review
 - keyboard and mouse navigation
+
+Operator workflow docs:
+
+- [docs/HIVECLAW_OPERATOR_WORKBENCH.md](/Users/kushagramadhukar/coding/anima/docs/HIVECLAW_OPERATOR_WORKBENCH.md)
 
 ## Getting Started
 
@@ -423,6 +430,18 @@ The checked-in runtime defaults use:
 - `backend = "gemini"`
 - `model = "gemini-3-flash-preview"`
 
+### 1.6. Initialize local HiveClaw workspace files (recommended)
+
+```bash
+target/debug/hiveclaw init
+```
+
+This bootstraps `.hiveclaw/` with starter config, policy, and guidance files for local runs.
+
+For the full onboarding and operator workflow, see:
+
+- [docs/HIVECLAW_OPERATOR_WORKBENCH.md](/Users/kushagramadhukar/coding/anima/docs/HIVECLAW_OPERATOR_WORKBENCH.md)
+
 ### 2. Run tests
 
 ```bash
@@ -432,13 +451,13 @@ cargo test --workspace
 ### 3. Start the runtime
 
 ```bash
-cargo run -p aria-x -- aria-x/config.toml
+cargo run -p aria-x --bin hiveclaw -- run aria-x/config.toml
 ```
 
 ### 4. Start the TUI
 
 ```bash
-cargo run -p aria-x -- tui aria-x/config.toml
+cargo run -p aria-x --bin hiveclaw -- tui aria-x/config.toml
 ```
 
 ### 5. Attach the TUI to a shared runtime
@@ -446,23 +465,23 @@ cargo run -p aria-x -- tui aria-x/config.toml
 If you are already running a shared gateway with WebSocket enabled:
 
 ```bash
-target/debug/aria-x tui aria-x/config.toml --attach ws://127.0.0.1:8090/ws
+target/debug/hiveclaw tui aria-x/config.toml --attach ws://127.0.0.1:8090/ws
 ```
 
 ### 6. Multi-node examples
 
 ```bash
-cargo run -p aria-x -- nodes/orchestrator.toml
-cargo run -p aria-x -- nodes/relay.toml
-cargo run -p aria-x -- nodes/companion.toml
-cargo run -p aria-x -- nodes/micro.toml
+cargo run -p aria-x --bin hiveclaw -- nodes/orchestrator.toml
+cargo run -p aria-x --bin hiveclaw -- nodes/relay.toml
+cargo run -p aria-x --bin hiveclaw -- nodes/companion.toml
+cargo run -p aria-x --bin hiveclaw -- nodes/micro.toml
 ```
 
 ### 7. Verify speech-to-text setup
 
 ```bash
-target/debug/aria-x doctor stt
-target/debug/aria-x setup stt --local
+target/debug/hiveclaw doctor stt
+target/debug/hiveclaw setup stt --local
 ```
 
 ## Configuration
@@ -530,9 +549,9 @@ Do not place live secrets in tracked config files. Generated runtime config file
 If you want local voice transcription:
 
 ```bash
-target/debug/aria-x doctor
-target/debug/aria-x doctor stt
-target/debug/aria-x setup stt --local
+target/debug/hiveclaw doctor
+target/debug/hiveclaw doctor stt
+target/debug/hiveclaw setup stt --local
 ```
 
 `doctor stt` reports whether the local runtime is operational.
@@ -547,26 +566,26 @@ Additional doctor scopes:
 - `doctor gateway`
 - `doctor browser`
 
-`install` copies the current `aria-x` binary into `~/.local/bin/aria-x` by default so you can run the HiveClaw runtime from anywhere once that directory is on your shell `PATH`.
+`install` copies the current binary into `~/.local/bin/hiveclaw` by default so you can run HiveClaw from anywhere once that directory is on your shell `PATH`. The legacy `aria-x` command remains available for compatibility.
 
 You can also seed the standard application config path during install:
 
 ```bash
-target/debug/aria-x install --with-default-config
+target/debug/hiveclaw install --with-default-config
 ```
 
 Shell completions are generated on demand:
 
 ```bash
-target/debug/aria-x completion zsh
-target/debug/aria-x completion bash
-target/debug/aria-x completion fish
+target/debug/hiveclaw completion zsh
+target/debug/hiveclaw completion bash
+target/debug/hiveclaw completion fish
 ```
 
 ### Typical local setup
 
 ```bash
-cargo run -p aria-x -- aria-x/config.toml
+cargo run -p aria-x --bin hiveclaw -- run aria-x/config.toml
 ```
 
 ### Typical shared runtime setup
@@ -580,7 +599,7 @@ Configure both Telegram and WebSocket in the gateway section, then run:
 And attach the TUI from another terminal:
 
 ```bash
-target/debug/aria-x tui aria-x/config.toml --attach ws://127.0.0.1:8090/ws
+target/debug/hiveclaw tui aria-x/config.toml --attach ws://127.0.0.1:8090/ws
 ```
 
 ## Security Model
@@ -611,6 +630,15 @@ HiveClaw is built around runtime-enforced boundaries, not prompt-only instructio
 Start here if you want the deeper architecture and planning trail:
 
 - [`docs/HIVECLAW_EXECUTION_ROADMAP.md`](docs/HIVECLAW_EXECUTION_ROADMAP.md)
+- [`docs/HIVECLAW_IMPLEMENTATION_CHECKLIST.md`](docs/HIVECLAW_IMPLEMENTATION_CHECKLIST.md)
+- [`docs/HIVECLAW_RULES_HOOKS_SKILLS.md`](docs/HIVECLAW_RULES_HOOKS_SKILLS.md)
+- [`docs/HIVECLAW_COMPUTER_RUNTIME.md`](docs/HIVECLAW_COMPUTER_RUNTIME.md)
+- [`docs/HIVECLAW_EDGE_MODE.md`](docs/HIVECLAW_EDGE_MODE.md)
+- [`docs/HIVECLAW_EDGE_ROBOTICS_DEPLOYMENT.md`](docs/HIVECLAW_EDGE_ROBOTICS_DEPLOYMENT.md)
+- [`docs/HIVECLAW_DISTRIBUTED_EXECUTION.md`](docs/HIVECLAW_DISTRIBUTED_EXECUTION.md)
+- [`docs/HIVECLAW_EVALS_TELEMETRY.md`](docs/HIVECLAW_EVALS_TELEMETRY.md)
+- [`docs/HIVECLAW_OPERATOR_WORKBENCH.md`](docs/HIVECLAW_OPERATOR_WORKBENCH.md)
+- [`docs/CHROME_DEVTOOLS_MCP.md`](docs/CHROME_DEVTOOLS_MCP.md)
 - [`docs/architecture/README.md`](docs/architecture/README.md)
 - [`docs/REPO_CONTEXT_MAP.md`](docs/REPO_CONTEXT_MAP.md)
 - [`docs/ARCHITECTURAL_CHANGES.md`](docs/ARCHITECTURAL_CHANGES.md)
@@ -669,33 +697,33 @@ cargo build --workspace
 cargo test --workspace
 
 # Run main runtime
-cargo run -p aria-x -- aria-x/config.toml
+cargo run -p aria-x --bin hiveclaw -- run aria-x/config.toml
 
 # Installed-style run command
-target/debug/aria-x run aria-x/config.toml
+target/debug/hiveclaw run aria-x/config.toml
 
 # Run TUI
-cargo run -p aria-x -- tui aria-x/config.toml
+cargo run -p aria-x --bin hiveclaw -- tui aria-x/config.toml
 
 # Runtime lifecycle
-target/debug/aria-x status
-target/debug/aria-x stop
-target/debug/aria-x doctor
-target/debug/aria-x doctor stt
-target/debug/aria-x doctor env
-target/debug/aria-x doctor gateway
-target/debug/aria-x doctor browser
-target/debug/aria-x --inspect-context <session_id> [agent_id]
-target/debug/aria-x --inspect-provider-payloads <session_id> [agent_id]
-target/debug/aria-x --explain-context <session_id> [agent_id]
-target/debug/aria-x --explain-provider-payloads <session_id> [agent_id]
-target/debug/aria-x inspect context [session_id] [agent_id]
-target/debug/aria-x inspect provider-payloads [session_id] [agent_id]
-target/debug/aria-x explain context [session_id] [agent_id]
-target/debug/aria-x explain provider-payloads [session_id] [agent_id]
-target/debug/aria-x install
-target/debug/aria-x install --with-default-config
-target/debug/aria-x completion zsh
+target/debug/hiveclaw status
+target/debug/hiveclaw stop
+target/debug/hiveclaw doctor
+target/debug/hiveclaw doctor stt
+target/debug/hiveclaw doctor env
+target/debug/hiveclaw doctor gateway
+target/debug/hiveclaw doctor browser
+target/debug/hiveclaw --inspect-context <session_id> [agent_id]
+target/debug/hiveclaw --inspect-provider-payloads <session_id> [agent_id]
+target/debug/hiveclaw --explain-context <session_id> [agent_id]
+target/debug/hiveclaw --explain-provider-payloads <session_id> [agent_id]
+target/debug/hiveclaw inspect context [session_id] [agent_id]
+target/debug/hiveclaw inspect provider-payloads [session_id] [agent_id]
+target/debug/hiveclaw explain context [session_id] [agent_id]
+target/debug/hiveclaw explain provider-payloads [session_id] [agent_id]
+target/debug/hiveclaw install
+target/debug/hiveclaw install --with-default-config
+target/debug/hiveclaw completion zsh
 
 # Dev wrapper
 ./dev.sh aria-x/config.toml
